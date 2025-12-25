@@ -7,6 +7,7 @@ pub const cli = @import("cli.zig");
 pub const VERSION = cli.VERSION;
 pub const Command = cli.Command;
 pub const RunCommand = cli.RunCommand;
+pub const PullCommand = cli.PullCommand;
 pub const CliError = cli.CliError;
 
 pub const parse = cli.parse;
