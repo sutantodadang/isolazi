@@ -480,6 +480,13 @@ pub fn runWithVfkit(
     try vfkit_args.append(allocator, "--memory");
     try vfkit_args.append(allocator, "2048");
 
+    // Track allocations for cleanup
+    var allocs_to_free: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (allocs_to_free.items) |a| allocator.free(a);
+        allocs_to_free.deinit(allocator);
+    }
+
     // Add VirtioFS for rootfs sharing
     const virtfs_arg = try std.fmt.allocPrint(
         allocator,
@@ -511,13 +518,23 @@ pub fn runWithVfkit(
         try vfkit_args.append(allocator, vol_arg);
     }
 
-    // Build kernel cmdline with init command and env vars
+    // Build kernel cmdline with init script that sets clean environment
     var cmdline_parts: std.ArrayList(u8) = .empty;
     defer cmdline_parts.deinit(allocator);
 
     try cmdline_parts.appendSlice(allocator, "console=hvc0 ");
 
-    // Add environment variables to kernel cmdline
+    // Use init script that sets up clean environment
+    // The init will use env -i to clear inherited environment
+    try cmdline_parts.appendSlice(allocator, "init=/bin/sh -- -c 'exec env -i ");
+
+    // Set minimal required environment
+    try cmdline_parts.appendSlice(allocator, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ");
+    try cmdline_parts.appendSlice(allocator, "HOME=/root ");
+    try cmdline_parts.appendSlice(allocator, "TERM=xterm ");
+    try cmdline_parts.appendSlice(allocator, "LANG=C.UTF-8 ");
+
+    // Add user environment variables (these override defaults)
     for (env_vars) |env| {
         try cmdline_parts.appendSlice(allocator, env.key);
         try cmdline_parts.append(allocator, '=');
@@ -525,11 +542,12 @@ pub fn runWithVfkit(
         try cmdline_parts.append(allocator, ' ');
     }
 
-    try cmdline_parts.appendSlice(allocator, "init=/sbin/init -- ");
+    // Add the command
     for (command) |arg| {
         try cmdline_parts.appendSlice(allocator, arg);
         try cmdline_parts.append(allocator, ' ');
     }
+    try cmdline_parts.append(allocator, '\'');
 
     try vfkit_args.append(allocator, "--kernel-cmdline");
     try vfkit_args.append(allocator, cmdline_parts.items);
@@ -595,21 +613,28 @@ pub fn runWithLima(
     try lima_args.append(allocator, "--");
     try lima_args.append(allocator, "sudo");
 
-    // Add environment variables using env command
-    if (env_vars.len > 0) {
-        try lima_args.append(allocator, "env");
-        var env_allocs: std.ArrayList([]const u8) = .empty;
-        defer {
-            for (env_allocs.items) |alloc| {
-                allocator.free(alloc);
-            }
-            env_allocs.deinit(allocator);
+    // Use env -i to clear inherited environment and set fresh vars
+    try lima_args.append(allocator, "env");
+    try lima_args.append(allocator, "-i");
+
+    // Set minimal required environment
+    try lima_args.append(allocator, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    try lima_args.append(allocator, "HOME=/root");
+    try lima_args.append(allocator, "TERM=xterm");
+    try lima_args.append(allocator, "LANG=C.UTF-8");
+
+    // Add user environment variables (these override defaults)
+    var env_allocs: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (env_allocs.items) |alloc| {
+            allocator.free(alloc);
         }
-        for (env_vars) |env| {
-            const env_str = try std.fmt.allocPrint(allocator, "{s}={s}", .{ env.key, env.value });
-            try env_allocs.append(allocator, env_str);
-            try lima_args.append(allocator, env_str);
-        }
+        env_allocs.deinit(allocator);
+    }
+    for (env_vars) |env| {
+        const env_str = try std.fmt.allocPrint(allocator, "{s}={s}", .{ env.key, env.value });
+        try env_allocs.append(allocator, env_str);
+        try lima_args.append(allocator, env_str);
     }
 
     // Build a shell script to handle bind mounts for volumes
@@ -634,14 +659,29 @@ pub fn runWithLima(
             try script.appendSlice(allocator, " && ");
         }
 
-        // Add the unshare and chroot command
+        // Add the unshare and chroot command with clean environment inside container
         try script.appendSlice(allocator, "unshare --mount --uts --ipc --pid --fork --mount-proc chroot ");
         try script.appendSlice(allocator, rootfs_path);
+        try script.appendSlice(allocator, " /usr/bin/env -i ");
+
+        // Set minimal required environment inside container
+        try script.appendSlice(allocator, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ");
+        try script.appendSlice(allocator, "HOME=/root ");
+        try script.appendSlice(allocator, "TERM=xterm ");
+        try script.appendSlice(allocator, "LANG=C.UTF-8 ");
+
+        // Add user env vars inside container
+        for (env_vars) |env| {
+            try script.appendSlice(allocator, env.key);
+            try script.append(allocator, '=');
+            try script.appendSlice(allocator, env.value);
+            try script.append(allocator, ' ');
+        }
 
         // Add the command
         for (command) |arg| {
-            try script.append(allocator, ' ');
             try script.appendSlice(allocator, arg);
+            try script.append(allocator, ' ');
         }
 
         const script_str = try allocator.dupe(u8, script.items);
@@ -657,6 +697,21 @@ pub fn runWithLima(
         try lima_args.append(allocator, "--mount-proc");
         try lima_args.append(allocator, "chroot");
         try lima_args.append(allocator, rootfs_path);
+        try lima_args.append(allocator, "/usr/bin/env");
+        try lima_args.append(allocator, "-i");
+
+        // Set minimal required environment inside container
+        try lima_args.append(allocator, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+        try lima_args.append(allocator, "HOME=/root");
+        try lima_args.append(allocator, "TERM=xterm");
+        try lima_args.append(allocator, "LANG=C.UTF-8");
+
+        // Add user env vars
+        for (env_vars) |env| {
+            const env_str = try std.fmt.allocPrint(allocator, "{s}={s}", .{ env.key, env.value });
+            try env_allocs.append(allocator, env_str);
+            try lima_args.append(allocator, env_str);
+        }
 
         // Add the command
         for (command) |arg| {

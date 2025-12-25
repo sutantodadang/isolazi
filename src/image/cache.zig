@@ -277,6 +277,86 @@ pub const ImageCache = struct {
         std.fs.cwd().deleteTree(container_path) catch {};
     }
 
+    /// Remove an image by reference string (e.g., "postgres:16-alpine")
+    pub fn removeImage(self: *const Self, image_ref: []const u8) !void {
+        const ref = reference.parse(image_ref) catch return error.ImageNotFound;
+
+        // Build manifest path
+        var repo_encoded: [512]u8 = undefined;
+        var repo_len: usize = 0;
+        for (ref.repository) |c| {
+            repo_encoded[repo_len] = if (c == '/') '_' else c;
+            repo_len += 1;
+            if (repo_len >= repo_encoded.len) break;
+        }
+
+        const manifest_path = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}/images/manifests/{s}/{s}/{s}.json",
+            .{ self.base_path, ref.registry, repo_encoded[0..repo_len], ref.tag },
+        );
+        defer self.allocator.free(manifest_path);
+
+        // Delete manifest file
+        std.fs.cwd().deleteFile(manifest_path) catch {};
+    }
+
+    /// Remove all images (for prune)
+    pub fn removeAllImages(self: *const Self) !u64 {
+        var removed: u64 = 0;
+
+        const manifests_path = try std.fmt.allocPrint(self.allocator, "{s}/images/manifests", .{self.base_path});
+        defer self.allocator.free(manifests_path);
+
+        // Delete entire manifests directory and recreate structure
+        std.fs.cwd().deleteTree(manifests_path) catch {};
+        std.fs.cwd().makePath(manifests_path) catch {};
+
+        // Count and delete blobs
+        const blobs_path = try std.fmt.allocPrint(self.allocator, "{s}/images/blobs/sha256", .{self.base_path});
+        defer self.allocator.free(blobs_path);
+
+        var blobs_dir = std.fs.cwd().openDir(blobs_path, .{ .iterate = true }) catch {
+            return removed;
+        };
+        defer blobs_dir.close();
+
+        var blob_iter = blobs_dir.iterate();
+        while (try blob_iter.next()) |entry| {
+            if (entry.kind == .file) {
+                blobs_dir.deleteFile(entry.name) catch continue;
+                removed += 1;
+            }
+        }
+
+        return removed;
+    }
+
+    /// Remove all containers (for prune)
+    pub fn removeAllContainers(self: *const Self) !u64 {
+        var removed: u64 = 0;
+
+        const containers_path = try std.fmt.allocPrint(self.allocator, "{s}/containers", .{self.base_path});
+        defer self.allocator.free(containers_path);
+
+        var containers_dir = std.fs.cwd().openDir(containers_path, .{ .iterate = true }) catch {
+            return removed;
+        };
+        defer containers_dir.close();
+
+        var iter = containers_dir.iterate();
+        while (try iter.next()) |entry| {
+            if (entry.kind == .directory) {
+                const container_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ containers_path, entry.name });
+                defer self.allocator.free(container_path);
+                std.fs.cwd().deleteTree(container_path) catch continue;
+                removed += 1;
+            }
+        }
+
+        return removed;
+    }
+
     /// List all cached images
     pub fn listImages(self: *const Self, allocator: std.mem.Allocator) ![]CachedImageInfo {
         var images: std.ArrayList(CachedImageInfo) = .empty;

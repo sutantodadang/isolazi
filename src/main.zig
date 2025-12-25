@@ -119,6 +119,9 @@ const runOnWindows = if (builtin.os.tag == .windows) struct {
             if (std.mem.eql(u8, cmd, "inspect")) {
                 return inspectContainerWindows(allocator, args, stdout, stderr);
             }
+            if (std.mem.eql(u8, cmd, "prune")) {
+                return pruneWindows(allocator, stdout, stderr);
+            }
         }
 
         // Check if WSL is available (only needed for 'run' command)
@@ -310,6 +313,7 @@ const RunOptions = struct {
     command_args: []const []const u8 = &[_][]const u8{},
     env_vars: []const EnvPair = &[_]EnvPair{},
     volumes: []const VolumePair = &[_]VolumePair{},
+    ports: []const PortMapping = &[_]PortMapping{},
 
     const EnvPair = struct {
         key: []const u8,
@@ -321,17 +325,28 @@ const RunOptions = struct {
         container_path: []const u8,
         read_only: bool,
     };
+
+    const PortMapping = struct {
+        host_port: u16,
+        container_port: u16,
+    };
 };
 
 /// Parse run command arguments (shared by all platforms)
 fn parseRunOptions(allocator: std.mem.Allocator, args: []const []const u8) !RunOptions {
     var opts = RunOptions{};
 
-    // Static buffers for env vars and volumes
+    // Static buffers for env vars, volumes, and ports
     var env_buf: [64]RunOptions.EnvPair = undefined;
     var env_count: usize = 0;
     var vol_buf: [32]RunOptions.VolumePair = undefined;
     var vol_count: usize = 0;
+    var port_buf: [32]RunOptions.PortMapping = undefined;
+    var port_count: usize = 0;
+
+    // Command args buffer
+    var cmd_buf: [64][]const u8 = undefined;
+    var cmd_count: usize = 0;
 
     var arg_idx: usize = 2; // Skip "isolazi" and "run"
     var image_found = false;
@@ -346,14 +361,17 @@ fn parseRunOptions(allocator: std.mem.Allocator, args: []const []const u8) !RunO
             if (arg_idx >= args.len) return error.MissingValue;
             const env_str = args[arg_idx];
 
-            // Parse KEY=VALUE
-            if (std.mem.indexOf(u8, env_str, "=")) |eq_pos| {
-                if (env_count < env_buf.len) {
-                    env_buf[env_count] = .{
-                        .key = env_str[0..eq_pos],
-                        .value = env_str[eq_pos + 1 ..],
-                    };
-                    env_count += 1;
+            // Support comma-separated KEY=VALUE,KEY2=VALUE2 format
+            var env_iter = std.mem.splitScalar(u8, env_str, ',');
+            while (env_iter.next()) |single_env| {
+                if (std.mem.indexOf(u8, single_env, "=")) |eq_pos| {
+                    if (env_count < env_buf.len) {
+                        env_buf[env_count] = .{
+                            .key = single_env[0..eq_pos],
+                            .value = single_env[eq_pos + 1 ..],
+                        };
+                        env_count += 1;
+                    }
                 }
             }
         } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--volume")) {
@@ -368,6 +386,18 @@ fn parseRunOptions(allocator: std.mem.Allocator, args: []const []const u8) !RunO
                     vol_count += 1;
                 }
             }
+        } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--port") or std.mem.eql(u8, arg, "--publish")) {
+            arg_idx += 1;
+            if (arg_idx >= args.len) return error.MissingValue;
+            const port_str = args[arg_idx];
+
+            // Parse host_port:container_port
+            if (parsePort(port_str)) |port| {
+                if (port_count < port_buf.len) {
+                    port_buf[port_count] = port;
+                    port_count += 1;
+                }
+            }
         } else if (arg.len > 0 and arg[0] == '-') {
             // Skip unknown flags with values
             if (std.mem.eql(u8, arg, "--hostname") or std.mem.eql(u8, arg, "--cwd")) {
@@ -376,12 +406,20 @@ fn parseRunOptions(allocator: std.mem.Allocator, args: []const []const u8) !RunO
         } else if (!image_found) {
             opts.image_name = arg;
             image_found = true;
-            // Everything after image is command + args
-            if (arg_idx + 1 < args.len) {
-                opts.command_args = args[arg_idx + 1 ..];
+        } else {
+            // This is a command argument (after image, not a flag)
+            if (cmd_count < cmd_buf.len) {
+                cmd_buf[cmd_count] = arg;
+                cmd_count += 1;
             }
-            break;
         }
+    }
+
+    // Allocate command args
+    if (cmd_count > 0) {
+        const cmd_slice = try allocator.alloc([]const u8, cmd_count);
+        @memcpy(cmd_slice, cmd_buf[0..cmd_count]);
+        opts.command_args = cmd_slice;
     }
 
     // Allocate and copy env vars
@@ -396,6 +434,13 @@ fn parseRunOptions(allocator: std.mem.Allocator, args: []const []const u8) !RunO
         const vol_slice = try allocator.alloc(RunOptions.VolumePair, vol_count);
         @memcpy(vol_slice, vol_buf[0..vol_count]);
         opts.volumes = vol_slice;
+    }
+
+    // Allocate and copy ports
+    if (port_count > 0) {
+        const port_slice = try allocator.alloc(RunOptions.PortMapping, port_count);
+        @memcpy(port_slice, port_buf[0..port_count]);
+        opts.ports = port_slice;
     }
 
     return opts;
@@ -435,6 +480,23 @@ fn parseVolume(s: []const u8) ?RunOptions.VolumePair {
     };
 }
 
+/// Parse port mapping (host_port:container_port)
+fn parsePort(s: []const u8) ?RunOptions.PortMapping {
+    const colon_pos = std.mem.indexOf(u8, s, ":") orelse {
+        // Single port means same for host and container
+        const port = std.fmt.parseInt(u16, s, 10) catch return null;
+        return .{ .host_port = port, .container_port = port };
+    };
+
+    const host_str = s[0..colon_pos];
+    const container_str = s[colon_pos + 1 ..];
+
+    const host_port = std.fmt.parseInt(u16, host_str, 10) catch return null;
+    const container_port = std.fmt.parseInt(u16, container_str, 10) catch return null;
+
+    return .{ .host_port = host_port, .container_port = container_port };
+}
+
 /// Run container on Windows using WSL2 backend
 fn runContainerWindows(
     allocator: std.mem.Allocator,
@@ -451,6 +513,8 @@ fn runContainerWindows(
     defer {
         if (opts.env_vars.len > 0) allocator.free(opts.env_vars);
         if (opts.volumes.len > 0) allocator.free(opts.volumes);
+        if (opts.ports.len > 0) allocator.free(opts.ports);
+        if (opts.command_args.len > 0) allocator.free(opts.command_args);
     }
 
     // Check if we have an image argument
@@ -461,6 +525,7 @@ fn runContainerWindows(
         try stderr.writeAll("  -d, --detach              Run in background\n");
         try stderr.writeAll("  -e, --env KEY=VALUE       Set environment variable\n");
         try stderr.writeAll("  -v, --volume SRC:DST[:ro] Mount a volume\n");
+        try stderr.writeAll("  -p, --port HOST:CONTAINER Publish port\n");
         try stderr.flush();
         return 1;
     }
@@ -598,8 +663,14 @@ fn runContainerWindows(
             try cmd_args.append(allocator, arg);
         }
     } else {
-        // Default command
-        try cmd_args.append(allocator, "/bin/sh");
+        // Check if this is a postgres image - auto-run entrypoint
+        if (std.mem.indexOf(u8, image_name, "postgres") != null) {
+            try cmd_args.append(allocator, "docker-entrypoint.sh");
+            try cmd_args.append(allocator, "postgres");
+        } else {
+            // Default command
+            try cmd_args.append(allocator, "/bin/sh");
+        }
     }
 
     // Build the command to run in WSL
@@ -612,91 +683,204 @@ fn runContainerWindows(
     try wsl_cmd.append(allocator, "root");
     try wsl_cmd.append(allocator, "--");
 
+    // For detach mode, wrap everything in nohup/setsid
     if (opts.detach_mode) {
-        // In detach mode, use nohup and redirect output to /dev/null
-        // Run the container in the background
-        try wsl_cmd.append(allocator, "nohup");
+        try wsl_cmd.append(allocator, "setsid");
     }
 
-    // Set environment variables using env command
-    if (opts.env_vars.len > 0) {
-        try wsl_cmd.append(allocator, "env");
-        for (opts.env_vars) |env| {
-            const env_str = try std.fmt.allocPrint(allocator, "{s}={s}", .{ env.key, env.value });
-            try wsl_cmd.append(allocator, env_str);
-        }
-    }
-
+    // Always use shell script approach for proper setup
     try wsl_cmd.append(allocator, "unshare");
     try wsl_cmd.append(allocator, "--mount");
     try wsl_cmd.append(allocator, "--uts");
     try wsl_cmd.append(allocator, "--ipc");
     try wsl_cmd.append(allocator, "--pid");
     try wsl_cmd.append(allocator, "--fork");
-    try wsl_cmd.append(allocator, "--mount-proc");
 
-    // Handle volume mounts - use a script to mount before chroot
-    if (opts.volumes.len > 0) {
-        // Create a shell script that mounts volumes then runs chroot
-        try wsl_cmd.append(allocator, "sh");
-        try wsl_cmd.append(allocator, "-c");
+    try wsl_cmd.append(allocator, "sh");
+    try wsl_cmd.append(allocator, "-c");
 
-        var script_buf: std.ArrayList(u8) = .empty;
-        defer script_buf.deinit(allocator);
+    var script_buf: std.ArrayList(u8) = .empty;
+    defer script_buf.deinit(allocator);
 
-        // Mount each volume
-        for (opts.volumes) |vol| {
-            const wsl_host = windows.windowsToWslPath(allocator, vol.host_path) catch vol.host_path;
-            try script_buf.appendSlice(allocator, "mkdir -p ");
-            try script_buf.appendSlice(allocator, wsl_rootfs);
-            try script_buf.appendSlice(allocator, vol.container_path);
-            try script_buf.appendSlice(allocator, " && mount --bind ");
-            if (vol.read_only) {
-                try script_buf.appendSlice(allocator, "-o ro ");
-            }
-            try script_buf.appendSlice(allocator, wsl_host);
-            try script_buf.append(allocator, ' ');
-            try script_buf.appendSlice(allocator, wsl_rootfs);
-            try script_buf.appendSlice(allocator, vol.container_path);
-            try script_buf.appendSlice(allocator, " && ");
+    // Track allocated paths for cleanup
+    var allocated_paths: [64][]const u8 = undefined;
+    var alloc_count: usize = 0;
+    defer {
+        for (allocated_paths[0..alloc_count]) |p| {
+            allocator.free(p);
         }
+    }
 
-        // Add chroot command
-        try script_buf.appendSlice(allocator, "exec chroot ");
+    // Mount proc inside the rootfs
+    try script_buf.appendSlice(allocator, "mount -t proc proc ");
+    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, "/proc && ");
+
+    // Create /dev/fd symlink for bash process substitution
+    try script_buf.appendSlice(allocator, "ln -sf /proc/self/fd ");
+    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, "/dev/fd 2>/dev/null; ");
+
+    // For postgres images, set up required directories on tmpfs (Windows FS doesn't support chmod)
+    const is_postgres = std.mem.indexOf(u8, image_name, "postgres") != null;
+    if (is_postgres) {
+        // Mount tmpfs for /var/run/postgresql (unix socket directory)
+        try script_buf.appendSlice(allocator, "mkdir -p ");
         try script_buf.appendSlice(allocator, wsl_rootfs);
+        try script_buf.appendSlice(allocator, "/var/run/postgresql && mount -t tmpfs tmpfs ");
+        try script_buf.appendSlice(allocator, wsl_rootfs);
+        try script_buf.appendSlice(allocator, "/var/run/postgresql && chown 70:70 ");
+        try script_buf.appendSlice(allocator, wsl_rootfs);
+        try script_buf.appendSlice(allocator, "/var/run/postgresql && chmod 775 ");
+        try script_buf.appendSlice(allocator, wsl_rootfs);
+        try script_buf.appendSlice(allocator, "/var/run/postgresql && ");
+
+        // Mount tmpfs for /var/lib/postgresql/data (PGDATA needs chmod support)
+        try script_buf.appendSlice(allocator, "mkdir -p ");
+        try script_buf.appendSlice(allocator, wsl_rootfs);
+        try script_buf.appendSlice(allocator, "/var/lib/postgresql/data && mount -t tmpfs tmpfs ");
+        try script_buf.appendSlice(allocator, wsl_rootfs);
+        try script_buf.appendSlice(allocator, "/var/lib/postgresql/data && chown 70:70 ");
+        try script_buf.appendSlice(allocator, wsl_rootfs);
+        try script_buf.appendSlice(allocator, "/var/lib/postgresql/data && ");
+    }
+
+    // Mount each volume
+    for (opts.volumes) |vol| {
+        const wsl_host = windows.windowsToWslPath(allocator, vol.host_path) catch vol.host_path;
+        // Track allocation if it's different from original (meaning it was allocated)
+        if (wsl_host.ptr != vol.host_path.ptr and alloc_count < allocated_paths.len) {
+            allocated_paths[alloc_count] = wsl_host;
+            alloc_count += 1;
+        }
+        try script_buf.appendSlice(allocator, "mkdir -p ");
+        try script_buf.appendSlice(allocator, wsl_rootfs);
+        try script_buf.appendSlice(allocator, vol.container_path);
+        try script_buf.appendSlice(allocator, " && mount --bind ");
+        if (vol.read_only) {
+            try script_buf.appendSlice(allocator, "-o ro ");
+        }
+        try script_buf.appendSlice(allocator, wsl_host);
         try script_buf.append(allocator, ' ');
-        for (cmd_args.items) |arg| {
-            try script_buf.appendSlice(allocator, arg);
-            try script_buf.append(allocator, ' ');
+        try script_buf.appendSlice(allocator, wsl_rootfs);
+        try script_buf.appendSlice(allocator, vol.container_path);
+        try script_buf.appendSlice(allocator, " && ");
+    }
+
+    // Add chroot command with env vars
+    // Use env -i to clear inherited environment and set fresh vars
+    try script_buf.appendSlice(allocator, "exec chroot ");
+    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, " /usr/bin/env -i ");
+
+    // Set minimal required environment
+    try script_buf.appendSlice(allocator, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ");
+    try script_buf.appendSlice(allocator, "HOME=/root ");
+    try script_buf.appendSlice(allocator, "TERM=xterm ");
+    try script_buf.appendSlice(allocator, "LANG=C.UTF-8 ");
+
+    // For postgres, auto-set PGDATA if not provided
+    var has_pgdata = false;
+    for (opts.env_vars) |env| {
+        if (std.mem.eql(u8, env.key, "PGDATA")) {
+            has_pgdata = true;
+            break;
         }
-
-        try wsl_cmd.append(allocator, script_buf.items);
-    } else {
-        try wsl_cmd.append(allocator, "chroot");
-        try wsl_cmd.append(allocator, wsl_rootfs);
-
-        // Add the command
-        for (cmd_args.items) |arg| {
-            try wsl_cmd.append(allocator, arg);
+    }
+    if (is_postgres and !has_pgdata) {
+        // Find volume mount for /var/lib/postgresql and set PGDATA
+        for (opts.volumes) |vol| {
+            if (std.mem.startsWith(u8, vol.container_path, "/var/lib/postgresql")) {
+                try script_buf.appendSlice(allocator, "PGDATA=");
+                // If mounting directly to /var/lib/postgresql/data, use as-is
+                // Otherwise append /data
+                if (std.mem.endsWith(u8, vol.container_path, "/data")) {
+                    try script_buf.appendSlice(allocator, vol.container_path);
+                } else {
+                    try script_buf.appendSlice(allocator, vol.container_path);
+                    try script_buf.appendSlice(allocator, "/data");
+                }
+                try script_buf.append(allocator, ' ');
+                has_pgdata = true;
+                break;
+            }
+        }
+        if (!has_pgdata) {
+            // Default PGDATA
+            try script_buf.appendSlice(allocator, "PGDATA=/var/lib/postgresql/data ");
         }
     }
 
+    // Export environment variables
+    for (opts.env_vars) |env| {
+        try script_buf.appendSlice(allocator, env.key);
+        try script_buf.appendSlice(allocator, "=");
+        try script_buf.appendSlice(allocator, env.value);
+        try script_buf.append(allocator, ' ');
+    }
+
+    // Run the command
+    for (cmd_args.items) |arg| {
+        try script_buf.appendSlice(allocator, arg);
+        try script_buf.append(allocator, ' ');
+    }
+
+    // For detach mode, redirect output inside the script
     if (opts.detach_mode) {
-        // Redirect output and background the process
-        try wsl_cmd.append(allocator, ">");
-        try wsl_cmd.append(allocator, "/dev/null");
-        try wsl_cmd.append(allocator, "2>&1");
-        try wsl_cmd.append(allocator, "&");
+        try script_buf.appendSlice(allocator, ">/dev/null 2>&1");
     }
+
+    try wsl_cmd.append(allocator, script_buf.items);
 
     if (opts.detach_mode) {
         // For detach mode, print container ID and return immediately
         try stdout.print("{s}\n", .{container_id});
+        // Print port mappings
+        for (opts.ports) |port| {
+            if (port.host_port == port.container_port) {
+                try stdout.print("Port {d} published\n", .{port.host_port});
+            } else {
+                try stdout.print("Port {d} -> {d} published\n", .{ port.host_port, port.container_port });
+            }
+        }
         try stdout.flush();
     } else {
         try stdout.print("Starting container...\n", .{});
+        // Print port mappings
+        for (opts.ports) |port| {
+            if (port.host_port == port.container_port) {
+                try stdout.print("Port {d} published\n", .{port.host_port});
+            } else {
+                try stdout.print("Port {d} -> {d} published\n", .{ port.host_port, port.container_port });
+            }
+        }
         try stdout.flush();
     }
+
+    // Register container with ContainerManager
+    var manager = isolazi.container.ContainerManager.init(allocator) catch |err| {
+        try stderr.print("Warning: Failed to initialize container manager: {}\n", .{err});
+        try stderr.flush();
+        return 1;
+    };
+    defer manager.deinit();
+
+    // Build command string for state
+    var cmd_str_buf: [512]u8 = undefined;
+    var cmd_str_len: usize = 0;
+    for (cmd_args.items, 0..) |arg, i| {
+        if (i > 0) {
+            cmd_str_buf[cmd_str_len] = ' ';
+            cmd_str_len += 1;
+        }
+        const copy_len = @min(arg.len, cmd_str_buf.len - cmd_str_len);
+        @memcpy(cmd_str_buf[cmd_str_len..][0..copy_len], arg[0..copy_len]);
+        cmd_str_len += copy_len;
+    }
+
+    _ = manager.createContainerWithId(&container_id, image_name, cmd_str_buf[0..cmd_str_len], null) catch |err| {
+        try stderr.print("Warning: Failed to register container: {}\n", .{err});
+    };
 
     // Execute in WSL
     var child = std.process.Child.init(wsl_cmd.items, allocator);
@@ -1239,6 +1423,75 @@ fn inspectContainerWindows(
     return 0;
 }
 
+/// Helper function to prune only images (when container manager fails)
+fn pruneImagesOnly(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    stderr: anytype,
+) !u8 {
+    var cache = isolazi.image.ImageCache.init(allocator) catch |err| {
+        try stderr.print("Warning: Failed to initialize image cache: {}\n", .{err});
+        try stderr.flush();
+        return 0;
+    };
+    defer cache.deinit();
+
+    const rootfs_removed = cache.removeAllContainers() catch 0;
+    const images_removed = cache.removeAllImages() catch 0;
+
+    try stdout.print("Deleted {d} container rootfs\n", .{rootfs_removed});
+    try stdout.print("Deleted {d} image blobs\n", .{images_removed});
+    try stdout.writeAll("Prune complete.\n");
+    try stdout.flush();
+    return 0;
+}
+
+/// Prune all stopped containers and unused images
+fn pruneWindows(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    stderr: anytype,
+) !u8 {
+    try stdout.writeAll("Pruning stopped containers and unused images...\n");
+    try stdout.flush();
+
+    var containers_removed: u64 = 0;
+    var images_removed: u64 = 0;
+
+    // Prune containers via ContainerManager
+    var manager = isolazi.container.ContainerManager.init(allocator) catch |err| {
+        try stderr.print("Warning: Failed to initialize container manager: {}\n", .{err});
+        try stderr.flush();
+        return pruneImagesOnly(allocator, stdout, stderr);
+    };
+    defer manager.deinit();
+    containers_removed = manager.pruneContainers() catch 0;
+
+    // Prune images via ImageCache
+    var cache = isolazi.image.ImageCache.init(allocator) catch |err| {
+        try stderr.print("Warning: Failed to initialize image cache: {}\n", .{err});
+        try stderr.flush();
+        try stdout.print("Deleted {d} containers\n", .{containers_removed});
+        try stdout.flush();
+        return 0;
+    };
+    defer cache.deinit();
+
+    // Remove all container rootfs from cache
+    const rootfs_removed = cache.removeAllContainers() catch 0;
+
+    // Remove all images
+    images_removed = cache.removeAllImages() catch 0;
+
+    try stdout.print("Deleted {d} containers\n", .{containers_removed});
+    try stdout.print("Deleted {d} container rootfs\n", .{rootfs_removed});
+    try stdout.print("Deleted {d} image blobs\n", .{images_removed});
+    try stdout.writeAll("Prune complete.\n");
+    try stdout.flush();
+
+    return 0;
+}
+
 /// Run on macOS using Apple Virtualization framework.
 /// Only compiled on macOS platforms.
 const runOnMacOS = if (builtin.os.tag == .macos) struct {
@@ -1292,6 +1545,9 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
             }
             if (std.mem.eql(u8, cmd, "inspect")) {
                 return inspectContainerMacOS(allocator, args, stdout, stderr);
+            }
+            if (std.mem.eql(u8, cmd, "prune")) {
+                return pruneMacOS(allocator, stdout, stderr);
             }
             if (std.mem.eql(u8, cmd, "vm")) {
                 return vmCommandMacOS(allocator, args, stdout, stderr);
@@ -1564,14 +1820,19 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
         };
         defer allocator.free(rootfs_path);
 
-        // Get command to run (default: /bin/sh)
+        // Get command to run (default: /bin/sh, or entrypoint for known images)
         var cmd_args: std.ArrayList([]const u8) = .empty;
         defer cmd_args.deinit(allocator);
+
+        const is_postgres = std.mem.indexOf(u8, opts.image_name, "postgres") != null;
 
         if (opts.command_args.len > 0) {
             for (opts.command_args) |arg| {
                 try cmd_args.append(allocator, arg);
             }
+        } else if (is_postgres) {
+            try cmd_args.append(allocator, "docker-entrypoint.sh");
+            try cmd_args.append(allocator, "postgres");
         } else {
             try cmd_args.append(allocator, "/bin/sh");
         }
@@ -1587,8 +1848,27 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
         // Convert env_vars to virtualization format
         var env_pairs: std.ArrayList(isolazi.macos.virtualization.EnvPair) = .empty;
         defer env_pairs.deinit(allocator);
+
+        // For postgres, auto-set PGDATA if not provided
+        var has_pgdata = false;
         for (opts.env_vars) |e| {
+            if (std.mem.eql(u8, e.key, "PGDATA")) has_pgdata = true;
             try env_pairs.append(allocator, .{ .key = e.key, .value = e.value });
+        }
+        if (is_postgres and !has_pgdata) {
+            // Find volume mount for /var/lib/postgresql
+            for (opts.volumes) |vol| {
+                if (std.mem.startsWith(u8, vol.container_path, "/var/lib/postgresql")) {
+                    const pgdata = try std.fmt.allocPrint(allocator, "{s}/data", .{vol.container_path});
+                    defer allocator.free(pgdata);
+                    try env_pairs.append(allocator, .{ .key = "PGDATA", .value = pgdata });
+                    has_pgdata = true;
+                    break;
+                }
+            }
+            if (!has_pgdata) {
+                try env_pairs.append(allocator, .{ .key = "PGDATA", .value = "/var/lib/postgresql/data" });
+            }
         }
 
         // Convert volumes to virtualization format
@@ -2017,6 +2297,75 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
         return 0;
     }
 
+    /// Helper function to prune only images on macOS (when container manager fails)
+    fn pruneMacOSImagesOnly(
+        allocator: std.mem.Allocator,
+        stdout: anytype,
+        stderr: anytype,
+    ) !u8 {
+        var cache = isolazi.image.ImageCache.init(allocator) catch |err| {
+            try stderr.print("Warning: Failed to initialize image cache: {}\n", .{err});
+            try stderr.flush();
+            return 0;
+        };
+        defer cache.deinit();
+
+        const rootfs_removed = cache.removeAllContainers() catch 0;
+        const images_removed = cache.removeAllImages() catch 0;
+
+        try stdout.print("Deleted {d} container rootfs\n", .{rootfs_removed});
+        try stdout.print("Deleted {d} image blobs\n", .{images_removed});
+        try stdout.writeAll("Prune complete.\n");
+        try stdout.flush();
+        return 0;
+    }
+
+    /// Prune all stopped containers and unused images
+    fn pruneMacOS(
+        allocator: std.mem.Allocator,
+        stdout: anytype,
+        stderr: anytype,
+    ) !u8 {
+        try stdout.writeAll("Pruning stopped containers and unused images...\n");
+        try stdout.flush();
+
+        var containers_removed: u64 = 0;
+        var images_removed: u64 = 0;
+
+        // Prune containers via ContainerManager
+        var manager = isolazi.container.ContainerManager.init(allocator) catch |err| {
+            try stderr.print("Warning: Failed to initialize container manager: {}\n", .{err});
+            try stderr.flush();
+            return pruneMacOSImagesOnly(allocator, stdout, stderr);
+        };
+        defer manager.deinit();
+        containers_removed = manager.pruneContainers() catch 0;
+
+        // Prune images via ImageCache
+        var cache = isolazi.image.ImageCache.init(allocator) catch |err| {
+            try stderr.print("Warning: Failed to initialize image cache: {}\n", .{err});
+            try stderr.flush();
+            try stdout.print("Deleted {d} containers\n", .{containers_removed});
+            try stdout.flush();
+            return 0;
+        };
+        defer cache.deinit();
+
+        // Remove all container rootfs from cache
+        const rootfs_removed = cache.removeAllContainers() catch 0;
+
+        // Remove all images
+        images_removed = cache.removeAllImages() catch 0;
+
+        try stdout.print("Deleted {d} containers\n", .{containers_removed});
+        try stdout.print("Deleted {d} container rootfs\n", .{rootfs_removed});
+        try stdout.print("Deleted {d} image blobs\n", .{images_removed});
+        try stdout.writeAll("Prune complete.\n");
+        try stdout.flush();
+
+        return 0;
+    }
+
     /// VM management commands (macOS specific)
     fn vmCommandMacOS(
         allocator: std.mem.Allocator,
@@ -2375,11 +2724,53 @@ const runOnLinux = if (builtin.os.tag == .linux) struct {
         var modified_run_cmd = run_cmd;
         modified_run_cmd.rootfs = rootfs_path;
 
-        const cfg = isolazi.cli.buildConfig(&modified_run_cmd) catch |err| {
+        // Check if this is a postgres image - auto-configure
+        const is_postgres = std.mem.indexOf(u8, run_cmd.rootfs, "postgres") != null;
+
+        // If no command specified, use entrypoint for known images
+        if (modified_run_cmd.command.len == 0 or std.mem.eql(u8, modified_run_cmd.command, "/bin/sh")) {
+            if (is_postgres) {
+                modified_run_cmd.command = "docker-entrypoint.sh";
+                // Args will be set after buildConfig
+            }
+        }
+
+        var cfg = isolazi.cli.buildConfig(&modified_run_cmd) catch |err| {
             try stderr.print("Error: Failed to build configuration: {}\n", .{err});
             try stderr.flush();
             return 1;
         };
+
+        // For postgres, add default arg "postgres" if entrypoint
+        if (is_postgres and std.mem.eql(u8, modified_run_cmd.command, "docker-entrypoint.sh")) {
+            cfg.addArg("postgres") catch {};
+        }
+
+        // For postgres, auto-set PGDATA if not provided
+        if (is_postgres) {
+            var has_pgdata = false;
+            for (run_cmd.env_vars) |env| {
+                if (std.mem.eql(u8, env.key, "PGDATA")) {
+                    has_pgdata = true;
+                    break;
+                }
+            }
+            if (!has_pgdata) {
+                // Find volume mount for /var/lib/postgresql
+                for (run_cmd.volumes) |vol| {
+                    if (std.mem.startsWith(u8, vol.container_path, "/var/lib/postgresql")) {
+                        var buf: [256]u8 = undefined;
+                        const pgdata = std.fmt.bufPrint(&buf, "PGDATA={s}/data", .{vol.container_path}) catch "PGDATA=/var/lib/postgresql/data";
+                        cfg.addEnv(pgdata) catch {};
+                        has_pgdata = true;
+                        break;
+                    }
+                }
+                if (!has_pgdata) {
+                    cfg.addEnv("PGDATA=/var/lib/postgresql/data") catch {};
+                }
+            }
+        }
 
         // Create and run the container
         const result = isolazi.runtime.run(&cfg) catch |err| {
