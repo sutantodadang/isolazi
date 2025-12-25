@@ -1,0 +1,62 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+          - os: macos-latest
+            platform: macos
+          - os: windows-latest
+            platform: windows
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.15.2
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Package (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          BIN="zig-out/bin/isolazi"
+          chmod +x "$BIN" || true
+          OUT="dist/isolazi-${GITHUB_REF_NAME}-${{ matrix.platform }}-${RUNNER_ARCH}.tar.gz"
+          tar -C "$(dirname "$BIN")" -czf "$OUT" "$(basename "$BIN")"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $bin = "zig-out/bin/isolazi.exe"
+          $out = "dist/isolazi-$env:GITHUB_REF_NAME-${{ matrix.platform }}-$env:RUNNER_ARCH.zip"
+          Compress-Archive -Path $bin -DestinationPath $out -Force
+
+      - name: Upload artifacts to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
