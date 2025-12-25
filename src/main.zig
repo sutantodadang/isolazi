@@ -1599,13 +1599,14 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
         }
 
         // Ensure VM assets are available (only needed for vfkit)
-        var vm_assets: ?struct {
+        const VMAssets = struct {
             kernel_path: []const u8,
             initramfs_path: []const u8,
-        } = null;
+        };
+        var vm_assets: ?VMAssets = null;
 
         if (std.mem.eql(u8, hypervisor.?, "vfkit")) {
-            vm_assets = isolazi.macos.virtualization.ensureVMAssets(allocator) catch {
+            const assets = isolazi.macos.virtualization.ensureVMAssets(allocator) catch {
                 try stderr.writeAll("Error: Linux VM kernel not found.\n");
                 try stderr.writeAll("\nTo setup the VM environment:\n");
                 try stderr.writeAll("  1. Download a Linux kernel (vmlinuz) for your architecture\n");
@@ -1613,6 +1614,10 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
                 try stderr.writeAll("\nAlternatively, use Lima as the backend (brew install lima).\n");
                 try stderr.flush();
                 return 1;
+            };
+            vm_assets = VMAssets{
+                .kernel_path = assets.kernel_path,
+                .initramfs_path = assets.initramfs_path,
             };
         }
         defer {
@@ -1767,7 +1772,6 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
             try stderr.flush();
             return 1;
         };
-        defer allocator.free(container_id);
 
         try stdout.print("{s}\n", .{container_id});
         try stdout.flush();
@@ -2199,12 +2203,11 @@ const runOnLinux = if (builtin.os.tag == .linux) struct {
             }
         }.cb;
 
-        var ref = isolazi.image.pullImage(allocator, pull_cmd.image, &cache, &progress_cb) catch |err| {
+        _ = isolazi.image.pullImage(allocator, pull_cmd.image, &cache, &progress_cb) catch |err| {
             try stderr.print("Error: Failed to pull image: {}\n", .{err});
             try stderr.flush();
             return 1;
         };
-        defer ref.deinit();
 
         try stdout.print("Successfully pulled {s}\n", .{pull_cmd.image});
         try stdout.flush();
@@ -2230,7 +2233,7 @@ const runOnLinux = if (builtin.os.tag == .linux) struct {
         };
         defer {
             for (images) |*img| {
-                @constCast(img).deinit();
+                @constCast(img).deinit(allocator);
             }
             allocator.free(images);
         }
@@ -2289,7 +2292,6 @@ const runOnLinux = if (builtin.os.tag == .linux) struct {
         var rootfs_path: []const u8 = undefined;
         var container_id: ?[12]u8 = null;
         var cache_opt: ?isolazi.image.ImageCache = null;
-        var ref_opt: ?isolazi.image.ImageReference = null;
         defer {
             if (cache_opt) |*c| {
                 // Cleanup container if we created one
@@ -2301,7 +2303,6 @@ const runOnLinux = if (builtin.os.tag == .linux) struct {
                 }
                 c.deinit();
             }
-            if (ref_opt) |*r| r.deinit();
         }
 
         if (run_cmd.is_image) {
@@ -2314,12 +2315,11 @@ const runOnLinux = if (builtin.os.tag == .linux) struct {
             cache_opt = cache;
 
             // Pull image if needed
-            var ref = isolazi.image.pullImage(allocator, run_cmd.rootfs, &cache, null) catch |err| {
+            const ref = isolazi.image.pullImage(allocator, run_cmd.rootfs, &cache, null) catch |err| {
                 try stderr.print("Error: Failed to pull image '{s}': {}\n", .{ run_cmd.rootfs, err });
                 try stderr.flush();
                 return 1;
             };
-            ref_opt = ref;
 
             // Get manifest and layer digests
             const manifest_data = cache.readManifest(&ref) catch |err| {
