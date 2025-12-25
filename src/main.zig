@@ -11,6 +11,24 @@ const std = @import("std");
 const builtin = @import("builtin");
 const isolazi = @import("isolazi");
 
+// Platform-specific module aliases for compile-time conditional access
+const windows = if (builtin.os.tag == .windows) isolazi.windows else struct {
+    pub fn isWslAvailable(_: std.mem.Allocator) bool {
+        return false;
+    }
+    pub fn windowsToWslPath(_: std.mem.Allocator, path: []const u8) ![]const u8 {
+        return path;
+    }
+    pub const WslConfig = struct {
+        distro: ?[]const u8,
+        isolazi_path: ?[]const u8,
+        run_as_root: bool,
+    };
+    pub fn execInWsl(_: std.mem.Allocator, _: WslConfig, _: []const []const u8) !u8 {
+        return 1;
+    }
+};
+
 pub fn main() !u8 {
     // Get the writer for stdout/stderr
     var stderr_buffer: [4096]u8 = undefined;
@@ -48,122 +66,130 @@ pub fn main() !u8 {
     }
 }
 
-/// Run on Windows using WSL2 backend.
-fn runOnWindows(
-    allocator: std.mem.Allocator,
-    args: []const []const u8,
-    stdout: anytype,
-    stderr: anytype,
-) !u8 {
-    // Handle help and version locally (no need for WSL)
-    if (args.len >= 2) {
-        const cmd = args[1];
-        if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
-            try isolazi.cli.printHelp(stdout);
-            try stdout.writeAll("\nWindows Note: Image pull/list work natively. Running containers requires Linux.\n");
-            try stdout.flush();
-            return 0;
-        }
-        if (std.mem.eql(u8, cmd, "version") or std.mem.eql(u8, cmd, "--version") or std.mem.eql(u8, cmd, "-v")) {
-            try isolazi.cli.printVersion(stdout);
-            try stdout.writeAll("Platform: Windows (native image pull, WSL2 for container run)\n");
-            try stdout.flush();
-            return 0;
-        }
-        // Handle pull and images commands locally (don't need WSL)
-        if (std.mem.eql(u8, cmd, "pull")) {
-            return pullImageWindows(allocator, args, stdout, stderr);
-        }
-        if (std.mem.eql(u8, cmd, "images")) {
-            return listImagesWindows(allocator, stdout, stderr);
-        }
-        // Handle run command - show message about Linux requirement
-        if (std.mem.eql(u8, cmd, "run")) {
-            return runContainerWindows(allocator, args, stdout, stderr);
-        }
-        // Container management commands
-        if (std.mem.eql(u8, cmd, "ps")) {
-            return listContainersWindows(allocator, args, stdout, stderr);
-        }
-        if (std.mem.eql(u8, cmd, "create")) {
-            return createContainerWindows(allocator, args, stdout, stderr);
-        }
-        if (std.mem.eql(u8, cmd, "start")) {
-            return startContainerWindows(allocator, args, stdout, stderr);
-        }
-        if (std.mem.eql(u8, cmd, "stop")) {
-            return stopContainerWindows(allocator, args, stdout, stderr);
-        }
-        if (std.mem.eql(u8, cmd, "rm")) {
-            return removeContainerWindows(allocator, args, stdout, stderr);
-        }
-        if (std.mem.eql(u8, cmd, "inspect")) {
-            return inspectContainerWindows(allocator, args, stdout, stderr);
-        }
-    }
-
-    // Check if WSL is available (only needed for 'run' command)
-    if (!isolazi.windows.isWslAvailable(allocator)) {
-        try stderr.writeAll("Error: WSL2 is not available.\n");
-        try stderr.writeAll("\nIsolazi on Windows requires WSL2 (Windows Subsystem for Linux).\n");
-        try stderr.writeAll("\nTo install WSL2:\n");
-        try stderr.writeAll("  1. Open PowerShell as Administrator\n");
-        try stderr.writeAll("  2. Run: wsl --install\n");
-        try stderr.writeAll("  3. Restart your computer\n");
-        try stderr.writeAll("  4. Install Isolazi in WSL: zig build -Doptimize=ReleaseFast\n");
-        try stderr.flush();
-        return 1;
-    }
-
-    // Convert Windows paths to WSL paths for the 'run' command
-    var wsl_args: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (wsl_args.items) |item| {
-            // Only free if it's not pointing to original args
-            var is_original = false;
-            for (args) |orig| {
-                if (item.ptr == orig.ptr) {
-                    is_original = true;
-                    break;
-                }
+/// Windows-specific functions - only compiled on Windows
+const runOnWindows = if (builtin.os.tag == .windows) struct {
+    fn call(
+        allocator: std.mem.Allocator,
+        args: []const []const u8,
+        stdout: anytype,
+        stderr: anytype,
+    ) !u8 {
+        // Handle help and version locally (no need for WSL)
+        if (args.len >= 2) {
+            const cmd = args[1];
+            if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
+                try isolazi.cli.printHelp(stdout);
+                try stdout.writeAll("\nWindows Note: Image pull/list work natively. Running containers requires Linux.\n");
+                try stdout.flush();
+                return 0;
             }
-            if (!is_original) allocator.free(item);
+            if (std.mem.eql(u8, cmd, "version") or std.mem.eql(u8, cmd, "--version") or std.mem.eql(u8, cmd, "-v")) {
+                try isolazi.cli.printVersion(stdout);
+                try stdout.writeAll("Platform: Windows (native image pull, WSL2 for container run)\n");
+                try stdout.flush();
+                return 0;
+            }
+            // Handle pull and images commands locally (don't need WSL)
+            if (std.mem.eql(u8, cmd, "pull")) {
+                return pullImageWindows(allocator, args, stdout, stderr);
+            }
+            if (std.mem.eql(u8, cmd, "images")) {
+                return listImagesWindows(allocator, stdout, stderr);
+            }
+            // Handle run command - show message about Linux requirement
+            if (std.mem.eql(u8, cmd, "run")) {
+                return runContainerWindows(allocator, args, stdout, stderr);
+            }
+            // Container management commands
+            if (std.mem.eql(u8, cmd, "ps")) {
+                return listContainersWindows(allocator, args, stdout, stderr);
+            }
+            if (std.mem.eql(u8, cmd, "create")) {
+                return createContainerWindows(allocator, args, stdout, stderr);
+            }
+            if (std.mem.eql(u8, cmd, "start")) {
+                return startContainerWindows(allocator, args, stdout, stderr);
+            }
+            if (std.mem.eql(u8, cmd, "stop")) {
+                return stopContainerWindows(allocator, args, stdout, stderr);
+            }
+            if (std.mem.eql(u8, cmd, "rm")) {
+                return removeContainerWindows(allocator, args, stdout, stderr);
+            }
+            if (std.mem.eql(u8, cmd, "inspect")) {
+                return inspectContainerWindows(allocator, args, stdout, stderr);
+            }
         }
-        wsl_args.deinit(allocator);
-    }
 
-    // Skip args[0] (program name), process the rest
-    for (args[1..]) |arg| {
-        // Check if this looks like a Windows path (has drive letter)
-        if (arg.len >= 2 and arg[1] == ':') {
-            const wsl_path = isolazi.windows.windowsToWslPath(allocator, arg) catch |err| {
-                try stderr.print("Error converting path '{s}': {}\n", .{ arg, err });
-                try stderr.flush();
-                return 1;
-            };
-            try wsl_args.append(allocator, wsl_path);
-        } else {
-            try wsl_args.append(allocator, arg);
+        // Check if WSL is available (only needed for 'run' command)
+        if (!windows.isWslAvailable(allocator)) {
+            try stderr.writeAll("Error: WSL2 is not available.\n");
+            try stderr.writeAll("\nIsolazi on Windows requires WSL2 (Windows Subsystem for Linux).\n");
+            try stderr.writeAll("\nTo install WSL2:\n");
+            try stderr.writeAll("  1. Open PowerShell as Administrator\n");
+            try stderr.writeAll("  2. Run: wsl --install\n");
+            try stderr.writeAll("  3. Restart your computer\n");
+            try stderr.writeAll("  4. Install Isolazi in WSL: zig build -Doptimize=ReleaseFast\n");
+            try stderr.flush();
+            return 1;
         }
+
+        // Convert Windows paths to WSL paths for the 'run' command
+        var wsl_args: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (wsl_args.items) |item| {
+                // Only free if it's not pointing to original args
+                var is_original = false;
+                for (args) |orig| {
+                    if (item.ptr == orig.ptr) {
+                        is_original = true;
+                        break;
+                    }
+                }
+                if (!is_original) allocator.free(item);
+            }
+            wsl_args.deinit(allocator);
+        }
+
+        // Skip args[0] (program name), process the rest
+        for (args[1..]) |arg| {
+            // Check if this looks like a Windows path (has drive letter)
+            if (arg.len >= 2 and arg[1] == ':') {
+                const wsl_path = windows.windowsToWslPath(allocator, arg) catch |err| {
+                    try stderr.print("Error converting path '{s}': {}\n", .{ arg, err });
+                    try stderr.flush();
+                    return 1;
+                };
+                try wsl_args.append(allocator, wsl_path);
+            } else {
+                try wsl_args.append(allocator, arg);
+            }
+        }
+
+        // Execute through WSL
+        const wsl_config = windows.WslConfig{
+            .distro = null, // Use default distro
+            .isolazi_path = null, // Assume isolazi is in PATH
+            .run_as_root = true, // Containers need root
+        };
+
+        return windows.execInWsl(allocator, wsl_config, wsl_args.items) catch |err| {
+            try stderr.print("Error executing in WSL: {}\n", .{err});
+            try stderr.writeAll("\nMake sure:\n");
+            try stderr.writeAll("  1. WSL2 is properly installed\n");
+            try stderr.writeAll("  2. Isolazi is installed in your WSL distribution\n");
+            try stderr.writeAll("  3. The rootfs path is accessible from WSL\n");
+            try stderr.flush();
+            return 1;
+        };
     }
-
-    // Execute through WSL
-    const wsl_config = isolazi.windows.WslConfig{
-        .distro = null, // Use default distro
-        .isolazi_path = null, // Assume isolazi is in PATH
-        .run_as_root = true, // Containers need root
-    };
-
-    return isolazi.windows.execInWsl(allocator, wsl_config, wsl_args.items) catch |err| {
-        try stderr.print("Error executing in WSL: {}\n", .{err});
-        try stderr.writeAll("\nMake sure:\n");
-        try stderr.writeAll("  1. WSL2 is properly installed\n");
-        try stderr.writeAll("  2. Isolazi is installed in your WSL distribution\n");
-        try stderr.writeAll("  3. The rootfs path is accessible from WSL\n");
+}.call else struct {
+    fn call(_: std.mem.Allocator, _: []const []const u8, _: anytype, stderr: anytype) !u8 {
+        try stderr.writeAll("Error: Windows support is not available on this platform.\n");
         try stderr.flush();
         return 1;
-    };
-}
+    }
+}.call;
 
 /// Pull image on Windows (native, no WSL needed)
 fn pullImageWindows(
@@ -489,7 +515,7 @@ fn runContainerWindows(
     }
 
     // Check if WSL is available
-    if (!isolazi.windows.isWslAvailable(allocator)) {
+    if (!windows.isWslAvailable(allocator)) {
         try stderr.writeAll("Error: WSL2 is required to run containers on Windows.\n");
         try stderr.writeAll("\nTo install WSL2:\n");
         try stderr.writeAll("  1. Open PowerShell as Administrator\n");
@@ -555,7 +581,7 @@ fn runContainerWindows(
     defer allocator.free(rootfs_path);
 
     // Convert Windows path to WSL path
-    const wsl_rootfs = isolazi.windows.windowsToWslPath(allocator, rootfs_path) catch |err| {
+    const wsl_rootfs = windows.windowsToWslPath(allocator, rootfs_path) catch |err| {
         try stderr.print("Error: Failed to convert path: {}\n", .{err});
         try stderr.flush();
         return 1;
@@ -620,7 +646,7 @@ fn runContainerWindows(
 
         // Mount each volume
         for (opts.volumes) |vol| {
-            const wsl_host = isolazi.windows.windowsToWslPath(allocator, vol.host_path) catch vol.host_path;
+            const wsl_host = windows.windowsToWslPath(allocator, vol.host_path) catch vol.host_path;
             try script_buf.appendSlice(allocator, "mkdir -p ");
             try script_buf.appendSlice(allocator, wsl_rootfs);
             try script_buf.appendSlice(allocator, vol.container_path);
@@ -972,7 +998,7 @@ fn startContainerWindows(
     defer allocator.free(rootfs_path);
 
     // Convert to WSL path
-    const wsl_rootfs = isolazi.windows.windowsToWslPath(allocator, rootfs_path) catch |err| {
+    const wsl_rootfs = windows.windowsToWslPath(allocator, rootfs_path) catch |err| {
         try stderr.print("Error: Failed to convert path: {}\n", .{err});
         try stderr.flush();
         return 1;
