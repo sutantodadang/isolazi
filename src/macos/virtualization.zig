@@ -570,7 +570,10 @@ pub fn runWithLima(
         if (err == error.FileNotFound) {
             return VirtualizationError.VMCreationFailed;
         }
-        // Try to continue anyway - VM might already be running
+        // VM might not exist, try to create it
+        _ = try createLimaInstance(allocator);
+        // After creating, try to start again
+        return runWithLima(allocator, "", rootfs_path, command, env_vars, volumes);
     };
 
     if (start_result.term.Exited != 0) {

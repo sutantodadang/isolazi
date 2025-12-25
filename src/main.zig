@@ -2248,7 +2248,7 @@ const runOnLinux = if (builtin.os.tag == .linux) struct {
                 try stdout.print("{s}/{s}                  {s}\n", .{
                     img.registry,
                     img.repository,
-                    img.tag orelse "latest",
+                    img.tag,
                 });
             }
         }
