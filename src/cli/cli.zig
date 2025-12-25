@@ -352,7 +352,7 @@ pub fn buildConfig(run_cmd: *const RunCommand) !Config {
 
     // Copy volume mounts
     for (run_cmd.volumes) |vol| {
-        try cfg.addMount(vol.host_path, vol.container_path);
+        try cfg.addMount(vol.host_path, vol.container_path, vol.read_only);
     }
 
     // Use chroot instead of pivot_root if requested
