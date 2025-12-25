@@ -35,6 +35,26 @@ pub const CliError = error{
     TooManyEnvVars,
     TooManyMounts,
     HostnameTooLong,
+    InvalidEnvVar,
+    InvalidVolumeMount,
+};
+
+/// Maximum number of environment variables
+pub const MAX_ENV_VARS = 64;
+/// Maximum number of volume mounts
+pub const MAX_VOLUMES = 32;
+
+/// Environment variable
+pub const EnvVar = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+/// Volume mount
+pub const VolumeMount = struct {
+    host_path: []const u8,
+    container_path: []const u8,
+    read_only: bool = false,
 };
 
 /// Parsed command from CLI
@@ -55,6 +75,8 @@ pub const RunCommand = struct {
     cwd: ?[]const u8 = null,
     use_chroot: bool = false, // Use chroot instead of pivot_root
     is_image: bool = false, // true if rootfs is an OCI image reference
+    env_vars: []const EnvVar = &[_]EnvVar{},
+    volumes: []const VolumeMount = &[_]VolumeMount{},
 };
 
 /// Arguments for the 'pull' command
@@ -114,6 +136,12 @@ fn parseRunCommand(args: []const []const u8) CliError!Command {
         .args = &[_][]const u8{},
     };
 
+    // Static arrays to store env vars and volumes (avoids allocation)
+    var env_vars_buf: [MAX_ENV_VARS]EnvVar = undefined;
+    var env_vars_count: usize = 0;
+    var volumes_buf: [MAX_VOLUMES]VolumeMount = undefined;
+    var volumes_count: usize = 0;
+
     var i: usize = 0;
     var positional_count: usize = 0;
     var command_args_start: usize = 0;
@@ -134,6 +162,29 @@ fn parseRunCommand(args: []const []const u8) CliError!Command {
                 run_cmd.cwd = args[i];
             } else if (std.mem.eql(u8, arg, "--chroot")) {
                 run_cmd.use_chroot = true;
+            } else if (std.mem.eql(u8, arg, "-e") or std.mem.eql(u8, arg, "--env")) {
+                // Environment variable: -e KEY=VALUE
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                if (env_vars_count >= MAX_ENV_VARS) return CliError.TooManyEnvVars;
+
+                const env_str = args[i];
+                const env_var = parseEnvVar(env_str) orelse return CliError.InvalidEnvVar;
+                env_vars_buf[env_vars_count] = env_var;
+                env_vars_count += 1;
+            } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--volume")) {
+                // Volume mount: -v /host/path:/container/path[:ro]
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                if (volumes_count >= MAX_VOLUMES) return CliError.TooManyMounts;
+
+                const vol_str = args[i];
+                const volume = parseVolumeMount(vol_str) orelse return CliError.InvalidVolumeMount;
+                volumes_buf[volumes_count] = volume;
+                volumes_count += 1;
+            } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--detach")) {
+                // Detach mode is handled at the main.zig level, just skip here
+                continue;
             } else {
                 return CliError.InvalidArgument;
             }
@@ -151,6 +202,14 @@ fn parseRunCommand(args: []const []const u8) CliError!Command {
         }
     }
 
+    // Store env vars and volumes in the command
+    if (env_vars_count > 0) {
+        run_cmd.env_vars = env_vars_buf[0..env_vars_count];
+    }
+    if (volumes_count > 0) {
+        run_cmd.volumes = volumes_buf[0..volumes_count];
+    }
+
     if (positional_count < 1) {
         return CliError.MissingRootfs;
     }
@@ -164,6 +223,63 @@ fn parseRunCommand(args: []const []const u8) CliError!Command {
     }
 
     return Command{ .run = run_cmd };
+}
+
+/// Parse an environment variable string "KEY=VALUE"
+fn parseEnvVar(s: []const u8) ?EnvVar {
+    const eq_pos = std.mem.indexOf(u8, s, "=") orelse return null;
+    if (eq_pos == 0) return null; // Empty key
+
+    return EnvVar{
+        .key = s[0..eq_pos],
+        .value = s[eq_pos + 1 ..],
+    };
+}
+
+/// Parse a volume mount string "/host/path:/container/path[:ro]"
+fn parseVolumeMount(s: []const u8) ?VolumeMount {
+    // Find the first colon (could be Windows drive letter)
+    var colon_pos: usize = 0;
+
+    // Handle Windows paths (C:\path)
+    if (s.len >= 2 and s[1] == ':' and (s[0] >= 'A' and s[0] <= 'Z' or s[0] >= 'a' and s[0] <= 'z')) {
+        // Windows path, skip first colon
+        colon_pos = if (std.mem.indexOf(u8, s[2..], ":")) |pos| pos + 2 else return null;
+    } else {
+        colon_pos = std.mem.indexOf(u8, s, ":") orelse return null;
+    }
+
+    if (colon_pos == 0) return null; // Empty host path
+
+    const host_path = s[0..colon_pos];
+    const rest = s[colon_pos + 1 ..];
+
+    // Check for read-only flag and container path
+    var container_path: []const u8 = undefined;
+    var read_only = false;
+
+    if (std.mem.lastIndexOf(u8, rest, ":")) |last_colon| {
+        const suffix = rest[last_colon + 1 ..];
+        if (std.mem.eql(u8, suffix, "ro")) {
+            read_only = true;
+            container_path = rest[0..last_colon];
+        } else if (std.mem.eql(u8, suffix, "rw")) {
+            container_path = rest[0..last_colon];
+        } else {
+            // No valid suffix, use entire rest as container path
+            container_path = rest;
+        }
+    } else {
+        container_path = rest;
+    }
+
+    if (container_path.len == 0) return null;
+
+    return VolumeMount{
+        .host_path = host_path,
+        .container_path = container_path,
+        .read_only = read_only,
+    };
 }
 
 /// Parse the 'pull' subcommand arguments.
@@ -255,9 +371,11 @@ pub fn printHelp(writer: anytype) !void {
         \\    help                             Print this help message
         \\
         \\OPTIONS for 'run':
-        \\    -d, --detach         Run container in background
-        \\    --hostname <name>    Set the container hostname
-        \\    --cwd <path>         Set the working directory
+        \\    -d, --detach              Run container in background
+        \\    -e, --env KEY=VALUE       Set environment variable (can be repeated)
+        \\    -v, --volume SRC:DST[:ro] Mount a volume (can be repeated)
+        \\    --hostname <name>         Set the container hostname
+        \\    --cwd <path>              Set the working directory
         \\
         \\OPTIONS for 'ps':
         \\    -a, --all            Show all containers (default: only running)
@@ -274,6 +392,8 @@ pub fn printHelp(writer: anytype) !void {
         \\    isolazi pull alpine:3.18
         \\    isolazi run alpine /bin/sh
         \\    isolazi run -d alpine sleep 300
+        \\    isolazi run -e DB_HOST=localhost -e DB_PORT=5432 postgres /bin/sh
+        \\    isolazi run -v /data:/app/data -v /config:/etc/myapp:ro alpine /bin/sh
         \\    isolazi create --name myapp alpine
         \\    isolazi start myapp
         \\    isolazi ps -a
@@ -299,9 +419,11 @@ pub fn printError(writer: anytype, err: CliError) !void {
         CliError.InvalidArgument => "Invalid argument",
         CliError.PathTooLong => "Path too long",
         CliError.TooManyArguments => "Too many arguments",
-        CliError.TooManyEnvVars => "Too many environment variables",
-        CliError.TooManyMounts => "Too many bind mounts",
+        CliError.TooManyEnvVars => "Too many environment variables (max 64)",
+        CliError.TooManyMounts => "Too many bind mounts (max 32)",
         CliError.HostnameTooLong => "Hostname too long",
+        CliError.InvalidEnvVar => "Invalid environment variable format (use KEY=VALUE)",
+        CliError.InvalidVolumeMount => "Invalid volume mount format (use /host/path:/container/path[:ro])",
     };
     try writer.print("Error: {s}\n", .{msg});
     try writer.writeAll("Run 'isolazi help' for usage information.\n");

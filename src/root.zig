@@ -50,6 +50,9 @@ pub const container = @import("container/mod.zig");
 // Windows-specific modules (WSL backend)
 pub const windows = if (builtin.os.tag == .windows) @import("windows/mod.zig") else struct {};
 
+// macOS-specific modules (Apple Virtualization backend)
+pub const macos = if (builtin.os.tag == .macos) @import("macos/mod.zig") else struct {};
+
 /// Check if we're running on Linux
 pub fn isLinux() bool {
     return builtin.os.tag == .linux;
@@ -58,6 +61,11 @@ pub fn isLinux() bool {
 /// Check if we have Windows (for future Windows Container support)
 pub fn isWindows() bool {
     return builtin.os.tag == .windows;
+}
+
+/// Check if we're running on macOS
+pub fn isMacOS() bool {
+    return builtin.os.tag == .macos;
 }
 
 // Re-export commonly used types
