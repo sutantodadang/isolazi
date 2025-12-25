@@ -149,6 +149,55 @@ pub const ContainerManager = struct {
         return container_id;
     }
 
+    /// Create a new container with a pre-generated ID (does not start it)
+    pub fn createContainerWithId(
+        self: *Self,
+        container_id: *const [32]u8,
+        image: []const u8,
+        command: []const u8,
+        name: ?[]const u8,
+    ) !void {
+        // Create container directory
+        const container_dir = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.base_path, container_id });
+        defer self.allocator.free(container_dir);
+        try std.fs.cwd().makePath(container_dir);
+
+        // Write state file
+        const state_path = try std.fmt.allocPrint(self.allocator, "{s}/state.json", .{container_dir});
+        defer self.allocator.free(state_path);
+
+        // Build name string
+        var name_buf: [256]u8 = undefined;
+        const name_str: []const u8 = if (name) |n|
+            std.fmt.bufPrint(&name_buf, "\"{s}\"", .{n}) catch "null"
+        else
+            "null";
+
+        var json_buf: [4096]u8 = undefined;
+        const json = try std.fmt.bufPrint(&json_buf,
+            \\{{
+            \\  "id": "{s}",
+            \\  "image": "{s}",
+            \\  "command": "{s}",
+            \\  "state": "running",
+            \\  "created_at": {d},
+            \\  "started_at": {d},
+            \\  "name": {s}
+            \\}}
+        , .{
+            container_id,
+            image,
+            command,
+            std.time.timestamp(),
+            std.time.timestamp(),
+            name_str,
+        });
+
+        const file = try std.fs.cwd().createFile(state_path, .{});
+        defer file.close();
+        try file.writeAll(json);
+    }
+
     /// Update container state
     pub fn updateState(
         self: *Self,
@@ -377,6 +426,50 @@ pub const ContainerManager = struct {
         }
 
         try self.updateState(container_id, .stopped, null, null);
+    }
+
+    /// Prune all non-running containers
+    pub fn pruneContainers(self: *Self) !u64 {
+        var removed: u64 = 0;
+
+        var dir = std.fs.cwd().openDir(self.base_path, .{ .iterate = true }) catch {
+            return removed;
+        };
+        defer dir.close();
+
+        // Collect container IDs to remove (can't modify while iterating)
+        var to_remove: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (to_remove.items) |id| {
+                self.allocator.free(id);
+            }
+            to_remove.deinit(self.allocator);
+        }
+
+        var iter = dir.iterate();
+        while (try iter.next()) |entry| {
+            if (entry.kind != .directory) continue;
+            if (entry.name.len != 32) continue;
+
+            const info = self.getContainer(entry.name) catch continue;
+            defer {
+                var info_mut = info;
+                info_mut.deinit();
+            }
+
+            // Only prune non-running containers
+            if (info.state != .running) {
+                try to_remove.append(self.allocator, try self.allocator.dupe(u8, entry.name));
+            }
+        }
+
+        // Now remove them
+        for (to_remove.items) |container_id| {
+            self.removeContainer(container_id, true) catch continue;
+            removed += 1;
+        }
+
+        return removed;
     }
 
     /// Find container by ID prefix or name

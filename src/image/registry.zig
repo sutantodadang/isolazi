@@ -103,9 +103,13 @@ pub const RegistryClient = struct {
         }
 
         const term = child.wait() catch return RegistryError.NetworkError;
-        if (term.Exited != 0) {
-            result.deinit(self.allocator);
-            return RegistryError.NetworkError;
+        switch (term) {
+            .Exited => |code| {
+                if (code != 0) {
+                    return RegistryError.NetworkError;
+                }
+            },
+            else => return RegistryError.NetworkError,
         }
 
         return result.toOwnedSlice(self.allocator);

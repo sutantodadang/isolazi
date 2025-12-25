@@ -343,6 +343,18 @@ pub fn buildConfig(run_cmd: *const RunCommand) !Config {
         try cfg.setCwd(c);
     }
 
+    // Copy environment variables
+    for (run_cmd.env_vars) |env| {
+        var buf: [4096]u8 = undefined;
+        const env_str = std.fmt.bufPrint(&buf, "{s}={s}", .{ env.key, env.value }) catch continue;
+        try cfg.addEnv(env_str);
+    }
+
+    // Copy volume mounts
+    for (run_cmd.volumes) |vol| {
+        try cfg.addMount(vol.host_path, vol.container_path);
+    }
+
     // Use chroot instead of pivot_root if requested
     cfg.use_pivot_root = !run_cmd.use_chroot;
 
@@ -367,13 +379,15 @@ pub fn printHelp(writer: anytype) !void {
         \\    inspect <container>              Display container details
         \\    pull <image>                     Pull an image from a registry
         \\    images                           List cached images
+        \\    prune                            Remove all stopped containers and unused images
         \\    version                          Print version information
         \\    help                             Print this help message
         \\
         \\OPTIONS for 'run':
         \\    -d, --detach              Run container in background
-        \\    -e, --env KEY=VALUE       Set environment variable (can be repeated)
+        \\    -e, --env KEY=VALUE       Set environment variable (can use comma: KEY1=V1,KEY2=V2)
         \\    -v, --volume SRC:DST[:ro] Mount a volume (can be repeated)
+        \\    -p, --port HOST:CONTAINER Publish port (can be repeated)
         \\    --hostname <name>         Set the container hostname
         \\    --cwd <path>              Set the working directory
         \\
@@ -394,10 +408,12 @@ pub fn printHelp(writer: anytype) !void {
         \\    isolazi run -d alpine sleep 300
         \\    isolazi run -e DB_HOST=localhost -e DB_PORT=5432 postgres /bin/sh
         \\    isolazi run -v /data:/app/data -v /config:/etc/myapp:ro alpine /bin/sh
+        \\    isolazi run postgres:16-alpine -d -p 5432:5432 -v /mydata:/var/lib/postgresql -e POSTGRES_PASSWORD=secret
         \\    isolazi create --name myapp alpine
         \\    isolazi start myapp
         \\    isolazi ps -a
         \\    isolazi stop myapp
+        \\    isolazi prune
         \\    isolazi rm myapp
         \\
     );
