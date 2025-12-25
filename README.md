@@ -50,6 +50,21 @@ isolazi run alpine echo "Hello from container!"
 
 # Run in detached mode
 isolazi run -d alpine sleep 300
+
+# With environment variables
+isolazi run -e MYVAR=hello -e DEBUG=1 alpine env
+
+# With volume mounts
+isolazi run -v /host/data:/container/data alpine ls /container/data
+
+# With port publishing
+isolazi run -d -p 8080:80 nginx
+
+# Run PostgreSQL with all options
+isolazi run -d -p 5432:5432 \
+  -e POSTGRES_PASSWORD=secret,POSTGRES_USER=myuser,POSTGRES_DB=mydb \
+  -v /mydata:/var/lib/postgresql/data \
+  postgres:16-alpine
 ```
 
 ### Container Management
@@ -78,6 +93,9 @@ isolazi rm -f myapp
 
 # Inspect container details
 isolazi inspect myapp
+
+# Clean up stopped containers and unused images
+isolazi prune
 ```
 
 ### Image Management
@@ -106,13 +124,17 @@ COMMANDS:
     inspect <container>              Display container details
     pull <image>                     Pull an image from a registry
     images                           List cached images
+    prune                            Remove stopped containers and unused images
     version                          Print version information
     help                             Print this help message
 
 OPTIONS for 'run':
-    -d, --detach         Run container in background
-    --hostname <name>    Set the container hostname
-    --cwd <path>         Set the working directory
+    -d, --detach              Run container in background
+    -e, --env KEY=VALUE       Set environment variable (comma-separated: KEY1=V1,KEY2=V2)
+    -v, --volume SRC:DST[:ro] Mount a volume (can be repeated)
+    -p, --port HOST:CONTAINER Publish container port to host (can be repeated)
+    --hostname <name>         Set the container hostname
+    --cwd <path>              Set the working directory
 
 OPTIONS for 'ps':
     -a, --all            Show all containers (default: only running)
