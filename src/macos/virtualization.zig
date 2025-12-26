@@ -484,44 +484,6 @@ pub fn runWithVfkit(
         allocs_to_free.deinit(allocator);
     }
 
-    // Add bootloader configuration (new vfkit format)
-    // Format: --bootloader linux,kernel=path,cmdline="..."
-    const bootloader_arg = try std.fmt.allocPrint(
-        allocator,
-        "linux,kernel={s}",
-        .{kernel_path},
-    );
-    try allocs_to_free.append(allocator, bootloader_arg);
-    try vfkit_args.append(allocator, "--bootloader");
-    try vfkit_args.append(allocator, bootloader_arg);
-
-    // Add VirtioFS for rootfs sharing using --device virtio-fs format
-    // Format: --device virtio-fs,sharedDir=/path,mountTag=tag
-    const virtfs_arg = try std.fmt.allocPrint(
-        allocator,
-        "virtio-fs,sharedDir={s},mountTag=rootfs",
-        .{rootfs_path},
-    );
-    try allocs_to_free.append(allocator, virtfs_arg);
-    try vfkit_args.append(allocator, "--device");
-    try vfkit_args.append(allocator, virtfs_arg);
-
-    // Add additional VirtioFS mounts for volumes
-    for (volumes, 0..) |vol, i| {
-        const vol_arg = try std.fmt.allocPrint(
-            allocator,
-            "virtio-fs,sharedDir={s},mountTag=vol{d}",
-            .{ vol.host_path, i },
-        );
-        try allocs_to_free.append(allocator, vol_arg);
-        try vfkit_args.append(allocator, "--device");
-        try vfkit_args.append(allocator, vol_arg);
-    }
-
-    // Add serial console device for output
-    try vfkit_args.append(allocator, "--device");
-    try vfkit_args.append(allocator, "virtio-serial,stdio");
-
     // Build kernel cmdline with init script that sets clean environment
     var cmdline_parts: std.ArrayList(u8) = .empty;
     defer cmdline_parts.deinit(allocator);
@@ -553,11 +515,44 @@ pub fn runWithVfkit(
     }
     try cmdline_parts.append(allocator, '\'');
 
-    // Use deprecated --kernel-cmdline for now (works with older and newer vfkit)
-    const cmdline_str = try allocator.dupe(u8, cmdline_parts.items);
-    try allocs_to_free.append(allocator, cmdline_str);
-    try vfkit_args.append(allocator, "--kernel-cmdline");
-    try vfkit_args.append(allocator, cmdline_str);
+    // Add bootloader configuration (new vfkit format)
+    // Format: --bootloader linux,kernel=path,cmdline="..."
+    // Note: cmdline must be quoted and inner quotes escaped
+    const bootloader_arg = try std.fmt.allocPrint(
+        allocator,
+        "linux,kernel={s},cmdline=\"{s}\"",
+        .{ kernel_path, cmdline_parts.items },
+    );
+    try allocs_to_free.append(allocator, bootloader_arg);
+    try vfkit_args.append(allocator, "--bootloader");
+    try vfkit_args.append(allocator, bootloader_arg);
+
+    // Add VirtioFS for rootfs sharing using --device virtio-fs format
+    // Format: --device virtio-fs,sharedDir=/path,mountTag=tag
+    const virtfs_arg = try std.fmt.allocPrint(
+        allocator,
+        "virtio-fs,sharedDir={s},mountTag=rootfs",
+        .{rootfs_path},
+    );
+    try allocs_to_free.append(allocator, virtfs_arg);
+    try vfkit_args.append(allocator, "--device");
+    try vfkit_args.append(allocator, virtfs_arg);
+
+    // Add additional VirtioFS mounts for volumes
+    for (volumes, 0..) |vol, i| {
+        const vol_arg = try std.fmt.allocPrint(
+            allocator,
+            "virtio-fs,sharedDir={s},mountTag=vol{d}",
+            .{ vol.host_path, i },
+        );
+        try allocs_to_free.append(allocator, vol_arg);
+        try vfkit_args.append(allocator, "--device");
+        try vfkit_args.append(allocator, vol_arg);
+    }
+
+    // Add serial console device for output
+    try vfkit_args.append(allocator, "--device");
+    try vfkit_args.append(allocator, "virtio-serial,stdio");
 
     // Execute vfkit
     var child = std.process.Child.init(vfkit_args.items, allocator);
