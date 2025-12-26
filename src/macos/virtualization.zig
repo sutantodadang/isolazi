@@ -347,13 +347,12 @@ pub fn createVMHelperScript(allocator: std.mem.Allocator) ![]const u8 {
         \\    # Check for vfkit (preferred on Apple Silicon)
         \\    if command -v vfkit &> /dev/null; then
         \\        vfkit \
-        \\            --kernel "$kernel" \
-        \\            --initrd "$initramfs" \
-        \\            --kernel-cmdline "console=hvc0 root=/dev/vda" \
+        \\            --bootloader "linux,kernel=$kernel,initrd=$initramfs,cmdline=\"console=hvc0 root=/dev/vda\"" \
         \\            --cpus 2 \
         \\            --memory 2048 \
-        \\            --virtio-fs "path=$rootfs,mount-tag=rootfs" \
-        \\            --virtio-vsock "port=2222,socketURL=$SOCKET_PATH" &
+        \\            --device "virtio-fs,sharedDir=$rootfs,mountTag=rootfs" \
+        \\            --device "virtio-vsock,port=2222,socketURL=$SOCKET_PATH" \
+        \\            --device virtio-serial,stdio &
         \\    elif command -v limactl &> /dev/null; then
         \\        # Fallback to Lima
         \\        limactl start isolazi 2>/dev/null || true
@@ -473,8 +472,6 @@ pub fn runWithVfkit(
     defer vfkit_args.deinit(allocator);
 
     try vfkit_args.append(allocator, "vfkit");
-    try vfkit_args.append(allocator, "--kernel");
-    try vfkit_args.append(allocator, kernel_path);
     try vfkit_args.append(allocator, "--cpus");
     try vfkit_args.append(allocator, "2");
     try vfkit_args.append(allocator, "--memory");
@@ -487,36 +484,43 @@ pub fn runWithVfkit(
         allocs_to_free.deinit(allocator);
     }
 
-    // Add VirtioFS for rootfs sharing
+    // Add bootloader configuration (new vfkit format)
+    // Format: --bootloader linux,kernel=path,cmdline="..."
+    const bootloader_arg = try std.fmt.allocPrint(
+        allocator,
+        "linux,kernel={s}",
+        .{kernel_path},
+    );
+    try allocs_to_free.append(allocator, bootloader_arg);
+    try vfkit_args.append(allocator, "--bootloader");
+    try vfkit_args.append(allocator, bootloader_arg);
+
+    // Add VirtioFS for rootfs sharing using --device virtio-fs format
+    // Format: --device virtio-fs,sharedDir=/path,mountTag=tag
     const virtfs_arg = try std.fmt.allocPrint(
         allocator,
-        "path={s},mount-tag=rootfs",
+        "virtio-fs,sharedDir={s},mountTag=rootfs",
         .{rootfs_path},
     );
-    defer allocator.free(virtfs_arg);
-
-    try vfkit_args.append(allocator, "--virtio-fs");
+    try allocs_to_free.append(allocator, virtfs_arg);
+    try vfkit_args.append(allocator, "--device");
     try vfkit_args.append(allocator, virtfs_arg);
 
     // Add additional VirtioFS mounts for volumes
-    var volume_allocs: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (volume_allocs.items) |alloc| {
-            allocator.free(alloc);
-        }
-        volume_allocs.deinit(allocator);
-    }
-
     for (volumes, 0..) |vol, i| {
         const vol_arg = try std.fmt.allocPrint(
             allocator,
-            "path={s},mount-tag=vol{d}",
+            "virtio-fs,sharedDir={s},mountTag=vol{d}",
             .{ vol.host_path, i },
         );
-        try volume_allocs.append(allocator, vol_arg);
-        try vfkit_args.append(allocator, "--virtio-fs");
+        try allocs_to_free.append(allocator, vol_arg);
+        try vfkit_args.append(allocator, "--device");
         try vfkit_args.append(allocator, vol_arg);
     }
+
+    // Add serial console device for output
+    try vfkit_args.append(allocator, "--device");
+    try vfkit_args.append(allocator, "virtio-serial,stdio");
 
     // Build kernel cmdline with init script that sets clean environment
     var cmdline_parts: std.ArrayList(u8) = .empty;
@@ -549,8 +553,11 @@ pub fn runWithVfkit(
     }
     try cmdline_parts.append(allocator, '\'');
 
+    // Use deprecated --kernel-cmdline for now (works with older and newer vfkit)
+    const cmdline_str = try allocator.dupe(u8, cmdline_parts.items);
+    try allocs_to_free.append(allocator, cmdline_str);
     try vfkit_args.append(allocator, "--kernel-cmdline");
-    try vfkit_args.append(allocator, cmdline_parts.items);
+    try vfkit_args.append(allocator, cmdline_str);
 
     // Execute vfkit
     var child = std.process.Child.init(vfkit_args.items, allocator);
