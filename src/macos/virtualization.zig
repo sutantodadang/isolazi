@@ -285,11 +285,195 @@ pub fn convertMacOSPath(
     return try std.fmt.allocPrint(allocator, "/mnt/{s}", .{mount_tag});
 }
 
+/// Download a file from a URL using curl
+fn downloadFile(allocator: std.mem.Allocator, url: []const u8, dest_path: []const u8) !void {
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &[_][]const u8{
+            "curl",
+            "-fSL",
+            "--progress-bar",
+            "-o",
+            dest_path,
+            url,
+        },
+    }) catch return VirtualizationError.CommandFailed;
+
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    if (result.term.Exited != 0) {
+        return VirtualizationError.CommandFailed;
+    }
+}
+
+/// Create a minimal initramfs that mounts virtio-fs rootfs and switches to it.
+/// This creates a cpio archive with busybox-based init.
+fn createMinimalInitramfs(allocator: std.mem.Allocator, initramfs_path: []const u8) !void {
+    const assets_dir = std.fs.path.dirname(initramfs_path) orelse return VirtualizationError.ConfigurationInvalid;
+
+    // Create initramfs build directory
+    const build_dir = try std.fmt.allocPrint(allocator, "{s}/initramfs-build", .{assets_dir});
+    defer allocator.free(build_dir);
+
+    // Remove old build dir if exists
+    std.fs.deleteTreeAbsolute(build_dir) catch {};
+
+    // Create directory structure
+    const dirs = [_][]const u8{
+        "",
+        "/bin",
+        "/sbin",
+        "/etc",
+        "/proc",
+        "/sys",
+        "/dev",
+        "/mnt",
+        "/mnt/rootfs",
+        "/lib",
+        "/lib64",
+    };
+
+    for (dirs) |dir| {
+        const full_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ build_dir, dir });
+        defer allocator.free(full_path);
+        std.fs.makeDirAbsolute(full_path) catch |err| {
+            if (err != error.PathAlreadyExists) return err;
+        };
+    }
+
+    // Create init script that mounts virtio-fs and switches root
+    const init_script =
+        \\#!/bin/sh
+        \\# Minimal init for isolazi VM
+        \\
+        \\# Mount essential filesystems
+        \\mount -t proc proc /proc
+        \\mount -t sysfs sys /sys
+        \\mount -t devtmpfs dev /dev
+        \\
+        \\# Mount virtio-fs rootfs
+        \\mount -t virtiofs rootfs /mnt/rootfs
+        \\
+        \\# Switch root to the container rootfs
+        \\exec switch_root /mnt/rootfs /sbin/init "$@"
+    ;
+
+    const init_path = try std.fmt.allocPrint(allocator, "{s}/init", .{build_dir});
+    defer allocator.free(init_path);
+
+    const init_file = try std.fs.createFileAbsolute(init_path, .{});
+    defer init_file.close();
+    try init_file.writeAll(init_script);
+
+    // Make init executable
+    _ = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &[_][]const u8{ "chmod", "+x", init_path },
+    }) catch {};
+
+    // Download busybox static binary for arm64
+    const busybox_path = try std.fmt.allocPrint(allocator, "{s}/bin/busybox", .{build_dir});
+    defer allocator.free(busybox_path);
+
+    // Use busybox from Alpine Linux (static arm64 build)
+    const busybox_url = "https://busybox.net/downloads/binaries/1.35.0-arm64-linux-musl/busybox";
+
+    std.debug.print("Downloading busybox for initramfs...\n", .{});
+    try downloadFile(allocator, busybox_url, busybox_path);
+
+    // Make busybox executable
+    _ = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &[_][]const u8{ "chmod", "+x", busybox_path },
+    }) catch {};
+
+    // Create busybox symlinks
+    const busybox_cmds = [_][]const u8{
+        "sh",
+        "mount",
+        "umount",
+        "switch_root",
+        "cat",
+        "ls",
+        "mkdir",
+        "mknod",
+        "sleep",
+    };
+
+    for (busybox_cmds) |cmd| {
+        const link_path = try std.fmt.allocPrint(allocator, "{s}/bin/{s}", .{ build_dir, cmd });
+        defer allocator.free(link_path);
+
+        // Create symlink: ln -sf busybox <cmd>
+        _ = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &[_][]const u8{ "ln", "-sf", "busybox", link_path },
+        }) catch {};
+    }
+
+    // Also link to /sbin
+    const sbin_cmds = [_][]const u8{ "init", "switch_root" };
+    for (sbin_cmds) |cmd| {
+        const link_path = try std.fmt.allocPrint(allocator, "{s}/sbin/{s}", .{ build_dir, cmd });
+        defer allocator.free(link_path);
+
+        _ = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &[_][]const u8{ "ln", "-sf", "../bin/busybox", link_path },
+        }) catch {};
+    }
+
+    // Create initramfs cpio archive
+    // (cd build_dir && find . | cpio -o -H newc | gzip > initramfs)
+    std.debug.print("Creating initramfs cpio archive...\n", .{});
+
+    const script_path = try std.fmt.allocPrint(allocator, "{s}/create-initramfs.sh", .{assets_dir});
+    defer allocator.free(script_path);
+
+    const create_script = try std.fmt.allocPrint(
+        allocator,
+        \\#!/bin/sh
+        \\cd "{s}" && find . | cpio -o -H newc 2>/dev/null | gzip > "{s}"
+    ,
+        .{ build_dir, initramfs_path },
+    );
+    defer allocator.free(create_script);
+
+    const script_file = try std.fs.createFileAbsolute(script_path, .{});
+    defer script_file.close();
+    try script_file.writeAll(create_script);
+
+    _ = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &[_][]const u8{ "chmod", "+x", script_path },
+    }) catch {};
+
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &[_][]const u8{ "sh", script_path },
+    }) catch return VirtualizationError.CommandFailed;
+
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    if (result.term.Exited != 0) {
+        return VirtualizationError.CommandFailed;
+    }
+
+    // Clean up build directory
+    std.fs.deleteTreeAbsolute(build_dir) catch {};
+    std.fs.deleteFileAbsolute(script_path) catch {};
+
+    std.debug.print("Initramfs created at: {s}\n", .{initramfs_path});
+}
+
 /// Download and setup the Linux VM assets if not present.
-/// This downloads a minimal Linux kernel and initramfs.
+/// This downloads a minimal Linux kernel from gokrazy/kernel.arm64.
+/// For ARM64 macOS (Apple Silicon), we use the arm64 kernel.
 pub fn ensureVMAssets(allocator: std.mem.Allocator) !struct {
     kernel_path: []const u8,
-    initramfs_path: []const u8,
+    initramfs_path: ?[]const u8,
 } {
     const assets_dir = try getVMAssetsDir(allocator);
     defer allocator.free(assets_dir);
@@ -302,21 +486,43 @@ pub fn ensureVMAssets(allocator: std.mem.Allocator) !struct {
     };
 
     const kernel_path = try std.fmt.allocPrint(allocator, "{s}/vmlinuz", .{assets_dir});
-    const initramfs_path = try std.fmt.allocPrint(allocator, "{s}/initramfs", .{assets_dir});
+    errdefer allocator.free(kernel_path);
 
-    // Check if assets exist
+    const initramfs_path = try std.fmt.allocPrint(allocator, "{s}/initramfs.cpio.gz", .{assets_dir});
+    errdefer allocator.free(initramfs_path);
+
+    // Check if kernel exists, if not download it
     const kernel_exists = blk: {
         std.fs.accessAbsolute(kernel_path, .{}) catch break :blk false;
         break :blk true;
     };
 
     if (!kernel_exists) {
-        // Assets need to be downloaded or built
-        // In a full implementation, we would download pre-built assets
-        // or guide the user to install them
-        allocator.free(kernel_path);
-        allocator.free(initramfs_path);
-        return VirtualizationError.KernelNotFound;
+        // Download kernel from gokrazy/kernel.arm64 repository
+        // The vmlinuz file is available directly in the repo
+        const kernel_url = "https://raw.githubusercontent.com/gokrazy/kernel.arm64/main/vmlinuz";
+
+        std.debug.print("Downloading Linux kernel from gokrazy/kernel.arm64...\n", .{});
+        downloadFile(allocator, kernel_url, kernel_path) catch {
+            allocator.free(kernel_path);
+            allocator.free(initramfs_path);
+            return VirtualizationError.KernelNotFound;
+        };
+        std.debug.print("Kernel downloaded to: {s}\n", .{kernel_path});
+    }
+
+    // Check if initramfs exists, if not create it
+    const initramfs_exists = blk: {
+        std.fs.accessAbsolute(initramfs_path, .{}) catch break :blk false;
+        break :blk true;
+    };
+
+    if (!initramfs_exists) {
+        createMinimalInitramfs(allocator, initramfs_path) catch {
+            allocator.free(kernel_path);
+            allocator.free(initramfs_path);
+            return VirtualizationError.InitramfsNotFound;
+        };
     }
 
     return .{
@@ -462,6 +668,7 @@ pub const VolumePair = struct {
 pub fn runWithVfkit(
     allocator: std.mem.Allocator,
     kernel_path: []const u8,
+    initramfs_path: ?[]const u8,
     rootfs_path: []const u8,
     command: []const []const u8,
     env_vars: []const EnvPair,
@@ -516,13 +723,20 @@ pub fn runWithVfkit(
     try cmdline_parts.append(allocator, '\'');
 
     // Add bootloader configuration (new vfkit format)
-    // Format: --bootloader linux,kernel=path,cmdline="..."
+    // Format: --bootloader linux,kernel=path,initrd=path,cmdline="..."
     // Note: cmdline must be quoted and inner quotes escaped
-    const bootloader_arg = try std.fmt.allocPrint(
-        allocator,
-        "linux,kernel={s},cmdline=\"{s}\"",
-        .{ kernel_path, cmdline_parts.items },
-    );
+    const bootloader_arg = if (initramfs_path) |initrd|
+        try std.fmt.allocPrint(
+            allocator,
+            "linux,kernel={s},initrd={s},cmdline=\"{s}\"",
+            .{ kernel_path, initrd, cmdline_parts.items },
+        )
+    else
+        try std.fmt.allocPrint(
+            allocator,
+            "linux,kernel={s},cmdline=\"{s}\"",
+            .{ kernel_path, cmdline_parts.items },
+        );
     try allocs_to_free.append(allocator, bootloader_arg);
     try vfkit_args.append(allocator, "--bootloader");
     try vfkit_args.append(allocator, bootloader_arg);

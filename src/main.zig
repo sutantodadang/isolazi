@@ -1881,7 +1881,7 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
         // Ensure VM assets are available (only needed for vfkit)
         const VMAssets = struct {
             kernel_path: []const u8,
-            initramfs_path: []const u8,
+            initramfs_path: ?[]const u8,
         };
         var vm_assets: ?VMAssets = null;
 
@@ -1889,8 +1889,11 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
             const assets = isolazi.macos.virtualization.ensureVMAssets(allocator) catch {
                 try stderr.writeAll("Error: Linux VM kernel not found.\n");
                 try stderr.writeAll("\nTo setup the VM environment:\n");
-                try stderr.writeAll("  1. Download a Linux kernel (vmlinuz) for your architecture\n");
-                try stderr.writeAll("  2. Place it at: ~/Library/Application Support/isolazi/vm/vmlinuz\n");
+                try stderr.writeAll("  1. Download Linux kernel and initramfs for ARM64:\n");
+                try stderr.writeAll("     - https://github.com/gokrazy/kernel.arm64/releases\n");
+                try stderr.writeAll("  2. Place files at:\n");
+                try stderr.writeAll("     ~/Library/Application Support/isolazi/vm/vmlinuz\n");
+                try stderr.writeAll("     ~/Library/Application Support/isolazi/vm/initramfs\n");
                 try stderr.writeAll("\nAlternatively, use Lima as the backend (brew install lima).\n");
                 try stderr.flush();
                 return 1;
@@ -1903,7 +1906,7 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
         defer {
             if (vm_assets) |assets| {
                 allocator.free(assets.kernel_path);
-                allocator.free(assets.initramfs_path);
+                if (assets.initramfs_path) |p| allocator.free(p);
             }
         }
 
@@ -1912,6 +1915,7 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
             return isolazi.macos.virtualization.runWithVfkit(
                 allocator,
                 vm_assets.?.kernel_path,
+                vm_assets.?.initramfs_path,
                 rootfs_path,
                 cmd_args.items,
                 env_pairs.items,
