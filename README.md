@@ -7,6 +7,7 @@ A minimal container runtime written in Zig, inspired by Docker, Podman, and OCI 
 - 🐳 **Docker-like CLI** - Familiar commands: `run`, `pull`, `ps`, `stop`, `rm`, `exec`
 - 📦 **OCI Image Support** - Pull images from Docker Hub and other registries
 - 🔒 **Process Isolation** - Linux namespaces (PID, mount, UTS, IPC, **network**, **user**, **cgroup**)
+- 🛡️ **Seccomp Filtering** - Block dangerous syscalls with configurable profiles
 - 🌐 **Network Isolation** - veth pairs, bridge networking, NAT, and port forwarding
 - 👤 **Rootless Containers** - User namespace support for unprivileged container execution
 - ⚙️ **Resource Limits** - cgroup v2 support for memory, CPU, and I/O limits
@@ -104,6 +105,18 @@ isolazi run --oom-kill-disable alpine /bin/sh        # Disable OOM killer
 
 # Combine resource limits
 isolazi run -d -m 1g --cpus 2 --io-weight 100 -p 8080:80 nginx
+
+# With seccomp filtering (default: blocks dangerous syscalls)
+isolazi run alpine /bin/sh
+
+# Use minimal seccomp profile for more permissive filtering
+isolazi run --seccomp minimal alpine /bin/sh
+
+# Strict seccomp profile (allowlist mode)
+isolazi run --seccomp strict alpine /bin/sh
+
+# Disable seccomp (for debugging only - NOT recommended)
+isolazi run --no-seccomp alpine /bin/sh
 ```
 
 ### Container Management
@@ -212,6 +225,10 @@ OPTIONS for 'run':
     --oom-score-adj <-1000..1000>  OOM killer score adjustment
     --oom-kill-disable        Disable OOM killer for this container
 
+    Security Options:
+    --seccomp <profile>       Seccomp profile: default, minimal, strict, disabled
+    --no-seccomp              Disable seccomp filtering (less secure)
+
 OPTIONS for 'exec':
     -i, --interactive         Keep STDIN open
     -t, --tty                 Allocate a pseudo-TTY
@@ -259,13 +276,74 @@ isolazi/
 │   │   ├── syscalls.zig  # Low-level Linux syscall wrappers (setns, nsenter)
 │   │   ├── network.zig   # Container networking (veth, bridge, NAT)
 │   │   ├── userns.zig    # User namespace for rootless containers
-│   │   └── cgroup.zig    # cgroup v2 resource limits
+│   │   ├── cgroup.zig    # cgroup v2 resource limits
+│   │   └── seccomp.zig   # Seccomp syscall filtering
 │   ├── fs/               # Filesystem operations
 │   ├── windows/          # WSL2 backend
 │   └── macos/            # Apple Virtualization backend
 ├── build.zig
 └── build.zig.zon
 ```
+
+## Security
+
+### Seccomp Syscall Filtering
+
+Isolazi uses seccomp-bpf to restrict syscalls available inside containers. This provides defense-in-depth against container escapes and privilege escalation.
+
+**Seccomp Profiles:**
+
+| Profile | Description | Use Case |
+|---------|-------------|----------|
+| `default` | Blocks dangerous syscalls (default) | Production containers |
+| `minimal` | Only blocks critical syscalls | When you need more syscalls |
+| `strict` | Allowlist mode - minimal syscalls | High-security environments |
+| `disabled` | No filtering | Debugging only |
+
+**Default Profile Blocked Syscalls:**
+- `mount`, `umount` - Filesystem manipulation
+- `ptrace` - Process tracing/debugging
+- `kexec_load`, `kexec_file_load` - Kernel replacement
+- `reboot` - System reboot
+- `init_module`, `delete_module` - Kernel modules
+- `settimeofday`, `clock_settime` - Time manipulation
+- `sethostname`, `setdomainname` - Hostname changes
+- `pivot_root` - Root filesystem changes
+- `bpf`, `perf_event_open` - Kernel debugging
+- `setns`, `unshare` - Namespace manipulation
+- `open_by_handle_at` - Filesystem escape vector
+
+**Usage Examples:**
+
+```bash
+# Default security (recommended)
+isolazi run alpine /bin/sh
+
+# Minimal profile for applications that need more syscalls
+isolazi run --seccomp minimal alpine /bin/sh
+
+# Strict profile for high-security environments
+isolazi run --seccomp strict alpine /bin/sh
+
+# Disable seccomp for debugging (NOT recommended for production)
+isolazi run --no-seccomp alpine /bin/sh
+```
+
+**How it Works:**
+1. BPF filter is generated from the selected profile
+2. `prctl(PR_SET_NO_NEW_PRIVS)` is set to enable unprivileged seccomp
+3. Filter is installed via `seccomp(SECCOMP_SET_MODE_FILTER)`
+4. Container process and all children are restricted
+
+### Security Layers
+
+Isolazi provides multiple security layers:
+
+1. **Namespaces** - Process, mount, network, UTS, IPC, user, cgroup isolation
+2. **Seccomp** - Syscall filtering to block dangerous operations
+3. **Pivot Root** - Complete filesystem isolation
+4. **User Namespace** - Run as non-root on host (rootless containers)
+5. **Cgroups** - Resource limits to prevent DoS
 
 ## Network Architecture
 
@@ -283,6 +361,7 @@ Containers use network namespace isolation with bridge networking:
               iptables NAT
               (MASQUERADE)
 ```
+
 
 - **Bridge**: `isolazi0` (172.20.0.1/24) - Created automatically
 - **Container IPs**: 172.20.0.2 - 172.20.0.254 (auto-allocated)
@@ -365,8 +444,8 @@ isolazi stores data in `~/.isolazi/`:
 - ✅ User namespace support (rootless containers) - **Implemented**
 - ✅ Network namespace isolation - **Implemented**
 - ✅ Cgroup v2 resource limits - **Implemented**
-- Seccomp filters
-- AppArmor/SELinux profiles
+- ✅ Seccomp syscall filtering - **Implemented**
+- AppArmor/SELinux profiles (not yet implemented)
 
 ### Resource Limits (cgroup v2)
 

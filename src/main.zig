@@ -321,6 +321,9 @@ const RunOptions = struct {
     rootless: bool = false,
     uid_maps: []const IdMapping = &[_]IdMapping{},
     gid_maps: []const IdMapping = &[_]IdMapping{},
+    // Seccomp options
+    seccomp_enabled: bool = true, // Default enabled
+    seccomp_profile: SeccompProfileOption = .default_container,
 
     const EnvPair = struct {
         key: []const u8,
@@ -348,6 +351,13 @@ const RunOptions = struct {
         container_id: u32,
         host_id: u32,
         count: u32 = 1,
+    };
+
+    const SeccompProfileOption = enum {
+        disabled,
+        default_container,
+        minimal,
+        strict,
     };
 };
 
@@ -423,6 +433,23 @@ fn parseRunOptions(allocator: std.mem.Allocator, args: []const []const u8) !RunO
             }
         } else if (std.mem.eql(u8, arg, "--rootless") or std.mem.eql(u8, arg, "--userns")) {
             opts.rootless = true;
+        } else if (std.mem.eql(u8, arg, "--no-seccomp") or std.mem.eql(u8, arg, "--disable-seccomp")) {
+            opts.seccomp_enabled = false;
+            opts.seccomp_profile = .disabled;
+        } else if (std.mem.eql(u8, arg, "--seccomp")) {
+            arg_idx += 1;
+            if (arg_idx >= args.len) return error.MissingValue;
+            const profile_str = args[arg_idx];
+            if (std.mem.eql(u8, profile_str, "disabled") or std.mem.eql(u8, profile_str, "none")) {
+                opts.seccomp_enabled = false;
+                opts.seccomp_profile = .disabled;
+            } else if (std.mem.eql(u8, profile_str, "default") or std.mem.eql(u8, profile_str, "default-container")) {
+                opts.seccomp_profile = .default_container;
+            } else if (std.mem.eql(u8, profile_str, "minimal")) {
+                opts.seccomp_profile = .minimal;
+            } else if (std.mem.eql(u8, profile_str, "strict")) {
+                opts.seccomp_profile = .strict;
+            }
         } else if (std.mem.eql(u8, arg, "--uid-map") or std.mem.eql(u8, arg, "--uidmap")) {
             arg_idx += 1;
             if (arg_idx >= args.len) return error.MissingValue;

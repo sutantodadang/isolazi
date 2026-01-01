@@ -15,6 +15,7 @@ pub const syscalls = @import("syscalls.zig");
 pub const network = @import("network.zig");
 pub const userns = @import("userns.zig");
 pub const cgroup = @import("cgroup.zig");
+pub const seccomp = @import("seccomp.zig");
 
 // Re-export commonly used items
 pub const CloneFlags = syscalls.CloneFlags;
@@ -72,3 +73,16 @@ pub const CpuStats = cgroup.CpuStats;
 pub const isCgroupV2Available = cgroup.isCgroupV2Available;
 pub const setupContainerCgroup = cgroup.setupContainerCgroup;
 pub const cleanupContainerCgroup = cgroup.cleanupContainerCgroup;
+
+// Seccomp syscall filtering module exports
+pub const SeccompError = seccomp.SeccompError;
+pub const SeccompAction = seccomp.SeccompAction;
+pub const SeccompRule = seccomp.SeccompRule;
+pub const SeccompProfile = seccomp.SeccompProfile;
+pub const SeccompConfig = seccomp.SeccompConfig;
+pub const SeccompArg = seccomp.SeccompArg;
+pub const SeccompOp = seccomp.SeccompOp;
+pub const Syscall = seccomp.Syscall;
+pub const installSeccompFilter = seccomp.installSeccompFilter;
+pub const applySeccompFilter = seccomp.applySeccompFilter;
+pub const isSeccompSupported = seccomp.isSeccompSupported;
