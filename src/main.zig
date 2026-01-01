@@ -2840,8 +2840,8 @@ const runOnLinux = if (builtin.os.tag == .linux) struct {
         }
 
         // Create and run the container
-        const cid = container_id orelse &[_]u8{ 'u', 'n', 'k', 'n', 'o', 'w', 'n' };
-        const result = isolazi.runtime.run(&cfg, allocator, cid) catch |err| {
+        var cid_buf: [12]u8 = if (container_id) |cid| cid else [_]u8{ 'u', 'n', 'k', 'n', 'o', 'w', 'n', '0', '0', '0', '0', '0' };
+        const result = isolazi.runtime.run(&cfg, allocator, &cid_buf) catch |err| {
             try stderr.print("Error: Container execution failed: {}\n", .{err});
             try stderr.flush();
             return 1;
