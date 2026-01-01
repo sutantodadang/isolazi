@@ -686,7 +686,12 @@ pub fn runWithVfkit(
     env_vars: []const EnvPair,
     volumes: []const VolumePair,
     port_mappings: []const PortMapping,
+    rootless: bool,
 ) !u8 {
+    // Note: vfkit runs a full VM where the container runs as root inside the VM
+    // The rootless flag is accepted for API consistency but doesn't change VM behavior
+    // as the VM itself provides isolation
+    _ = rootless;
     // Build vfkit command
     var vfkit_args: std.ArrayList([]const u8) = .empty;
     defer vfkit_args.deinit(allocator);
@@ -827,6 +832,7 @@ pub fn runWithLima(
     env_vars: []const EnvPair,
     volumes: []const VolumePair,
     port_mappings: []const PortMapping,
+    rootless: bool,
 ) !u8 {
     // First, ensure Lima VM "isolazi" exists and is running
     // Try to start it (will succeed if already running)
@@ -841,7 +847,7 @@ pub fn runWithLima(
         // VM might not exist, try to create it
         _ = try createLimaInstance(allocator);
         // After creating, try to start again
-        return runWithLima(allocator, "", rootfs_path, command, env_vars, volumes, port_mappings);
+        return runWithLima(allocator, "", rootfs_path, command, env_vars, volumes, port_mappings, rootless);
     };
 
     if (start_result.term.Exited != 0) {
@@ -929,7 +935,11 @@ pub fn runWithLima(
         }
 
         // Add the unshare and chroot command with clean environment inside container
-        try script.appendSlice(allocator, "unshare --mount --uts --ipc --pid --fork --mount-proc chroot ");
+        try script.appendSlice(allocator, "unshare --mount --uts --ipc --pid --fork --mount-proc");
+        if (rootless) {
+            try script.appendSlice(allocator, " --user --map-root-user");
+        }
+        try script.appendSlice(allocator, " chroot ");
         try script.appendSlice(allocator, rootfs_path);
         try script.appendSlice(allocator, " /usr/bin/env -i ");
 
@@ -984,7 +994,11 @@ pub fn runWithLima(
         }
 
         // Add the unshare and chroot command with clean environment inside container
-        try script.appendSlice(allocator, "unshare --mount --uts --ipc --pid --fork --mount-proc chroot ");
+        try script.appendSlice(allocator, "unshare --mount --uts --ipc --pid --fork --mount-proc");
+        if (rootless) {
+            try script.appendSlice(allocator, " --user --map-root-user");
+        }
+        try script.appendSlice(allocator, " chroot ");
         try script.appendSlice(allocator, rootfs_path);
         try script.appendSlice(allocator, " /usr/bin/env -i ");
 
@@ -1019,6 +1033,11 @@ pub fn runWithLima(
         try lima_args.append(allocator, "--pid");
         try lima_args.append(allocator, "--fork");
         try lima_args.append(allocator, "--mount-proc");
+        // Add user namespace for rootless containers
+        if (rootless) {
+            try lima_args.append(allocator, "--user");
+            try lima_args.append(allocator, "--map-root-user");
+        }
         try lima_args.append(allocator, "chroot");
         try lima_args.append(allocator, rootfs_path);
         try lima_args.append(allocator, "/usr/bin/env");

@@ -6,8 +6,9 @@ A minimal container runtime written in Zig, inspired by Docker, Podman, and OCI 
 
 - 🐳 **Docker-like CLI** - Familiar commands: `run`, `pull`, `ps`, `stop`, `rm`
 - 📦 **OCI Image Support** - Pull images from Docker Hub and other registries
-- 🔒 **Process Isolation** - Linux namespaces (PID, mount, UTS, IPC, **network**)
+- 🔒 **Process Isolation** - Linux namespaces (PID, mount, UTS, IPC, **network**, **user**)
 - 🌐 **Network Isolation** - veth pairs, bridge networking, NAT, and port forwarding
+- 👤 **Rootless Containers** - User namespace support for unprivileged container execution
 - 🗂️ **Filesystem Isolation** - Using `pivot_root` or `chroot`
 - 🪟 **Windows Support** - Run containers via WSL2 backend
 - 🍎 **macOS Support** - Run containers via Apple Virtualization framework
@@ -72,6 +73,12 @@ isolazi run -d -p 5432:5432 \
   -e POSTGRES_PASSWORD=secret,POSTGRES_USER=myuser,POSTGRES_DB=mydb \
   -v /mydata:/var/lib/postgresql/data \
   postgres:16-alpine
+
+# Rootless containers (no root required)
+isolazi run --rootless alpine /bin/sh
+
+# Rootless with custom UID/GID mapping
+isolazi run --rootless --uid-map 0:1000:1 --gid-map 0:1000:1 alpine /bin/sh
 ```
 
 ### Container Management
@@ -142,6 +149,9 @@ OPTIONS for 'run':
     -p, --port HOST:CONTAINER Publish container port to host (can be repeated)
     --hostname <name>         Set the container hostname
     --cwd <path>              Set the working directory
+    --rootless                Run container without root privileges (user namespace)
+    --uid-map C:H:S           Map container UID C to host UID H for S IDs
+    --gid-map C:H:S           Map container GID C to host GID H for S IDs
 
 OPTIONS for 'ps':
     -a, --all            Show all containers (default: only running)
@@ -179,7 +189,8 @@ isolazi/
 │   ├── runtime/          # Container runtime (Linux)
 │   ├── linux/            # Linux-specific (namespaces, networking)
 │   │   ├── syscalls.zig  # Low-level Linux syscall wrappers
-│   │   └── network.zig   # Container networking (veth, bridge, NAT)
+│   │   ├── network.zig   # Container networking (veth, bridge, NAT)
+│   │   └── userns.zig    # User namespace for rootless containers
 │   ├── fs/               # Filesystem operations
 │   ├── windows/          # WSL2 backend
 │   └── macos/            # Apple Virtualization backend
@@ -282,17 +293,36 @@ isolazi stores data in `~/.isolazi/`:
 
 ⚠️ **This is an educational implementation.** For production use, consider:
 
-- User namespace support (rootless containers)
+- ✅ User namespace support (rootless containers) - **Implemented**
+- ✅ Network namespace isolation - **Implemented**
 - Seccomp filters
 - AppArmor/SELinux profiles
 - Proper cgroup limits
-- Network namespace isolation
+
+### Rootless Containers
+
+Rootless mode uses Linux user namespaces to run containers without requiring root privileges:
+
+```bash
+# Run as unprivileged user (maps your UID to root inside container)
+isolazi run --rootless alpine whoami  # outputs: root
+
+# Custom UID/GID mapping (map container root to host UID 1000)
+isolazi run --rootless --uid-map 0:1000:1 --gid-map 0:1000:1 alpine id
+```
+
+**Benefits:**
+- No root privileges required on the host
+- Container root (UID 0) is mapped to your unprivileged user
+- Improved security isolation
+- Works on Linux, Windows (WSL2), and macOS (Lima/vfkit)
 
 ## Requirements
 
 ### Linux
-- Root privileges (CAP_SYS_ADMIN) for namespace creation
-- Kernel with namespace support
+- Root privileges (CAP_SYS_ADMIN) for namespace creation, OR
+- Use `--rootless` flag for unprivileged execution via user namespaces
+- Kernel with namespace support (user namespace for rootless)
 
 ### Windows
 - WSL2 installed and configured

@@ -13,9 +13,11 @@ pub const Config = config.Config;
 pub const Namespaces = config.Namespaces;
 pub const Mount = config.Mount;
 pub const PortMapping = config.PortMapping;
+pub const IdMapping = config.IdMapping;
 
 pub const PATH_MAX = config.PATH_MAX;
 pub const MAX_ARGS = config.MAX_ARGS;
 pub const MAX_ENV = config.MAX_ENV;
 pub const MAX_MOUNTS = config.MAX_MOUNTS;
 pub const MAX_PORTS = config.MAX_PORTS;
+pub const MAX_ID_MAPPINGS = config.MAX_ID_MAPPINGS;

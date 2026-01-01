@@ -47,6 +47,8 @@ pub const MAX_ENV_VARS = 64;
 pub const MAX_VOLUMES = 32;
 /// Maximum number of port mappings
 pub const MAX_PORTS = 32;
+/// Maximum number of UID/GID mappings
+pub const MAX_ID_MAPPINGS = 8;
 
 /// Environment variable
 pub const EnvVar = struct {
@@ -68,6 +70,13 @@ pub const PortMap = struct {
     protocol: Protocol = .tcp,
 
     pub const Protocol = enum { tcp, udp };
+};
+
+/// UID/GID mapping for user namespaces
+pub const IdMap = struct {
+    container_id: u32,
+    host_id: u32,
+    count: u32 = 1,
 };
 
 /// Parsed command from CLI
@@ -92,6 +101,9 @@ pub const RunCommand = struct {
     volumes: []const VolumeMount = &[_]VolumeMount{},
     ports: []const PortMap = &[_]PortMap{},
     detach: bool = false, // Run container in background
+    rootless: bool = false, // Enable rootless mode (user namespace)
+    uid_maps: []const IdMap = &[_]IdMap{}, // Custom UID mappings
+    gid_maps: []const IdMap = &[_]IdMap{}, // Custom GID mappings
 };
 
 /// Arguments for the 'pull' command
@@ -151,13 +163,17 @@ fn parseRunCommand(args: []const []const u8) CliError!Command {
         .args = &[_][]const u8{},
     };
 
-    // Static arrays to store env vars, volumes, and ports (avoids allocation)
+    // Static arrays to store env vars, volumes, ports, and id maps (avoids allocation)
     var env_vars_buf: [MAX_ENV_VARS]EnvVar = undefined;
     var env_vars_count: usize = 0;
     var volumes_buf: [MAX_VOLUMES]VolumeMount = undefined;
     var volumes_count: usize = 0;
     var ports_buf: [MAX_PORTS]PortMap = undefined;
     var ports_count: usize = 0;
+    var uid_maps_buf: [MAX_ID_MAPPINGS]IdMap = undefined;
+    var uid_maps_count: usize = 0;
+    var gid_maps_buf: [MAX_ID_MAPPINGS]IdMap = undefined;
+    var gid_maps_count: usize = 0;
 
     var i: usize = 0;
     var positional_count: usize = 0;
@@ -212,6 +228,29 @@ fn parseRunCommand(args: []const []const u8) CliError!Command {
             } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--detach")) {
                 // Detach mode
                 run_cmd.detach = true;
+            } else if (std.mem.eql(u8, arg, "--rootless") or std.mem.eql(u8, arg, "--userns")) {
+                // Enable rootless mode (user namespace)
+                run_cmd.rootless = true;
+            } else if (std.mem.eql(u8, arg, "--uid-map") or std.mem.eql(u8, arg, "--uidmap")) {
+                // UID mapping: --uid-map container:host:count
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                if (uid_maps_count >= MAX_ID_MAPPINGS) return CliError.InvalidArgument;
+
+                const map_str = args[i];
+                const uid_map = parseIdMap(map_str) orelse return CliError.InvalidArgument;
+                uid_maps_buf[uid_maps_count] = uid_map;
+                uid_maps_count += 1;
+            } else if (std.mem.eql(u8, arg, "--gid-map") or std.mem.eql(u8, arg, "--gidmap")) {
+                // GID mapping: --gid-map container:host:count
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                if (gid_maps_count >= MAX_ID_MAPPINGS) return CliError.InvalidArgument;
+
+                const map_str = args[i];
+                const gid_map = parseIdMap(map_str) orelse return CliError.InvalidArgument;
+                gid_maps_buf[gid_maps_count] = gid_map;
+                gid_maps_count += 1;
             } else {
                 return CliError.InvalidArgument;
             }
@@ -238,6 +277,12 @@ fn parseRunCommand(args: []const []const u8) CliError!Command {
     }
     if (ports_count > 0) {
         run_cmd.ports = ports_buf[0..ports_count];
+    }
+    if (uid_maps_count > 0) {
+        run_cmd.uid_maps = uid_maps_buf[0..uid_maps_count];
+    }
+    if (gid_maps_count > 0) {
+        run_cmd.gid_maps = gid_maps_buf[0..gid_maps_count];
     }
 
     if (positional_count < 1) {
@@ -280,6 +325,25 @@ fn parsePortMapping(s: []const u8) ?PortMap {
         .host_port = host_port,
         .container_port = container_port,
         .protocol = protocol,
+    };
+}
+
+/// Parse an ID mapping string "container:host[:count]"
+fn parseIdMap(s: []const u8) ?IdMap {
+    var iter = std.mem.splitScalar(u8, s, ':');
+
+    const container_str = iter.next() orelse return null;
+    const host_str = iter.next() orelse return null;
+    const count_str = iter.next() orelse "1";
+
+    const container_id = std.fmt.parseInt(u32, container_str, 10) catch return null;
+    const host_id = std.fmt.parseInt(u32, host_str, 10) catch return null;
+    const count = std.fmt.parseInt(u32, count_str, 10) catch return null;
+
+    return IdMap{
+        .container_id = container_id,
+        .host_id = host_id,
+        .count = count,
     };
 }
 
@@ -419,6 +483,26 @@ pub fn buildConfig(run_cmd: *const RunCommand) !Config {
         try cfg.addPort(port.host_port, port.container_port, protocol);
     }
 
+    // Enable rootless mode if requested
+    if (run_cmd.rootless) {
+        cfg.enableRootless();
+    }
+
+    // Copy UID mappings
+    for (run_cmd.uid_maps) |uid_map| {
+        try cfg.addUidMapping(uid_map.host_id, uid_map.container_id, uid_map.count);
+    }
+
+    // Copy GID mappings
+    for (run_cmd.gid_maps) |gid_map| {
+        try cfg.addGidMapping(gid_map.host_id, gid_map.container_id, gid_map.count);
+    }
+
+    // If uid/gid maps provided but rootless not explicitly set, enable user namespace
+    if (run_cmd.uid_maps.len > 0 or run_cmd.gid_maps.len > 0) {
+        cfg.namespaces.user = true;
+    }
+
     // Use chroot instead of pivot_root if requested
     cfg.use_pivot_root = !run_cmd.use_chroot;
 
@@ -454,6 +538,9 @@ pub fn printHelp(writer: anytype) !void {
         \\    -p, --port HOST:CONTAINER Publish port (can be repeated)
         \\    --hostname <name>         Set the container hostname
         \\    --cwd <path>              Set the working directory
+        \\    --rootless                Enable rootless mode (user namespace)
+        \\    --uid-map C:H[:N]         Map container UID C to host UID H (N count, default 1)
+        \\    --gid-map C:H[:N]         Map container GID C to host GID H (N count, default 1)
         \\
         \\OPTIONS for 'ps':
         \\    -a, --all            Show all containers (default: only running)
@@ -473,6 +560,8 @@ pub fn printHelp(writer: anytype) !void {
         \\    isolazi run -e DB_HOST=localhost -e DB_PORT=5432 postgres /bin/sh
         \\    isolazi run -v /data:/app/data -v /config:/etc/myapp:ro alpine /bin/sh
         \\    isolazi run postgres:16-alpine -d -p 5432:5432 -v /mydata:/var/lib/postgresql -e POSTGRES_PASSWORD=secret
+        \\    isolazi run --rootless alpine /bin/sh
+        \\    isolazi run --uid-map 0:1000:1 --gid-map 0:1000:1 alpine /bin/sh
         \\    isolazi create --name myapp alpine
         \\    isolazi start myapp
         \\    isolazi ps -a

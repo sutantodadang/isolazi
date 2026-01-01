@@ -4,6 +4,7 @@
 //! - Direct syscall wrappers (syscalls.zig)
 //! - Namespace management helpers
 //! - Network namespace and container networking (network.zig)
+//! - User namespace for rootless containers (userns.zig)
 //! - Constants and flags for Linux primitives
 //!
 //! PLATFORM: This module is Linux-only. Windows support requires
@@ -11,6 +12,7 @@
 
 pub const syscalls = @import("syscalls.zig");
 pub const network = @import("network.zig");
+pub const userns = @import("userns.zig");
 
 // Re-export commonly used items
 pub const CloneFlags = syscalls.CloneFlags;
@@ -40,3 +42,12 @@ pub const PortMapping = network.PortMapping;
 pub const NetworkError = network.NetworkError;
 pub const setupContainerNetworkHost = network.setupContainerNetworkHost;
 pub const setupContainerNetworkContainer = network.setupContainerNetworkContainer;
+
+// User namespace module exports
+pub const UserNamespaceConfig = userns.UserNamespaceConfig;
+pub const UserNamespaceError = userns.UserNamespaceError;
+pub const setupUserNamespace = userns.setupUserNamespace;
+pub const canCreateUserNamespace = userns.canCreateUserNamespace;
+pub const isRoot = userns.isRoot;
+pub const getCurrentUid = userns.getCurrentUid;
+pub const getCurrentGid = userns.getCurrentGid;

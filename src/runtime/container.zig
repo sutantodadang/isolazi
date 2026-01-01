@@ -99,16 +99,21 @@ pub const Runtime = struct {
     /// - CAP_SYS_ADMIN (for namespaces, pivot_root, mount)
     /// - CAP_SYS_CHROOT (for chroot fallback)
     /// - CAP_NET_ADMIN (for network namespace)
+    /// For rootless mode (user namespace), no special capabilities are needed.
     pub fn run(self: *Runtime) RuntimeError!RunResult {
         const cfg = self.config;
 
-        // Create pipes for parent-child synchronization (needed for network setup)
-        // child_ready_pipe: child signals after entering namespaces
-        // parent_done_pipe: parent signals after network setup
+        // Create pipes for parent-child synchronization
+        // These are needed for:
+        // 1. User namespace: parent must write uid_map/gid_map after child unshares
+        // 2. Network namespace: parent creates veth and moves to child ns
         var child_ready_pipe: [2]std.posix.fd_t = undefined;
         var parent_done_pipe: [2]std.posix.fd_t = undefined;
 
-        if (cfg.namespaces.network) {
+        // We need pipes if network or user namespace is enabled
+        const needs_sync = cfg.namespaces.network or cfg.namespaces.user;
+
+        if (needs_sync) {
             child_ready_pipe = std.posix.pipe() catch return RuntimeError.PipeError;
             parent_done_pipe = std.posix.pipe() catch {
                 std.posix.close(child_ready_pipe[0]);
@@ -122,15 +127,15 @@ pub const Runtime = struct {
 
         if (pid == 0) {
             // Child process - this becomes the container
-            if (cfg.namespaces.network) {
+            if (needs_sync) {
                 // Close unused pipe ends
                 std.posix.close(child_ready_pipe[0]); // Close read end
                 std.posix.close(parent_done_pipe[1]); // Close write end
             }
 
             self.childProcess(
-                if (cfg.namespaces.network) child_ready_pipe[1] else null,
-                if (cfg.namespaces.network) parent_done_pipe[0] else null,
+                if (needs_sync) child_ready_pipe[1] else null,
+                if (needs_sync) parent_done_pipe[0] else null,
             ) catch |err| {
                 // If setup fails, print error and exit with code 1
                 std.debug.print("Container setup failed: {}\n", .{err});
@@ -140,17 +145,17 @@ pub const Runtime = struct {
             unreachable;
         } else {
             // Parent process
-            if (cfg.namespaces.network) {
+            if (needs_sync) {
                 // Close unused pipe ends
                 std.posix.close(child_ready_pipe[1]); // Close write end
                 std.posix.close(parent_done_pipe[0]); // Close read end
             }
 
-            // Set up network and wait for the container to finish
+            // Set up user namespace mappings, network and wait for the container to finish
             return self.parentProcess(
                 pid,
-                if (cfg.namespaces.network) child_ready_pipe[0] else null,
-                if (cfg.namespaces.network) parent_done_pipe[1] else null,
+                if (needs_sync) child_ready_pipe[0] else null,
+                if (needs_sync) parent_done_pipe[1] else null,
             );
         }
     }
@@ -172,22 +177,28 @@ pub const Runtime = struct {
         const ns_flags = cfg.namespaces.toCloneFlags();
         try linux.unshare(ns_flags);
 
-        // Step 2: If network namespace, signal parent and wait for network setup
-        if (cfg.namespaces.network) {
+        // Step 2: Synchronize with parent for user namespace and/or network setup
+        const needs_sync = cfg.namespaces.network or cfg.namespaces.user;
+
+        if (needs_sync) {
             if (child_ready_write) |fd| {
-                // Signal parent that we've entered the network namespace
+                // Signal parent that we've entered the namespaces
+                // Parent will write uid_map/gid_map if user namespace is enabled
                 const ready_byte: [1]u8 = .{1};
                 _ = std.posix.write(fd, &ready_byte) catch {};
                 std.posix.close(fd);
             }
 
             if (parent_done_read) |fd| {
-                // Wait for parent to complete network setup
+                // Wait for parent to complete user namespace mapping and/or network setup
                 var done_byte: [1]u8 = undefined;
                 _ = std.posix.read(fd, &done_byte) catch {};
                 std.posix.close(fd);
             }
+        }
 
+        // Step 3: Configure container-side network if enabled
+        if (cfg.namespaces.network) {
             // Configure container-side network (eth0, IP, routes)
             // This is done after we receive the veth from parent
             var net_config = linux.ContainerNetwork.init(self.container_id, 2);
@@ -200,7 +211,7 @@ pub const Runtime = struct {
             };
         }
 
-        // Step 3: Set hostname (only works if we have UTS namespace)
+        // Step 4: Set hostname (only works if we have UTS namespace)
         if (cfg.namespaces.uts) {
             const hostname = cfg.getHostname();
             if (hostname.len > 0) {
@@ -237,7 +248,7 @@ pub const Runtime = struct {
         try linux.execve(cmd, argv, envp);
     }
 
-    /// Parent process: setup network (if enabled), wait for container, cleanup.
+    /// Parent process: setup user namespace mappings, network (if enabled), wait for container, cleanup.
     fn parentProcess(
         self: *Runtime,
         child_pid: std.os.linux.pid_t,
@@ -247,45 +258,105 @@ pub const Runtime = struct {
         const cfg = self.config;
         var net_config: ?linux.ContainerNetwork = null;
 
-        // Network setup if enabled
-        if (cfg.namespaces.network) {
+        const needs_sync = cfg.namespaces.network or cfg.namespaces.user;
+
+        if (needs_sync) {
             if (child_ready_read) |fd| {
-                // Wait for child to signal it has entered network namespace
+                // Wait for child to signal it has entered namespaces
                 var ready_byte: [1]u8 = undefined;
                 _ = std.posix.read(fd, &ready_byte) catch {};
                 std.posix.close(fd);
             }
 
-            // Convert port mappings from config to network module format
-            var port_mappings: [config_mod.MAX_PORTS]linux.PortMapping = undefined;
-            var port_count: usize = 0;
+            // Step 1: Set up user namespace mappings if enabled
+            if (cfg.namespaces.user) {
+                // Build user namespace configuration
+                var userns_config = linux.UserNamespaceConfig{
+                    .rootless = cfg.rootless,
+                    .deny_setgroups = cfg.rootless, // Required for unprivileged users
+                };
 
-            for (cfg.port_mappings[0..cfg.port_count]) |pm| {
-                if (pm.active) {
-                    port_mappings[port_count] = linux.PortMapping{
-                        .host_port = pm.host_port,
-                        .container_port = pm.container_port,
-                        .protocol = if (pm.protocol == .tcp) .tcp else .udp,
-                    };
-                    port_count += 1;
+                // Copy mappings from config or use defaults
+                if (cfg.uid_map_count > 0) {
+                    for (cfg.uid_mappings[0..cfg.uid_map_count], 0..) |mapping, i| {
+                        if (mapping.active) {
+                            userns_config.uid_mappings[i] = linux.userns.IdMapping{
+                                .container_id = mapping.container_id,
+                                .host_id = mapping.host_id,
+                                .count = mapping.count,
+                            };
+                            userns_config.uid_count += 1;
+                        }
+                    }
+                } else if (cfg.rootless) {
+                    // Default rootless mapping: current user to root
+                    userns_config.uid_mappings[0] = linux.userns.IdMapping.single(
+                        linux.getCurrentUid(),
+                        0,
+                    );
+                    userns_config.uid_count = 1;
                 }
+
+                if (cfg.gid_map_count > 0) {
+                    for (cfg.gid_mappings[0..cfg.gid_map_count], 0..) |mapping, i| {
+                        if (mapping.active) {
+                            userns_config.gid_mappings[i] = linux.userns.IdMapping{
+                                .container_id = mapping.container_id,
+                                .host_id = mapping.host_id,
+                                .count = mapping.count,
+                            };
+                            userns_config.gid_count += 1;
+                        }
+                    }
+                } else if (cfg.rootless) {
+                    // Default rootless mapping: current group to root
+                    userns_config.gid_mappings[0] = linux.userns.IdMapping.single(
+                        linux.getCurrentGid(),
+                        0,
+                    );
+                    userns_config.gid_count = 1;
+                }
+
+                // Write uid_map and gid_map
+                linux.setupUserNamespace(child_pid, &userns_config) catch |err| {
+                    std.debug.print("Warning: User namespace setup failed: {}\n", .{err});
+                    // Don't fail completely - child might still work with restricted permissions
+                };
             }
 
-            // Set up host-side networking (veth, bridge, NAT, port forwarding)
-            net_config = linux.setupContainerNetworkHost(
-                self.allocator,
-                self.container_id,
-                port_mappings[0..port_count],
-                child_pid,
-            ) catch |err| blk: {
-                std.debug.print("Warning: Network setup failed: {}\n", .{err});
-                break :blk null;
-            };
+            // Step 2: Set up network if enabled
+            if (cfg.namespaces.network) {
+                // Convert port mappings from config to network module format
+                var port_mappings: [config_mod.MAX_PORTS]linux.PortMapping = undefined;
+                var port_count: usize = 0;
 
-            self.network_config = net_config;
+                for (cfg.port_mappings[0..cfg.port_count]) |pm| {
+                    if (pm.active) {
+                        port_mappings[port_count] = linux.PortMapping{
+                            .host_port = pm.host_port,
+                            .container_port = pm.container_port,
+                            .protocol = if (pm.protocol == .tcp) .tcp else .udp,
+                        };
+                        port_count += 1;
+                    }
+                }
+
+                // Set up host-side networking (veth, bridge, NAT, port forwarding)
+                net_config = linux.setupContainerNetworkHost(
+                    self.allocator,
+                    self.container_id,
+                    port_mappings[0..port_count],
+                    child_pid,
+                ) catch |err| blk: {
+                    std.debug.print("Warning: Network setup failed: {}\n", .{err});
+                    break :blk null;
+                };
+
+                self.network_config = net_config;
+            }
 
             if (parent_done_write) |fd| {
-                // Signal child that network setup is complete
+                // Signal child that user namespace mapping and network setup are complete
                 const done_byte: [1]u8 = .{1};
                 _ = std.posix.write(fd, &done_byte) catch {};
                 std.posix.close(fd);
