@@ -12,6 +12,7 @@ pub const config = @import("config.zig");
 pub const Config = config.Config;
 pub const Namespaces = config.Namespaces;
 pub const Mount = config.Mount;
+pub const PortMapping = config.PortMapping;
 
 pub const PATH_MAX = config.PATH_MAX;
 pub const MAX_ARGS = config.MAX_ARGS;
