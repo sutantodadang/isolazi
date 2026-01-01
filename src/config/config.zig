@@ -29,6 +29,65 @@ pub const MAX_MOUNTS = 32;
 /// Maximum number of port mappings
 pub const MAX_PORTS = 32;
 
+/// Maximum number of UID/GID mappings for user namespace
+pub const MAX_ID_MAPPINGS = 8;
+
+/// A UID/GID mapping entry for user namespaces
+/// Maps a range of IDs from parent namespace to child namespace
+pub const IdMapping = struct {
+    /// First ID in the child (container) namespace
+    container_id: u32 = 0,
+    /// First ID in the parent (host) namespace
+    host_id: u32 = 0,
+    /// Number of consecutive IDs to map
+    count: u32 = 1,
+    /// Is this mapping active?
+    active: bool = false,
+
+    /// Create a simple 1:1 mapping
+    pub fn single(host_id: u32, container_id: u32) IdMapping {
+        return IdMapping{
+            .container_id = container_id,
+            .host_id = host_id,
+            .count = 1,
+            .active = true,
+        };
+    }
+
+    /// Create a range mapping
+    pub fn range(host_id: u32, container_id: u32, count: u32) IdMapping {
+        return IdMapping{
+            .container_id = container_id,
+            .host_id = host_id,
+            .count = count,
+            .active = true,
+        };
+    }
+
+    /// Parse a mapping string like "0:1000:1" (container:host:count)
+    pub fn parse(spec: []const u8) !IdMapping {
+        var iter = std.mem.splitScalar(u8, spec, ':');
+
+        const container_str = iter.next() orelse return error.InvalidIdMapping;
+        const host_str = iter.next() orelse return error.InvalidIdMapping;
+        const count_str = iter.next() orelse "1";
+
+        const container_id = std.fmt.parseInt(u32, container_str, 10) catch
+            return error.InvalidIdMapping;
+        const host_id = std.fmt.parseInt(u32, host_str, 10) catch
+            return error.InvalidIdMapping;
+        const count = std.fmt.parseInt(u32, count_str, 10) catch
+            return error.InvalidIdMapping;
+
+        return IdMapping{
+            .container_id = container_id,
+            .host_id = host_id,
+            .count = count,
+            .active = true,
+        };
+    }
+};
+
 /// A port mapping specification (host:container).
 pub const PortMapping = struct {
     /// Host port to listen on
@@ -192,6 +251,18 @@ pub const Config = struct {
     /// Use pivot_root instead of chroot (more secure)
     use_pivot_root: bool = true,
 
+    /// User namespace configuration for rootless containers
+    /// UID mappings (container_id:host_id:count format)
+    uid_mappings: [MAX_ID_MAPPINGS]IdMapping = std.mem.zeroes([MAX_ID_MAPPINGS]IdMapping),
+    uid_map_count: usize = 0,
+
+    /// GID mappings (container_id:host_id:count format)
+    gid_mappings: [MAX_ID_MAPPINGS]IdMapping = std.mem.zeroes([MAX_ID_MAPPINGS]IdMapping),
+    gid_map_count: usize = 0,
+
+    /// Enable rootless mode (user namespace with current user mapped to root)
+    rootless: bool = false,
+
     /// Initialize a new configuration with the given rootfs path.
     pub fn init(rootfs: []const u8) !Config {
         if (rootfs.len >= PATH_MAX) {
@@ -282,6 +353,62 @@ pub const Config = struct {
         }
         self.port_mappings[self.port_count] = mapping;
         self.port_count += 1;
+    }
+
+    /// Add a UID mapping for user namespace.
+    pub fn addUidMapping(self: *Config, host_id: u32, container_id: u32, count: u32) !void {
+        if (self.uid_map_count >= MAX_ID_MAPPINGS) {
+            return error.TooManyIdMappings;
+        }
+        self.uid_mappings[self.uid_map_count] = IdMapping.range(host_id, container_id, count);
+        self.uid_map_count += 1;
+    }
+
+    /// Add a UID mapping from a spec string like "0:1000:1" (container:host:count).
+    pub fn addUidMappingFromSpec(self: *Config, spec: []const u8) !void {
+        if (self.uid_map_count >= MAX_ID_MAPPINGS) {
+            return error.TooManyIdMappings;
+        }
+        self.uid_mappings[self.uid_map_count] = try IdMapping.parse(spec);
+        self.uid_map_count += 1;
+    }
+
+    /// Add a GID mapping for user namespace.
+    pub fn addGidMapping(self: *Config, host_id: u32, container_id: u32, count: u32) !void {
+        if (self.gid_map_count >= MAX_ID_MAPPINGS) {
+            return error.TooManyIdMappings;
+        }
+        self.gid_mappings[self.gid_map_count] = IdMapping.range(host_id, container_id, count);
+        self.gid_map_count += 1;
+    }
+
+    /// Add a GID mapping from a spec string like "0:1000:1" (container:host:count).
+    pub fn addGidMappingFromSpec(self: *Config, spec: []const u8) !void {
+        if (self.gid_map_count >= MAX_ID_MAPPINGS) {
+            return error.TooManyIdMappings;
+        }
+        self.gid_mappings[self.gid_map_count] = try IdMapping.parse(spec);
+        self.gid_map_count += 1;
+    }
+
+    /// Enable rootless mode with default mappings (current user -> root in container).
+    pub fn enableRootless(self: *Config) void {
+        self.rootless = true;
+        self.namespaces.user = true;
+        // Default mapping: current user to root (0) inside container
+        // The actual UID/GID will be determined at runtime
+        self.uid_map_count = 0;
+        self.gid_map_count = 0;
+    }
+
+    /// Get active UID mappings.
+    pub fn getUidMappings(self: *const Config) []const IdMapping {
+        return self.uid_mappings[0..self.uid_map_count];
+    }
+
+    /// Get active GID mappings.
+    pub fn getGidMappings(self: *const Config) []const IdMapping {
+        return self.gid_mappings[0..self.gid_map_count];
     }
 
     /// Set the hostname.

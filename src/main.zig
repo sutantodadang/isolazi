@@ -314,6 +314,9 @@ const RunOptions = struct {
     env_vars: []const EnvPair = &[_]EnvPair{},
     volumes: []const VolumePair = &[_]VolumePair{},
     ports: []const PortMapping = &[_]PortMapping{},
+    rootless: bool = false,
+    uid_maps: []const IdMapping = &[_]IdMapping{},
+    gid_maps: []const IdMapping = &[_]IdMapping{},
 
     const EnvPair = struct {
         key: []const u8,
@@ -336,19 +339,29 @@ const RunOptions = struct {
             udp,
         };
     };
+
+    const IdMapping = struct {
+        container_id: u32,
+        host_id: u32,
+        count: u32 = 1,
+    };
 };
 
 /// Parse run command arguments (shared by all platforms)
 fn parseRunOptions(allocator: std.mem.Allocator, args: []const []const u8) !RunOptions {
     var opts = RunOptions{};
 
-    // Static buffers for env vars, volumes, and ports
+    // Static buffers for env vars, volumes, ports, and id maps
     var env_buf: [64]RunOptions.EnvPair = undefined;
     var env_count: usize = 0;
     var vol_buf: [32]RunOptions.VolumePair = undefined;
     var vol_count: usize = 0;
     var port_buf: [32]RunOptions.PortMapping = undefined;
     var port_count: usize = 0;
+    var uid_map_buf: [8]RunOptions.IdMapping = undefined;
+    var uid_map_count: usize = 0;
+    var gid_map_buf: [8]RunOptions.IdMapping = undefined;
+    var gid_map_count: usize = 0;
 
     // Command args buffer
     var cmd_buf: [64][]const u8 = undefined;
@@ -404,6 +417,28 @@ fn parseRunOptions(allocator: std.mem.Allocator, args: []const []const u8) !RunO
                     port_count += 1;
                 }
             }
+        } else if (std.mem.eql(u8, arg, "--rootless") or std.mem.eql(u8, arg, "--userns")) {
+            opts.rootless = true;
+        } else if (std.mem.eql(u8, arg, "--uid-map") or std.mem.eql(u8, arg, "--uidmap")) {
+            arg_idx += 1;
+            if (arg_idx >= args.len) return error.MissingValue;
+            const map_str = args[arg_idx];
+            if (parseIdMap(map_str)) |id_map| {
+                if (uid_map_count < uid_map_buf.len) {
+                    uid_map_buf[uid_map_count] = id_map;
+                    uid_map_count += 1;
+                }
+            }
+        } else if (std.mem.eql(u8, arg, "--gid-map") or std.mem.eql(u8, arg, "--gidmap")) {
+            arg_idx += 1;
+            if (arg_idx >= args.len) return error.MissingValue;
+            const map_str = args[arg_idx];
+            if (parseIdMap(map_str)) |id_map| {
+                if (gid_map_count < gid_map_buf.len) {
+                    gid_map_buf[gid_map_count] = id_map;
+                    gid_map_count += 1;
+                }
+            }
         } else if (arg.len > 0 and arg[0] == '-') {
             // Skip unknown flags with values
             if (std.mem.eql(u8, arg, "--hostname") or std.mem.eql(u8, arg, "--cwd")) {
@@ -447,6 +482,20 @@ fn parseRunOptions(allocator: std.mem.Allocator, args: []const []const u8) !RunO
         const port_slice = try allocator.alloc(RunOptions.PortMapping, port_count);
         @memcpy(port_slice, port_buf[0..port_count]);
         opts.ports = port_slice;
+    }
+
+    // Allocate and copy UID mappings
+    if (uid_map_count > 0) {
+        const uid_map_slice = try allocator.alloc(RunOptions.IdMapping, uid_map_count);
+        @memcpy(uid_map_slice, uid_map_buf[0..uid_map_count]);
+        opts.uid_maps = uid_map_slice;
+    }
+
+    // Allocate and copy GID mappings
+    if (gid_map_count > 0) {
+        const gid_map_slice = try allocator.alloc(RunOptions.IdMapping, gid_map_count);
+        @memcpy(gid_map_slice, gid_map_buf[0..gid_map_count]);
+        opts.gid_maps = gid_map_slice;
     }
 
     return opts;
@@ -512,6 +561,25 @@ fn parsePort(s: []const u8) ?RunOptions.PortMapping {
     const container_port = std.fmt.parseInt(u16, container_str, 10) catch return null;
 
     return .{ .host_port = host_port, .container_port = container_port, .protocol = protocol };
+}
+
+/// Parse ID mapping (container_id:host_id[:count])
+fn parseIdMap(s: []const u8) ?RunOptions.IdMapping {
+    var iter = std.mem.splitScalar(u8, s, ':');
+
+    const container_str = iter.next() orelse return null;
+    const host_str = iter.next() orelse return null;
+    const count_str = iter.next() orelse "1";
+
+    const container_id = std.fmt.parseInt(u32, container_str, 10) catch return null;
+    const host_id = std.fmt.parseInt(u32, host_str, 10) catch return null;
+    const count = std.fmt.parseInt(u32, count_str, 10) catch return null;
+
+    return .{
+        .container_id = container_id,
+        .host_id = host_id,
+        .count = count,
+    };
 }
 
 /// Run container on Windows using WSL2 backend
@@ -712,6 +780,12 @@ fn runContainerWindows(
     try wsl_cmd.append(allocator, "--ipc");
     try wsl_cmd.append(allocator, "--pid");
     try wsl_cmd.append(allocator, "--fork");
+
+    // Add user namespace for rootless containers
+    if (opts.rootless) {
+        try wsl_cmd.append(allocator, "--user");
+        try wsl_cmd.append(allocator, "--map-root-user");
+    }
 
     try wsl_cmd.append(allocator, "sh");
     try wsl_cmd.append(allocator, "-c");
@@ -1982,6 +2056,7 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
                 env_pairs.items,
                 vol_pairs.items,
                 port_pairs.items,
+                opts.rootless,
             ) catch |err| {
                 try stderr.print("Error: Failed to run in VM: {}\n", .{err});
                 try stderr.flush();
@@ -1997,6 +2072,7 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
                 env_pairs.items,
                 vol_pairs.items,
                 port_pairs.items,
+                opts.rootless,
             ) catch |err| {
                 try stderr.print("Error: Failed to run with Lima: {}\n", .{err});
                 try stderr.flush();
