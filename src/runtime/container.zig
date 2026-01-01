@@ -243,7 +243,16 @@ pub const Runtime = struct {
         // Step 7: Change to working directory
         try linux.chdir(cfg.getCwd());
 
-        // Step 8: Execute the container command
+        // Step 8: Apply seccomp filter (must be done BEFORE execve)
+        // This restricts syscalls available to the container process
+        if (cfg.seccomp.enabled and cfg.seccomp.profile_type != .disabled) {
+            applySeccompFromConfig(cfg) catch |err| {
+                std.debug.print("Warning: Seccomp filter installation failed: {}\n", .{err});
+                // Continue without seccomp - some systems may not support it
+            };
+        }
+
+        // Step 9: Execute the container command
         // Build argv and envp arrays (on stack)
         var argv_buf: [config_mod.MAX_ARGS + 1]?[*:0]const u8 = undefined;
         var envp_buf: [config_mod.MAX_ENV + 1]?[*:0]const u8 = undefined;
@@ -631,6 +640,54 @@ pub fn execInContainer(allocator: std.mem.Allocator, exec_cfg: ExecConfig) Runti
             };
         }
     }
+}
+
+// =============================================================================
+// Seccomp Helper Functions
+// =============================================================================
+
+/// Convert config SeccompConfig to linux seccomp module format and apply.
+/// This function bridges the config module's seccomp settings to the linux module's
+/// seccomp BPF filter installation.
+fn applySeccompFromConfig(cfg: *const Config) !void {
+    const seccomp_cfg = &cfg.seccomp;
+
+    // If seccomp is disabled, do nothing
+    if (!seccomp_cfg.enabled or seccomp_cfg.profile_type == .disabled) {
+        return;
+    }
+
+    // Create the appropriate profile based on config
+    var linux_config = linux.SeccompConfig{
+        .enabled = true,
+        .log_blocked = seccomp_cfg.log_blocked,
+        .errno_instead_of_kill = seccomp_cfg.errno_instead_of_kill,
+        .errno_value = seccomp_cfg.errno_value,
+        .profile = switch (seccomp_cfg.profile_type) {
+            .disabled => linux.SeccompProfile.init(),
+            .default_container => linux.SeccompProfile.defaultContainerProfile(),
+            .minimal => linux.SeccompProfile.minimalProfile(),
+            .strict => linux.SeccompProfile.allowlistProfile(),
+            .custom => blk: {
+                var profile = linux.SeccompProfile.init();
+                // Add custom rules from config
+                for (seccomp_cfg.custom_rules[0..seccomp_cfg.custom_rules_count]) |rule| {
+                    if (!rule.active) continue;
+                    const linux_rule = switch (rule.action) {
+                        .kill => linux.SeccompRule.block(@enumFromInt(rule.syscall)),
+                        .errno => linux.SeccompRule.denyWithErrno(@enumFromInt(rule.syscall), rule.errno_value),
+                        .log => linux.SeccompRule.logOnly(@enumFromInt(rule.syscall)),
+                        .allow => linux.SeccompRule.allow(@enumFromInt(rule.syscall)),
+                    };
+                    profile.addRule(linux_rule);
+                }
+                break :blk profile;
+            },
+        },
+    };
+
+    // Apply the seccomp filter
+    try linux.applySeccompFilter(&linux_config);
 }
 
 // =============================================================================

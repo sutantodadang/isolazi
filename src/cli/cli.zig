@@ -121,6 +121,17 @@ pub const RunCommand = struct {
     io_weight: ?u32 = null, // I/O weight (1-10000)
     oom_score_adj: ?i16 = null, // OOM score adjustment (-1000 to 1000)
     oom_kill_disable: bool = false, // Disable OOM killer
+
+    // Seccomp security options
+    seccomp_enabled: bool = true, // Enable seccomp filtering (default: true)
+    seccomp_profile: SeccompProfile = .default_container, // Seccomp profile
+
+    pub const SeccompProfile = enum {
+        disabled, // No seccomp filtering
+        default_container, // Default container profile - blocks dangerous syscalls
+        minimal, // Minimal profile - only blocks most critical syscalls
+        strict, // Strict allowlist profile - blocks everything except explicitly allowed
+    };
 };
 
 /// Arguments for the 'pull' command
@@ -331,6 +342,27 @@ fn parseRunCommand(args: []const []const u8) CliError!Command {
             } else if (std.mem.eql(u8, arg, "--oom-kill-disable")) {
                 // Disable OOM killer
                 run_cmd.oom_kill_disable = true;
+            } else if (std.mem.eql(u8, arg, "--no-seccomp") or std.mem.eql(u8, arg, "--disable-seccomp")) {
+                // Disable seccomp filtering
+                run_cmd.seccomp_enabled = false;
+                run_cmd.seccomp_profile = .disabled;
+            } else if (std.mem.eql(u8, arg, "--seccomp")) {
+                // Seccomp profile: --seccomp <profile>
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                const profile_str = args[i];
+                if (std.mem.eql(u8, profile_str, "disabled") or std.mem.eql(u8, profile_str, "none")) {
+                    run_cmd.seccomp_enabled = false;
+                    run_cmd.seccomp_profile = .disabled;
+                } else if (std.mem.eql(u8, profile_str, "default") or std.mem.eql(u8, profile_str, "default-container")) {
+                    run_cmd.seccomp_profile = .default_container;
+                } else if (std.mem.eql(u8, profile_str, "minimal")) {
+                    run_cmd.seccomp_profile = .minimal;
+                } else if (std.mem.eql(u8, profile_str, "strict")) {
+                    run_cmd.seccomp_profile = .strict;
+                } else {
+                    return CliError.InvalidArgument;
+                }
             } else {
                 return CliError.InvalidArgument;
             }
@@ -765,6 +797,17 @@ pub fn printHelp(writer: anytype) !void {
         \\    --oom-score-adj <adj>     OOM score adjustment (-1000 to 1000)
         \\    --oom-kill-disable        Disable OOM killer (use with caution)
         \\
+        \\SECURITY OPTIONS:
+        \\    --seccomp <profile>       Seccomp profile (default: default-container)
+        \\                              Profiles: default, minimal, strict, disabled
+        \\    --no-seccomp              Disable seccomp filtering (same as --seccomp disabled)
+        \\
+        \\    Seccomp Profiles:
+        \\      default-container       Blocks dangerous syscalls (mount, ptrace, kexec, etc.)
+        \\      minimal                 Only blocks critical syscalls (kexec, reboot, modules)
+        \\      strict                  Allowlist mode - only basic syscalls permitted
+        \\      disabled                No syscall filtering (less secure)
+        \\
         \\OPTIONS for 'ps':
         \\    -a, --all            Show all containers (default: only running)
         \\
@@ -787,6 +830,8 @@ pub fn printHelp(writer: anytype) !void {
         \\    isolazi run --uid-map 0:1000:1 --gid-map 0:1000:1 alpine /bin/sh
         \\    isolazi run --memory 512m --cpus 2 alpine stress --vm 1 --vm-bytes 256M
         \\    isolazi run -m 1g --cpu-weight 200 --io-weight 500 alpine /bin/sh
+        \\    isolazi run --seccomp minimal alpine /bin/sh
+        \\    isolazi run --no-seccomp alpine /bin/sh     # Less secure, for debugging
         \\    isolazi create --name myapp alpine
         \\    isolazi start myapp
         \\    isolazi ps -a

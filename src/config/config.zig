@@ -35,6 +35,9 @@ pub const MAX_ID_MAPPINGS = 8;
 /// Maximum number of I/O device limits
 pub const MAX_IO_DEVICES = 8;
 
+/// Maximum number of seccomp rules
+pub const MAX_SECCOMP_RULES = 64;
+
 /// Resource limits for memory
 pub const MemoryLimitConfig = struct {
     /// Hard memory limit in bytes (0 = unlimited)
@@ -178,6 +181,134 @@ pub const ResourceLimits = struct {
             self.oom.disable_oom_kill or
             self.oom.oom_score_adj != 0 or
             self.oom.oom_group;
+    }
+};
+
+/// Seccomp syscall filtering action
+pub const SeccompAction = enum(u8) {
+    /// Kill the process on blocked syscall
+    kill = 0,
+    /// Return errno to the calling process
+    errno = 1,
+    /// Log the syscall but allow it
+    log = 2,
+    /// Allow the syscall
+    allow = 3,
+};
+
+/// A seccomp rule for syscall filtering
+pub const SeccompRuleConfig = struct {
+    /// Syscall number to match
+    syscall: u32 = 0,
+    /// Action to take when matched
+    action: SeccompAction = .kill,
+    /// Errno to return (only used with action = .errno)
+    errno_value: u16 = 1,
+    /// Is this rule active?
+    active: bool = false,
+    /// Description of what this rule does (for logging/debugging)
+    description: [64]u8 = std.mem.zeroes([64]u8),
+
+    /// Create a block rule
+    pub fn block(syscall: u32) SeccompRuleConfig {
+        return SeccompRuleConfig{
+            .syscall = syscall,
+            .action = .kill,
+            .active = true,
+        };
+    }
+
+    /// Create an allow rule
+    pub fn allow(syscall: u32) SeccompRuleConfig {
+        return SeccompRuleConfig{
+            .syscall = syscall,
+            .action = .allow,
+            .active = true,
+        };
+    }
+
+    /// Create an errno rule
+    pub fn denyWithErrno(syscall: u32, errno: u16) SeccompRuleConfig {
+        return SeccompRuleConfig{
+            .syscall = syscall,
+            .action = .errno,
+            .errno_value = errno,
+            .active = true,
+        };
+    }
+};
+
+/// Seccomp profile type
+pub const SeccompProfileType = enum {
+    /// No seccomp filtering (disabled)
+    disabled,
+    /// Default container profile - blocks dangerous syscalls
+    default_container,
+    /// Minimal profile - only blocks most critical syscalls
+    minimal,
+    /// Strict allowlist profile - blocks everything except explicitly allowed
+    strict,
+    /// Custom profile - uses custom rules
+    custom,
+};
+
+/// Seccomp configuration for container security
+pub const SeccompConfig = struct {
+    /// Is seccomp filtering enabled?
+    enabled: bool = true,
+    /// Profile type to use
+    profile_type: SeccompProfileType = .default_container,
+    /// Log blocked syscalls instead of killing
+    log_blocked: bool = false,
+    /// Return errno instead of killing on blocked syscalls
+    errno_instead_of_kill: bool = false,
+    /// Errno value to return when blocking (default EPERM = 1)
+    errno_value: u16 = 1,
+    /// Custom rules (only used when profile_type = .custom)
+    custom_rules: [MAX_SECCOMP_RULES]SeccompRuleConfig = std.mem.zeroes([MAX_SECCOMP_RULES]SeccompRuleConfig),
+    /// Number of custom rules
+    custom_rules_count: usize = 0,
+
+    /// Create default seccomp configuration (enabled with default profile)
+    pub fn default_config() SeccompConfig {
+        return SeccompConfig{};
+    }
+
+    /// Create disabled seccomp configuration
+    pub fn disabled() SeccompConfig {
+        return SeccompConfig{
+            .enabled = false,
+            .profile_type = .disabled,
+        };
+    }
+
+    /// Create minimal seccomp configuration
+    pub fn minimal() SeccompConfig {
+        return SeccompConfig{
+            .profile_type = .minimal,
+        };
+    }
+
+    /// Create strict seccomp configuration
+    pub fn strict() SeccompConfig {
+        return SeccompConfig{
+            .profile_type = .strict,
+        };
+    }
+
+    /// Add a custom rule
+    pub fn addCustomRule(self: *SeccompConfig, rule: SeccompRuleConfig) !void {
+        if (self.custom_rules_count >= MAX_SECCOMP_RULES) {
+            return error.TooManySeccompRules;
+        }
+        self.custom_rules[self.custom_rules_count] = rule;
+        self.custom_rules_count += 1;
+        self.profile_type = .custom;
+    }
+
+    /// Check if seccomp filtering is effective
+    pub fn hasFilter(self: *const SeccompConfig) bool {
+        return self.enabled and self.profile_type != .disabled;
     }
 };
 
@@ -429,6 +560,9 @@ pub const Config = struct {
     /// Resource limits (memory, CPU, I/O, OOM)
     resource_limits: ResourceLimits = .{},
 
+    /// Seccomp syscall filtering configuration
+    seccomp: SeccompConfig = SeccompConfig.default_config(),
+
     /// Initialize a new configuration with the given rootfs path.
     pub fn init(rootfs: []const u8) !Config {
         if (rootfs.len >= PATH_MAX) {
@@ -674,6 +808,58 @@ pub const Config = struct {
     pub fn enableOomGroup(self: *Config) void {
         self.resource_limits.oom.oom_group = true;
         self.namespaces.cgroup = true;
+    }
+
+    // =========================================================================
+    // Seccomp Configuration Methods
+    // =========================================================================
+
+    /// Enable seccomp filtering with default container profile
+    pub fn enableSeccomp(self: *Config) void {
+        self.seccomp.enabled = true;
+        self.seccomp.profile_type = .default_container;
+    }
+
+    /// Disable seccomp filtering
+    pub fn disableSeccomp(self: *Config) void {
+        self.seccomp.enabled = false;
+        self.seccomp.profile_type = .disabled;
+    }
+
+    /// Set seccomp profile type
+    pub fn setSeccompProfile(self: *Config, profile_type: SeccompProfileType) void {
+        self.seccomp.profile_type = profile_type;
+        if (profile_type == .disabled) {
+            self.seccomp.enabled = false;
+        } else {
+            self.seccomp.enabled = true;
+        }
+    }
+
+    /// Enable logging of blocked syscalls instead of killing
+    pub fn setSeccompLogBlocked(self: *Config, log_blocked: bool) void {
+        self.seccomp.log_blocked = log_blocked;
+    }
+
+    /// Set seccomp to return errno instead of killing
+    pub fn setSeccompErrnoMode(self: *Config, errno_value: u16) void {
+        self.seccomp.errno_instead_of_kill = true;
+        self.seccomp.errno_value = errno_value;
+    }
+
+    /// Add a custom seccomp rule to block a syscall
+    pub fn addSeccompBlockRule(self: *Config, syscall: u32) !void {
+        try self.seccomp.addCustomRule(SeccompRuleConfig.block(syscall));
+    }
+
+    /// Add a custom seccomp rule to allow a syscall
+    pub fn addSeccompAllowRule(self: *Config, syscall: u32) !void {
+        try self.seccomp.addCustomRule(SeccompRuleConfig.allow(syscall));
+    }
+
+    /// Check if seccomp is enabled and has effective filtering
+    pub fn hasSeccompFilter(self: *const Config) bool {
+        return self.seccomp.hasFilter();
     }
 
     /// Get active UID mappings.
