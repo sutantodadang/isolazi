@@ -6,7 +6,8 @@ A minimal container runtime written in Zig, inspired by Docker, Podman, and OCI 
 
 - 🐳 **Docker-like CLI** - Familiar commands: `run`, `pull`, `ps`, `stop`, `rm`
 - 📦 **OCI Image Support** - Pull images from Docker Hub and other registries
-- 🔒 **Process Isolation** - Linux namespaces (PID, mount, UTS, IPC)
+- 🔒 **Process Isolation** - Linux namespaces (PID, mount, UTS, IPC, **network**)
+- 🌐 **Network Isolation** - veth pairs, bridge networking, NAT, and port forwarding
 - 🗂️ **Filesystem Isolation** - Using `pivot_root` or `chroot`
 - 🪟 **Windows Support** - Run containers via WSL2 backend
 - 🍎 **macOS Support** - Run containers via Apple Virtualization framework
@@ -57,8 +58,14 @@ isolazi run -e MYVAR=hello -e DEBUG=1 alpine env
 # With volume mounts
 isolazi run -v /host/data:/container/data alpine ls /container/data
 
-# With port publishing
+# With port publishing (network namespace enabled by default)
 isolazi run -d -p 8080:80 nginx
+
+# Multiple port mappings
+isolazi run -d -p 8080:80 -p 8443:443 nginx
+
+# UDP port mapping
+isolazi run -d -p 5353:53/udp coredns
 
 # Run PostgreSQL with all options
 isolazi run -d -p 5432:5432 \
@@ -170,13 +177,37 @@ isolazi/
 │   │   ├── reference.zig # Image reference parsing
 │   │   └── registry.zig  # Registry client
 │   ├── runtime/          # Container runtime (Linux)
-│   ├── linux/            # Linux-specific (namespaces)
+│   ├── linux/            # Linux-specific (namespaces, networking)
+│   │   ├── syscalls.zig  # Low-level Linux syscall wrappers
+│   │   └── network.zig   # Container networking (veth, bridge, NAT)
 │   ├── fs/               # Filesystem operations
 │   ├── windows/          # WSL2 backend
 │   └── macos/            # Apple Virtualization backend
 ├── build.zig
 └── build.zig.zon
 ```
+
+## Network Architecture
+
+Containers use network namespace isolation with bridge networking:
+
+```
+                     Host                          Container
+              ┌─────────────────┐           ┌─────────────────┐
+              │                 │           │                 │
+   eth0 ──────┤   isolazi0      ├───vethXXX─┤   eth0          │
+              │   172.20.0.1    │           │   172.20.0.X    │
+              │   (bridge)      │           │                 │
+              └─────────────────┘           └─────────────────┘
+                     │
+              iptables NAT
+              (MASQUERADE)
+```
+
+- **Bridge**: `isolazi0` (172.20.0.1/24) - Created automatically
+- **Container IPs**: 172.20.0.2 - 172.20.0.254 (auto-allocated)
+- **NAT**: Outbound traffic masqueraded via host
+- **Port Forwarding**: DNAT rules for `-p` published ports
 
 ## Platform Support
 

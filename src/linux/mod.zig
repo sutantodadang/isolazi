@@ -3,12 +3,14 @@
 //! This module provides:
 //! - Direct syscall wrappers (syscalls.zig)
 //! - Namespace management helpers
+//! - Network namespace and container networking (network.zig)
 //! - Constants and flags for Linux primitives
 //!
 //! PLATFORM: This module is Linux-only. Windows support requires
 //! different isolation mechanisms (Windows Containers, Hyper-V).
 
 pub const syscalls = @import("syscalls.zig");
+pub const network = @import("network.zig");
 
 // Re-export commonly used items
 pub const CloneFlags = syscalls.CloneFlags;
@@ -28,3 +30,13 @@ pub const chdir = syscalls.chdir;
 pub const mkdir = syscalls.mkdir;
 pub const rmdir = syscalls.rmdir;
 pub const close = syscalls.close;
+
+// Network module exports
+pub const NetworkManager = network.NetworkManager;
+pub const NetworkConfig = network.NetworkConfig;
+pub const ContainerNetwork = network.ContainerNetwork;
+pub const IpAllocator = network.IpAllocator;
+pub const PortMapping = network.PortMapping;
+pub const NetworkError = network.NetworkError;
+pub const setupContainerNetworkHost = network.setupContainerNetworkHost;
+pub const setupContainerNetworkContainer = network.setupContainerNetworkContainer;

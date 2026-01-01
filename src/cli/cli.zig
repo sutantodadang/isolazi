@@ -34,15 +34,19 @@ pub const CliError = error{
     TooManyArguments,
     TooManyEnvVars,
     TooManyMounts,
+    TooManyPorts,
     HostnameTooLong,
     InvalidEnvVar,
     InvalidVolumeMount,
+    InvalidPortMapping,
 };
 
 /// Maximum number of environment variables
 pub const MAX_ENV_VARS = 64;
 /// Maximum number of volume mounts
 pub const MAX_VOLUMES = 32;
+/// Maximum number of port mappings
+pub const MAX_PORTS = 32;
 
 /// Environment variable
 pub const EnvVar = struct {
@@ -55,6 +59,15 @@ pub const VolumeMount = struct {
     host_path: []const u8,
     container_path: []const u8,
     read_only: bool = false,
+};
+
+/// Port mapping
+pub const PortMap = struct {
+    host_port: u16,
+    container_port: u16,
+    protocol: Protocol = .tcp,
+
+    pub const Protocol = enum { tcp, udp };
 };
 
 /// Parsed command from CLI
@@ -77,6 +90,8 @@ pub const RunCommand = struct {
     is_image: bool = false, // true if rootfs is an OCI image reference
     env_vars: []const EnvVar = &[_]EnvVar{},
     volumes: []const VolumeMount = &[_]VolumeMount{},
+    ports: []const PortMap = &[_]PortMap{},
+    detach: bool = false, // Run container in background
 };
 
 /// Arguments for the 'pull' command
@@ -136,11 +151,13 @@ fn parseRunCommand(args: []const []const u8) CliError!Command {
         .args = &[_][]const u8{},
     };
 
-    // Static arrays to store env vars and volumes (avoids allocation)
+    // Static arrays to store env vars, volumes, and ports (avoids allocation)
     var env_vars_buf: [MAX_ENV_VARS]EnvVar = undefined;
     var env_vars_count: usize = 0;
     var volumes_buf: [MAX_VOLUMES]VolumeMount = undefined;
     var volumes_count: usize = 0;
+    var ports_buf: [MAX_PORTS]PortMap = undefined;
+    var ports_count: usize = 0;
 
     var i: usize = 0;
     var positional_count: usize = 0;
@@ -182,9 +199,19 @@ fn parseRunCommand(args: []const []const u8) CliError!Command {
                 const volume = parseVolumeMount(vol_str) orelse return CliError.InvalidVolumeMount;
                 volumes_buf[volumes_count] = volume;
                 volumes_count += 1;
+            } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--port") or std.mem.eql(u8, arg, "--publish")) {
+                // Port mapping: -p host_port:container_port[/protocol]
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                if (ports_count >= MAX_PORTS) return CliError.TooManyPorts;
+
+                const port_str = args[i];
+                const port_map = parsePortMapping(port_str) orelse return CliError.InvalidPortMapping;
+                ports_buf[ports_count] = port_map;
+                ports_count += 1;
             } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--detach")) {
-                // Detach mode is handled at the main.zig level, just skip here
-                continue;
+                // Detach mode
+                run_cmd.detach = true;
             } else {
                 return CliError.InvalidArgument;
             }
@@ -202,12 +229,15 @@ fn parseRunCommand(args: []const []const u8) CliError!Command {
         }
     }
 
-    // Store env vars and volumes in the command
+    // Store env vars, volumes, and ports in the command
     if (env_vars_count > 0) {
         run_cmd.env_vars = env_vars_buf[0..env_vars_count];
     }
     if (volumes_count > 0) {
         run_cmd.volumes = volumes_buf[0..volumes_count];
+    }
+    if (ports_count > 0) {
+        run_cmd.ports = ports_buf[0..ports_count];
     }
 
     if (positional_count < 1) {
@@ -223,6 +253,34 @@ fn parseRunCommand(args: []const []const u8) CliError!Command {
     }
 
     return Command{ .run = run_cmd };
+}
+
+/// Parse a port mapping string "host_port:container_port[/protocol]"
+fn parsePortMapping(s: []const u8) ?PortMap {
+    // Check for protocol suffix
+    var protocol: PortMap.Protocol = .tcp;
+    var port_spec = s;
+
+    if (std.mem.endsWith(u8, s, "/udp")) {
+        protocol = .udp;
+        port_spec = s[0 .. s.len - 4];
+    } else if (std.mem.endsWith(u8, s, "/tcp")) {
+        port_spec = s[0 .. s.len - 4];
+    }
+
+    // Parse host:container
+    const colon_idx = std.mem.indexOf(u8, port_spec, ":") orelse return null;
+    const host_str = port_spec[0..colon_idx];
+    const container_str = port_spec[colon_idx + 1 ..];
+
+    const host_port = std.fmt.parseInt(u16, host_str, 10) catch return null;
+    const container_port = std.fmt.parseInt(u16, container_str, 10) catch return null;
+
+    return PortMap{
+        .host_port = host_port,
+        .container_port = container_port,
+        .protocol = protocol,
+    };
 }
 
 /// Parse an environment variable string "KEY=VALUE"
@@ -355,6 +413,12 @@ pub fn buildConfig(run_cmd: *const RunCommand) !Config {
         try cfg.addMount(vol.host_path, vol.container_path, vol.read_only);
     }
 
+    // Copy port mappings
+    for (run_cmd.ports) |port| {
+        const protocol: config_mod.PortMapping.Protocol = if (port.protocol == .tcp) .tcp else .udp;
+        try cfg.addPort(port.host_port, port.container_port, protocol);
+    }
+
     // Use chroot instead of pivot_root if requested
     cfg.use_pivot_root = !run_cmd.use_chroot;
 
@@ -437,9 +501,11 @@ pub fn printError(writer: anytype, err: CliError) !void {
         CliError.TooManyArguments => "Too many arguments",
         CliError.TooManyEnvVars => "Too many environment variables (max 64)",
         CliError.TooManyMounts => "Too many bind mounts (max 32)",
+        CliError.TooManyPorts => "Too many port mappings (max 32)",
         CliError.HostnameTooLong => "Hostname too long",
         CliError.InvalidEnvVar => "Invalid environment variable format (use KEY=VALUE)",
         CliError.InvalidVolumeMount => "Invalid volume mount format (use /host/path:/container/path[:ro])",
+        CliError.InvalidPortMapping => "Invalid port mapping format (use HOST_PORT:CONTAINER_PORT[/tcp|udp])",
     };
     try writer.print("Error: {s}\n", .{msg});
     try writer.writeAll("Run 'isolazi help' for usage information.\n");

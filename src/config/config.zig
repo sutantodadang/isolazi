@@ -26,13 +26,67 @@ pub const MAX_ENV = 128;
 /// Maximum number of bind mounts
 pub const MAX_MOUNTS = 32;
 
+/// Maximum number of port mappings
+pub const MAX_PORTS = 32;
+
+/// A port mapping specification (host:container).
+pub const PortMapping = struct {
+    /// Host port to listen on
+    host_port: u16 = 0,
+    /// Container port to forward to
+    container_port: u16 = 0,
+    /// Protocol (tcp/udp)
+    protocol: Protocol = .tcp,
+    /// Is this mapping active?
+    active: bool = false,
+
+    pub const Protocol = enum(u8) {
+        tcp = 0,
+        udp = 1,
+    };
+
+    /// Create a port mapping.
+    pub fn init(host_port: u16, container_port: u16, protocol: Protocol) PortMapping {
+        return PortMapping{
+            .host_port = host_port,
+            .container_port = container_port,
+            .protocol = protocol,
+            .active = true,
+        };
+    }
+
+    /// Parse a port mapping string like "8080:80" or "8080:80/udp"
+    pub fn parse(spec: []const u8) !PortMapping {
+        // Check for protocol suffix
+        var protocol: Protocol = .tcp;
+        var port_spec = spec;
+
+        if (std.mem.endsWith(u8, spec, "/udp")) {
+            protocol = .udp;
+            port_spec = spec[0 .. spec.len - 4];
+        } else if (std.mem.endsWith(u8, spec, "/tcp")) {
+            port_spec = spec[0 .. spec.len - 4];
+        }
+
+        // Parse host:container
+        const colon_idx = std.mem.indexOf(u8, port_spec, ":") orelse return error.InvalidPortMapping;
+        const host_str = port_spec[0..colon_idx];
+        const container_str = port_spec[colon_idx + 1 ..];
+
+        const host_port = std.fmt.parseInt(u16, host_str, 10) catch return error.InvalidPortNumber;
+        const container_port = std.fmt.parseInt(u16, container_str, 10) catch return error.InvalidPortNumber;
+
+        return PortMapping.init(host_port, container_port, protocol);
+    }
+};
+
 /// Namespace configuration flags.
 pub const Namespaces = packed struct {
     pid: bool = true,
     mount: bool = true,
     uts: bool = true,
     ipc: bool = true,
-    network: bool = false, // Not implemented yet
+    network: bool = true, // Network namespace with veth/bridge
     user: bool = false, // Not implemented yet
     cgroup: bool = false, // Not implemented yet
 
@@ -128,6 +182,10 @@ pub const Config = struct {
     mounts: [MAX_MOUNTS]Mount = std.mem.zeroes([MAX_MOUNTS]Mount),
     mounts_count: usize = 0,
 
+    /// Port mappings (host:container)
+    port_mappings: [MAX_PORTS]PortMapping = std.mem.zeroes([MAX_PORTS]PortMapping),
+    port_count: usize = 0,
+
     /// Namespace configuration
     namespaces: Namespaces = Namespaces.default,
 
@@ -205,6 +263,25 @@ pub const Config = struct {
         }
         self.mounts[self.mounts_count] = try Mount.init(source, destination, readonly);
         self.mounts_count += 1;
+    }
+
+    /// Add a port mapping.
+    pub fn addPort(self: *Config, host_port: u16, container_port: u16, protocol: PortMapping.Protocol) !void {
+        if (self.port_count >= MAX_PORTS) {
+            return error.TooManyPorts;
+        }
+        self.port_mappings[self.port_count] = PortMapping.init(host_port, container_port, protocol);
+        self.port_count += 1;
+    }
+
+    /// Add a port mapping from a spec string like "8080:80" or "8080:80/udp".
+    pub fn addPortFromSpec(self: *Config, spec: []const u8) !void {
+        const mapping = try PortMapping.parse(spec);
+        if (self.port_count >= MAX_PORTS) {
+            return error.TooManyPorts;
+        }
+        self.port_mappings[self.port_count] = mapping;
+        self.port_count += 1;
     }
 
     /// Set the hostname.
@@ -294,7 +371,7 @@ test "Config initialization" {
     try testing.expect(config.namespaces.mount);
     try testing.expect(config.namespaces.uts);
     try testing.expect(config.namespaces.ipc);
-    try testing.expect(!config.namespaces.network);
+    try testing.expect(config.namespaces.network); // Network is now enabled by default
 }
 
 test "Config add arguments" {
