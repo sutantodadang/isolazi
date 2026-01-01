@@ -664,6 +664,18 @@ pub const VolumePair = struct {
     container_path: []const u8,
 };
 
+/// Port mapping for container networking
+pub const PortMapping = struct {
+    host_port: u16,
+    container_port: u16,
+    protocol: Protocol = .tcp,
+
+    pub const Protocol = enum {
+        tcp,
+        udp,
+    };
+};
+
 /// Run using vfkit (Apple Virtualization.framework wrapper)
 pub fn runWithVfkit(
     allocator: std.mem.Allocator,
@@ -673,6 +685,7 @@ pub fn runWithVfkit(
     command: []const []const u8,
     env_vars: []const EnvPair,
     volumes: []const VolumePair,
+    port_mappings: []const PortMapping,
 ) !u8 {
     // Build vfkit command
     var vfkit_args: std.ArrayList([]const u8) = .empty;
@@ -764,6 +777,26 @@ pub fn runWithVfkit(
         try vfkit_args.append(allocator, vol_arg);
     }
 
+    // Add virtio-net device with NAT networking
+    // Format: --device virtio-net,nat,unixSocketPath=/path/to/socket
+    // or simpler: --device virtio-net,nat for basic NAT
+    try vfkit_args.append(allocator, "--device");
+    try vfkit_args.append(allocator, "virtio-net,nat");
+
+    // Add port forwarding rules if any ports are mapped
+    // vfkit uses --publish flag for port forwarding: --publish HOST:CONTAINER/PROTOCOL
+    for (port_mappings) |port| {
+        const proto_str: []const u8 = if (port.protocol == .udp) "udp" else "tcp";
+        const publish_arg = try std.fmt.allocPrint(
+            allocator,
+            "{d}:{d}/{s}",
+            .{ port.host_port, port.container_port, proto_str },
+        );
+        try allocs_to_free.append(allocator, publish_arg);
+        try vfkit_args.append(allocator, "--publish");
+        try vfkit_args.append(allocator, publish_arg);
+    }
+
     // Add serial console device for output
     try vfkit_args.append(allocator, "--device");
     try vfkit_args.append(allocator, "virtio-serial,stdio");
@@ -793,6 +826,7 @@ pub fn runWithLima(
     command: []const []const u8,
     env_vars: []const EnvPair,
     volumes: []const VolumePair,
+    port_mappings: []const PortMapping,
 ) !u8 {
     // First, ensure Lima VM "isolazi" exists and is running
     // Try to start it (will succeed if already running)
@@ -807,7 +841,7 @@ pub fn runWithLima(
         // VM might not exist, try to create it
         _ = try createLimaInstance(allocator);
         // After creating, try to start again
-        return runWithLima(allocator, "", rootfs_path, command, env_vars, volumes);
+        return runWithLima(allocator, "", rootfs_path, command, env_vars, volumes, port_mappings);
     };
 
     if (start_result.term.Exited != 0) {
@@ -873,6 +907,80 @@ pub fn runWithLima(
             try script.appendSlice(allocator, rootfs_path);
             try script.appendSlice(allocator, vol.container_path);
             try script.appendSlice(allocator, " && ");
+        }
+
+        // Set up port forwarding using iptables DNAT
+        for (port_mappings) |port| {
+            try script.appendSlice(allocator, "iptables -t nat -A PREROUTING -p ");
+            if (port.protocol == .udp) {
+                try script.appendSlice(allocator, "udp");
+            } else {
+                try script.appendSlice(allocator, "tcp");
+            }
+            try script.appendSlice(allocator, " --dport ");
+            var host_port_buf: [8]u8 = undefined;
+            const host_port_str = std.fmt.bufPrint(&host_port_buf, "{d}", .{port.host_port}) catch "0";
+            try script.appendSlice(allocator, host_port_str);
+            try script.appendSlice(allocator, " -j REDIRECT --to-port ");
+            var cont_port_buf: [8]u8 = undefined;
+            const cont_port_str = std.fmt.bufPrint(&cont_port_buf, "{d}", .{port.container_port}) catch "0";
+            try script.appendSlice(allocator, cont_port_str);
+            try script.appendSlice(allocator, " 2>/dev/null; ");
+        }
+
+        // Add the unshare and chroot command with clean environment inside container
+        try script.appendSlice(allocator, "unshare --mount --uts --ipc --pid --fork --mount-proc chroot ");
+        try script.appendSlice(allocator, rootfs_path);
+        try script.appendSlice(allocator, " /usr/bin/env -i ");
+
+        // Set minimal required environment inside container
+        try script.appendSlice(allocator, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ");
+        try script.appendSlice(allocator, "HOME=/root ");
+        try script.appendSlice(allocator, "TERM=xterm ");
+        try script.appendSlice(allocator, "LANG=C.UTF-8 ");
+
+        // Add user env vars inside container
+        for (env_vars) |env| {
+            try script.appendSlice(allocator, env.key);
+            try script.append(allocator, '=');
+            try script.appendSlice(allocator, env.value);
+            try script.append(allocator, ' ');
+        }
+
+        // Add the command
+        for (command) |arg| {
+            try script.appendSlice(allocator, arg);
+            try script.append(allocator, ' ');
+        }
+
+        const script_str = try allocator.dupe(u8, script.items);
+        defer allocator.free(script_str);
+        try lima_args.append(allocator, script_str);
+    } else if (port_mappings.len > 0) {
+        // Use script approach for port forwarding even without volumes
+        try lima_args.append(allocator, "sh");
+        try lima_args.append(allocator, "-c");
+
+        var script: std.ArrayList(u8) = .empty;
+        defer script.deinit(allocator);
+
+        // Set up port forwarding using iptables DNAT
+        for (port_mappings) |port| {
+            try script.appendSlice(allocator, "iptables -t nat -A PREROUTING -p ");
+            if (port.protocol == .udp) {
+                try script.appendSlice(allocator, "udp");
+            } else {
+                try script.appendSlice(allocator, "tcp");
+            }
+            try script.appendSlice(allocator, " --dport ");
+            var host_port_buf: [8]u8 = undefined;
+            const host_port_str = std.fmt.bufPrint(&host_port_buf, "{d}", .{port.host_port}) catch "0";
+            try script.appendSlice(allocator, host_port_str);
+            try script.appendSlice(allocator, " -j REDIRECT --to-port ");
+            var cont_port_buf: [8]u8 = undefined;
+            const cont_port_str = std.fmt.bufPrint(&cont_port_buf, "{d}", .{port.container_port}) catch "0";
+            try script.appendSlice(allocator, cont_port_str);
+            try script.appendSlice(allocator, " 2>/dev/null; ");
         }
 
         // Add the unshare and chroot command with clean environment inside container

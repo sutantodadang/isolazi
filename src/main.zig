@@ -329,6 +329,12 @@ const RunOptions = struct {
     const PortMapping = struct {
         host_port: u16,
         container_port: u16,
+        protocol: Protocol = .tcp,
+
+        pub const Protocol = enum {
+            tcp,
+            udp,
+        };
     };
 };
 
@@ -482,19 +488,30 @@ fn parseVolume(s: []const u8) ?RunOptions.VolumePair {
 
 /// Parse port mapping (host_port:container_port)
 fn parsePort(s: []const u8) ?RunOptions.PortMapping {
-    const colon_pos = std.mem.indexOf(u8, s, ":") orelse {
+    // Parse protocol suffix (e.g., "8080:80/tcp" or "8080:80/udp")
+    var port_str = s;
+    var protocol: RunOptions.PortMapping.Protocol = .tcp;
+    if (std.mem.indexOf(u8, s, "/")) |slash_pos| {
+        const proto_str = s[slash_pos + 1 ..];
+        if (std.mem.eql(u8, proto_str, "udp")) {
+            protocol = .udp;
+        }
+        port_str = s[0..slash_pos];
+    }
+
+    const colon_pos = std.mem.indexOf(u8, port_str, ":") orelse {
         // Single port means same for host and container
-        const port = std.fmt.parseInt(u16, s, 10) catch return null;
-        return .{ .host_port = port, .container_port = port };
+        const port = std.fmt.parseInt(u16, port_str, 10) catch return null;
+        return .{ .host_port = port, .container_port = port, .protocol = protocol };
     };
 
-    const host_str = s[0..colon_pos];
-    const container_str = s[colon_pos + 1 ..];
+    const host_str = port_str[0..colon_pos];
+    const container_str = port_str[colon_pos + 1 ..];
 
     const host_port = std.fmt.parseInt(u16, host_str, 10) catch return null;
     const container_port = std.fmt.parseInt(u16, container_str, 10) catch return null;
 
-    return .{ .host_port = host_port, .container_port = container_port };
+    return .{ .host_port = host_port, .container_port = container_port, .protocol = protocol };
 }
 
 /// Run container on Windows using WSL2 backend
@@ -765,6 +782,27 @@ fn runContainerWindows(
         try script_buf.appendSlice(allocator, wsl_rootfs);
         try script_buf.appendSlice(allocator, vol.container_path);
         try script_buf.appendSlice(allocator, " && ");
+    }
+
+    // Set up port forwarding using iptables in WSL2
+    // This forwards from WSL2's network namespace to the container
+    for (opts.ports) |port| {
+        // Enable IP forwarding and set up DNAT rule
+        try script_buf.appendSlice(allocator, "iptables -t nat -A PREROUTING -p ");
+        if (port.protocol == .udp) {
+            try script_buf.appendSlice(allocator, "udp");
+        } else {
+            try script_buf.appendSlice(allocator, "tcp");
+        }
+        try script_buf.appendSlice(allocator, " --dport ");
+        var host_port_buf: [8]u8 = undefined;
+        const host_port_str = std.fmt.bufPrint(&host_port_buf, "{d}", .{port.host_port}) catch "0";
+        try script_buf.appendSlice(allocator, host_port_str);
+        try script_buf.appendSlice(allocator, " -j REDIRECT --to-port ");
+        var cont_port_buf: [8]u8 = undefined;
+        const cont_port_str = std.fmt.bufPrint(&cont_port_buf, "{d}", .{port.container_port}) catch "0";
+        try script_buf.appendSlice(allocator, cont_port_str);
+        try script_buf.appendSlice(allocator, " 2>/dev/null; ");
     }
 
     // Add chroot command with env vars
@@ -1878,6 +1916,29 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
             try vol_pairs.append(allocator, .{ .host_path = v.host_path, .container_path = v.container_path });
         }
 
+        // Convert port mappings to virtualization format
+        var port_pairs: std.ArrayList(isolazi.macos.virtualization.PortMapping) = .empty;
+        defer port_pairs.deinit(allocator);
+        for (opts.ports) |p| {
+            try port_pairs.append(allocator, .{
+                .host_port = p.host_port,
+                .container_port = p.container_port,
+                .protocol = if (p.protocol == .udp) .udp else .tcp,
+            });
+        }
+
+        // Print port mappings
+        for (opts.ports) |port| {
+            if (port.host_port == port.container_port) {
+                try stdout.print("Port {d} published\n", .{port.host_port});
+            } else {
+                try stdout.print("Port {d} -> {d} published\n", .{ port.host_port, port.container_port });
+            }
+        }
+        if (opts.ports.len > 0) {
+            try stdout.flush();
+        }
+
         // Ensure VM assets are available (only needed for vfkit)
         const VMAssets = struct {
             kernel_path: []const u8,
@@ -1920,6 +1981,7 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
                 cmd_args.items,
                 env_pairs.items,
                 vol_pairs.items,
+                port_pairs.items,
             ) catch |err| {
                 try stderr.print("Error: Failed to run in VM: {}\n", .{err});
                 try stderr.flush();
@@ -1934,6 +1996,7 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
                 cmd_args.items,
                 env_pairs.items,
                 vol_pairs.items,
+                port_pairs.items,
             ) catch |err| {
                 try stderr.print("Error: Failed to run with Lima: {}\n", .{err});
                 try stderr.flush();
