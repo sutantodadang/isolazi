@@ -18,3 +18,4 @@ pub const PATH_MAX = config.PATH_MAX;
 pub const MAX_ARGS = config.MAX_ARGS;
 pub const MAX_ENV = config.MAX_ENV;
 pub const MAX_MOUNTS = config.MAX_MOUNTS;
+pub const MAX_PORTS = config.MAX_PORTS;

@@ -190,10 +190,10 @@ pub const Runtime = struct {
 
             // Configure container-side network (eth0, IP, routes)
             // This is done after we receive the veth from parent
+            var net_config = linux.ContainerNetwork.init(self.container_id, 2);
             linux.setupContainerNetworkContainer(
                 self.allocator,
-                // We need to pass the network config - use a simple default for now
-                &linux.ContainerNetwork.init(self.container_id, 2),
+                &net_config,
             ) catch {
                 // Network config failed, but continue - container may work without full networking
                 std.debug.print("Warning: Container network configuration failed\n", .{});
