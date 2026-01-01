@@ -43,6 +43,7 @@ pub const CliError = error{
     InvalidCpuLimit,
     InvalidIoLimit,
     InvalidOomScoreAdj,
+    MissingContainerId,
 };
 
 /// Maximum number of environment variables
@@ -87,6 +88,7 @@ pub const IdMap = struct {
 pub const Command = union(enum) {
     run: RunCommand,
     pull: PullCommand,
+    exec: ExecCommand,
     images: void,
     version: void,
     help: void,
@@ -124,6 +126,20 @@ pub const RunCommand = struct {
 /// Arguments for the 'pull' command
 pub const PullCommand = struct {
     image: []const u8,
+};
+
+/// Arguments for the 'exec' command
+/// Execute a command in a running container using nsenter
+pub const ExecCommand = struct {
+    container_id: []const u8,
+    command: []const u8,
+    args: []const []const u8,
+    env_vars: []const EnvVar = &[_]EnvVar{},
+    cwd: ?[]const u8 = null,
+    interactive: bool = true, // -i, allocate pseudo-TTY
+    tty: bool = true, // -t, keep STDIN open
+    detach: bool = false, // -d, run in background
+    user: ?[]const u8 = null, // -u, user to run as
 };
 
 /// Parse command-line arguments.
@@ -165,6 +181,10 @@ pub fn parse(args: []const []const u8) CliError!Command {
 
     if (std.mem.eql(u8, cmd, "images")) {
         return Command{ .images = {} };
+    }
+
+    if (std.mem.eql(u8, cmd, "exec")) {
+        return parseExecCommand(args[2..]);
     }
 
     return CliError.UnknownCommand;
@@ -407,6 +427,92 @@ fn parseIdMap(s: []const u8) ?IdMap {
     };
 }
 
+/// Parse the 'exec' subcommand arguments.
+/// Usage: isolazi exec [options] <container-id> <command> [args...]
+fn parseExecCommand(args: []const []const u8) CliError!Command {
+    var exec_cmd = ExecCommand{
+        .container_id = undefined,
+        .command = undefined,
+        .args = &[_][]const u8{},
+    };
+
+    // Static arrays to store env vars (avoids allocation)
+    var env_vars_buf: [MAX_ENV_VARS]EnvVar = undefined;
+    var env_vars_count: usize = 0;
+
+    var i: usize = 0;
+    var positional_count: usize = 0;
+    var command_args_start: usize = 0;
+
+    // Parse options and positional arguments
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+
+        if (arg.len > 0 and arg[0] == '-') {
+            // Option
+            if (std.mem.eql(u8, arg, "-i") or std.mem.eql(u8, arg, "--interactive")) {
+                exec_cmd.interactive = true;
+            } else if (std.mem.eql(u8, arg, "-t") or std.mem.eql(u8, arg, "--tty")) {
+                exec_cmd.tty = true;
+            } else if (std.mem.eql(u8, arg, "-it")) {
+                // Common Docker shorthand
+                exec_cmd.interactive = true;
+                exec_cmd.tty = true;
+            } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--detach")) {
+                exec_cmd.detach = true;
+            } else if (std.mem.eql(u8, arg, "-u") or std.mem.eql(u8, arg, "--user")) {
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                exec_cmd.user = args[i];
+            } else if (std.mem.eql(u8, arg, "-w") or std.mem.eql(u8, arg, "--workdir")) {
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                exec_cmd.cwd = args[i];
+            } else if (std.mem.eql(u8, arg, "-e") or std.mem.eql(u8, arg, "--env")) {
+                // Environment variable: -e KEY=VALUE
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                if (env_vars_count >= MAX_ENV_VARS) return CliError.TooManyEnvVars;
+
+                const env_str = args[i];
+                const env_var = parseEnvVar(env_str) orelse return CliError.InvalidEnvVar;
+                env_vars_buf[env_vars_count] = env_var;
+                env_vars_count += 1;
+            } else {
+                return CliError.InvalidArgument;
+            }
+        } else {
+            // Positional argument
+            if (positional_count == 0) {
+                exec_cmd.container_id = arg;
+            } else if (positional_count == 1) {
+                exec_cmd.command = arg;
+                command_args_start = i;
+            }
+            positional_count += 1;
+        }
+    }
+
+    // Store env vars in the command
+    if (env_vars_count > 0) {
+        exec_cmd.env_vars = env_vars_buf[0..env_vars_count];
+    }
+
+    if (positional_count < 1) {
+        return CliError.MissingContainerId;
+    }
+    if (positional_count < 2) {
+        return CliError.MissingCommand;
+    }
+
+    // Set command args (including the command itself as argv[0])
+    if (command_args_start < args.len) {
+        exec_cmd.args = args[command_args_start..];
+    }
+
+    return Command{ .exec = exec_cmd };
+}
+
 /// Parse an environment variable string "KEY=VALUE"
 fn parseEnvVar(s: []const u8) ?EnvVar {
     const eq_pos = std.mem.indexOf(u8, s, "=") orelse return null;
@@ -616,6 +722,7 @@ pub fn printHelp(writer: anytype) !void {
         \\
         \\COMMANDS:
         \\    run [-d] <image> [command]       Run a command in a new container
+        \\    exec <container> <command>       Execute a command in a running container
         \\    create [--name NAME] <image>     Create a container without starting
         \\    start <container>                Start a stopped container
         \\    stop <container>                 Stop a running container
@@ -638,6 +745,14 @@ pub fn printHelp(writer: anytype) !void {
         \\    --rootless                Enable rootless mode (user namespace)
         \\    --uid-map C:H[:N]         Map container UID C to host UID H (N count, default 1)
         \\    --gid-map C:H[:N]         Map container GID C to host GID H (N count, default 1)
+        \\
+        \\OPTIONS for 'exec':
+        \\    -i, --interactive         Keep STDIN open
+        \\    -t, --tty                 Allocate a pseudo-TTY
+        \\    -d, --detach              Run command in background
+        \\    -e, --env KEY=VALUE       Set environment variable
+        \\    -u, --user <user>         Run as specified user (name or UID)
+        \\    -w, --workdir <path>      Working directory inside the container
         \\
         \\RESOURCE LIMITS:
         \\    -m, --memory <limit>      Memory limit (e.g., 512m, 1g, 2048k)
@@ -678,6 +793,9 @@ pub fn printHelp(writer: anytype) !void {
         \\    isolazi stop myapp
         \\    isolazi prune
         \\    isolazi rm myapp
+        \\    isolazi exec mycontainer /bin/sh
+        \\    isolazi exec -it mycontainer /bin/bash
+        \\    isolazi exec -e MY_VAR=value mycontainer env
         \\
     );
 }
@@ -695,6 +813,7 @@ pub fn printError(writer: anytype, err: CliError) !void {
         CliError.MissingRootfs => "Missing image or rootfs path",
         CliError.MissingCommand => "Missing command to execute",
         CliError.MissingImage => "Missing image name",
+        CliError.MissingContainerId => "Missing container ID or name",
         CliError.InvalidArgument => "Invalid argument",
         CliError.PathTooLong => "Path too long",
         CliError.TooManyArguments => "Too many arguments",

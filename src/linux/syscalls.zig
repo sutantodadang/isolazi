@@ -289,6 +289,142 @@ pub fn close(fd: i32) void {
     _ = linux.close(fd);
 }
 
+/// Namespace file descriptor flags for setns()
+pub const NsType = struct {
+    /// PID namespace
+    pub const CLONE_NEWPID: i32 = @intCast(linux.CLONE.NEWPID);
+    /// Mount namespace
+    pub const CLONE_NEWNS: i32 = @intCast(linux.CLONE.NEWNS);
+    /// UTS namespace (hostname)
+    pub const CLONE_NEWUTS: i32 = @intCast(linux.CLONE.NEWUTS);
+    /// IPC namespace
+    pub const CLONE_NEWIPC: i32 = @intCast(linux.CLONE.NEWIPC);
+    /// Network namespace
+    pub const CLONE_NEWNET: i32 = @intCast(linux.CLONE.NEWNET);
+    /// User namespace
+    pub const CLONE_NEWUSER: i32 = @intCast(linux.CLONE.NEWUSER);
+    /// Cgroup namespace
+    pub const CLONE_NEWCGROUP: i32 = @intCast(linux.CLONE.NEWCGROUP);
+};
+
+/// Set namespace using setns(2) syscall.
+///
+/// Associates the calling thread with a namespace.
+///
+/// SECURITY: Requires appropriate capabilities (usually CAP_SYS_ADMIN).
+/// The file descriptor must refer to a namespace file in /proc/<pid>/ns/.
+///
+/// # Arguments
+/// * `fd` - File descriptor referring to a namespace (from /proc/<pid>/ns/*)
+/// * `nstype` - Type of namespace to join (0 for any, or CLONE_NEW* flag)
+///
+/// # Example
+/// ```zig
+/// const fd = try std.posix.open("/proc/1234/ns/mnt", .{}, 0);
+/// defer std.posix.close(fd);
+/// try setns(fd, NsType.CLONE_NEWNS);
+/// ```
+pub fn setns(fd: i32, nstype: i32) SyscallError!void {
+    const result = linux.syscall2(.setns, @intCast(fd), @intCast(nstype));
+    if (result > std.math.maxInt(usize) - 4096) {
+        const errno_val: u16 = @truncate(0 -% result);
+        return errnoToError(@enumFromInt(errno_val));
+    }
+}
+
+/// Open a file and return its file descriptor.
+/// Wrapper around the open(2) syscall.
+pub fn openFile(path: [*:0]const u8, flags: linux.O) SyscallError!i32 {
+    const result = linux.open(path, flags, 0);
+    if (@as(isize, @bitCast(result)) < 0) {
+        const errno_val: u16 = @truncate(0 -% result);
+        return errnoToError(@enumFromInt(errno_val));
+    }
+    return @intCast(result);
+}
+
+/// Namespace types available in /proc/<pid>/ns/
+pub const NamespaceType = enum {
+    mnt, // Mount namespace
+    uts, // UTS (hostname) namespace
+    ipc, // IPC namespace
+    net, // Network namespace
+    pid, // PID namespace
+    user, // User namespace
+    cgroup, // Cgroup namespace
+
+    /// Get the filename for this namespace type
+    pub fn toFilename(self: NamespaceType) []const u8 {
+        return switch (self) {
+            .mnt => "mnt",
+            .uts => "uts",
+            .ipc => "ipc",
+            .net => "net",
+            .pid => "pid",
+            .user => "user",
+            .cgroup => "cgroup",
+        };
+    }
+
+    /// Get the clone flag for this namespace type
+    pub fn toCloneFlag(self: NamespaceType) i32 {
+        return switch (self) {
+            .mnt => NsType.CLONE_NEWNS,
+            .uts => NsType.CLONE_NEWUTS,
+            .ipc => NsType.CLONE_NEWIPC,
+            .net => NsType.CLONE_NEWNET,
+            .pid => NsType.CLONE_NEWPID,
+            .user => NsType.CLONE_NEWUSER,
+            .cgroup => NsType.CLONE_NEWCGROUP,
+        };
+    }
+};
+
+/// Enter a namespace of a running process.
+///
+/// Opens /proc/<pid>/ns/<ns_type> and calls setns() to join that namespace.
+///
+/// SECURITY: Requires CAP_SYS_ADMIN or CAP_SYS_PTRACE depending on the namespace.
+///
+/// # Arguments
+/// * `pid` - PID of the target process
+/// * `ns_type` - Type of namespace to enter
+///
+/// # Example
+/// ```zig
+/// try enterNamespace(1234, .mnt);  // Enter mount namespace of PID 1234
+/// try enterNamespace(1234, .pid);  // Enter PID namespace of PID 1234
+/// ```
+pub fn enterNamespace(pid: linux.pid_t, ns_type: NamespaceType) SyscallError!void {
+    var path_buf: [64]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/ns/{s}", .{
+        pid,
+        ns_type.toFilename(),
+    }) catch return SyscallError.NameTooLong;
+
+    // Open the namespace file read-only
+    const fd = try openFile(path.ptr, .{});
+    defer close(fd);
+
+    // Join the namespace
+    try setns(fd, ns_type.toCloneFlag());
+}
+
+/// Enter multiple namespaces of a running process.
+///
+/// This is the equivalent of `nsenter --target <pid> --mount --uts --ipc --net --pid`.
+///
+/// # Arguments
+/// * `pid` - PID of the target process
+/// * `namespaces` - Array of namespace types to enter
+pub fn enterNamespaces(pid: linux.pid_t, namespaces: []const NamespaceType) SyscallError!void {
+    // Order matters! User namespace should be entered first if present,
+    // then other namespaces.
+    for (namespaces) |ns| {
+        try enterNamespace(pid, ns);
+    }
+}
+
 // =============================================================================
 // Tests
 // =============================================================================

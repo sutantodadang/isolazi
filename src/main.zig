@@ -100,6 +100,10 @@ const runOnWindows = if (builtin.os.tag == .windows) struct {
             if (std.mem.eql(u8, cmd, "run")) {
                 return runContainerWindows(allocator, args, stdout, stderr);
             }
+            // Handle exec command - execute in running container
+            if (std.mem.eql(u8, cmd, "exec")) {
+                return execContainerWindows(allocator, args, stdout, stderr);
+            }
             // Container management commands
             if (std.mem.eql(u8, cmd, "ps")) {
                 return listContainersWindows(allocator, args, stdout, stderr);
@@ -1026,20 +1030,25 @@ fn runContainerWindows(
     try child.spawn();
 
     if (opts.detach_mode) {
-        // Don't wait for the child in detach mode
+        // Update state to running and return
+        manager.updateState(&container_id, .running, null, null) catch {};
         return 0;
     }
 
+    // Update state to running while container executes
+    manager.updateState(&container_id, .running, null, null) catch {};
+
     const term = try child.wait();
 
-    // Cleanup container (optional, could keep for debugging)
-    // cache.removeContainer(&container_id) catch {};
-
-    return switch (term) {
+    // Update state to stopped after container exits
+    const exit_code: u8 = switch (term) {
         .Exited => |code| code,
         .Signal => |sig| @truncate(128 +% sig),
         else => 1,
     };
+    manager.updateState(&container_id, .stopped, null, exit_code) catch {};
+
+    return exit_code;
 }
 
 /// List containers (like docker ps)
@@ -1619,6 +1628,305 @@ fn pruneWindows(
     return 0;
 }
 
+/// Execute a command in a running container on Windows via WSL nsenter
+fn execContainerWindows(
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+    stdout: anytype,
+    stderr: anytype,
+) !u8 {
+    _ = stdout;
+
+    // Parse exec options
+    if (args.len < 4) {
+        try stderr.writeAll("Error: Missing container ID or command\n");
+        try stderr.writeAll("Usage: isolazi exec [options] <container> <command> [args...]\n");
+        try stderr.writeAll("\nOptions:\n");
+        try stderr.writeAll("  -i, --interactive    Keep STDIN open\n");
+        try stderr.writeAll("  -t, --tty            Allocate a pseudo-TTY\n");
+        try stderr.writeAll("  -d, --detach         Run in background\n");
+        try stderr.writeAll("  -e, --env KEY=VALUE  Set environment variable\n");
+        try stderr.writeAll("  -u, --user <user>    Run as specified user\n");
+        try stderr.writeAll("  -w, --workdir <path> Working directory\n");
+        try stderr.flush();
+        return 1;
+    }
+
+    // Check if WSL is available
+    if (!windows.isWslAvailable(allocator)) {
+        try stderr.writeAll("Error: WSL2 is required to execute in containers on Windows.\n");
+        try stderr.writeAll("\nTo install WSL2:\n");
+        try stderr.writeAll("  1. Open PowerShell as Administrator\n");
+        try stderr.writeAll("  2. Run: wsl --install\n");
+        try stderr.writeAll("  3. Restart your computer\n");
+        try stderr.flush();
+        return 1;
+    }
+
+    // Parse arguments
+    var container_id: ?[]const u8 = null;
+    var command_start: usize = 0;
+    var interactive = false;
+    var tty = false;
+    var detach = false;
+    var user: ?[]const u8 = null;
+    var workdir: ?[]const u8 = null;
+    var env_vars: std.ArrayList([]const u8) = .empty;
+    defer env_vars.deinit(allocator);
+
+    var arg_idx: usize = 2; // Skip "isolazi" and "exec"
+    while (arg_idx < args.len) : (arg_idx += 1) {
+        const arg = args[arg_idx];
+
+        if (std.mem.eql(u8, arg, "-i") or std.mem.eql(u8, arg, "--interactive")) {
+            interactive = true;
+        } else if (std.mem.eql(u8, arg, "-t") or std.mem.eql(u8, arg, "--tty")) {
+            tty = true;
+        } else if (std.mem.eql(u8, arg, "-it")) {
+            interactive = true;
+            tty = true;
+        } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--detach")) {
+            detach = true;
+        } else if (std.mem.eql(u8, arg, "-u") or std.mem.eql(u8, arg, "--user")) {
+            arg_idx += 1;
+            if (arg_idx >= args.len) {
+                try stderr.writeAll("Error: --user requires a value\n");
+                try stderr.flush();
+                return 1;
+            }
+            user = args[arg_idx];
+        } else if (std.mem.eql(u8, arg, "-w") or std.mem.eql(u8, arg, "--workdir")) {
+            arg_idx += 1;
+            if (arg_idx >= args.len) {
+                try stderr.writeAll("Error: --workdir requires a value\n");
+                try stderr.flush();
+                return 1;
+            }
+            workdir = args[arg_idx];
+        } else if (std.mem.eql(u8, arg, "-e") or std.mem.eql(u8, arg, "--env")) {
+            arg_idx += 1;
+            if (arg_idx >= args.len) {
+                try stderr.writeAll("Error: --env requires a value\n");
+                try stderr.flush();
+                return 1;
+            }
+            try env_vars.append(allocator, args[arg_idx]);
+        } else if (arg.len > 0 and arg[0] != '-') {
+            if (container_id == null) {
+                container_id = arg;
+            } else {
+                command_start = arg_idx;
+                break;
+            }
+        }
+    }
+
+    if (container_id == null) {
+        try stderr.writeAll("Error: Missing container ID\n");
+        try stderr.flush();
+        return 1;
+    }
+
+    if (command_start == 0) {
+        try stderr.writeAll("Error: Missing command to execute\n");
+        try stderr.flush();
+        return 1;
+    }
+
+    // Find container and get PID
+    var manager = isolazi.container.ContainerManager.init(allocator) catch |err| {
+        try stderr.print("Error: Failed to initialize container manager: {}\n", .{err});
+        try stderr.flush();
+        return 1;
+    };
+    defer manager.deinit();
+
+    const full_id = manager.findContainer(container_id.?) catch {
+        try stderr.print("Error: No such container: {s}\n", .{container_id.?});
+        try stderr.flush();
+        return 1;
+    };
+    defer allocator.free(full_id);
+
+    var info = manager.getContainer(full_id) catch {
+        try stderr.print("Error: Failed to get container info\n", .{});
+        try stderr.flush();
+        return 1;
+    };
+    defer info.deinit();
+
+    if (info.state != .running) {
+        try stderr.print("Error: Container {s} is not running\n", .{info.shortId()});
+        try stderr.writeAll("Note: On Windows, only containers started with -d (detach) can use exec.\n");
+        try stderr.writeAll("      For interactive containers, run the command directly.\n");
+        try stderr.flush();
+        return 1;
+    }
+
+    // On Windows via WSL, we use chroot to enter the container's rootfs
+    // since the container process may not have a persistent PID in WSL
+
+    // Get container rootfs path
+    const home = std.process.getEnvVarOwned(allocator, "USERPROFILE") catch {
+        try stderr.writeAll("Error: Could not determine user profile directory\n");
+        try stderr.flush();
+        return 1;
+    };
+    defer allocator.free(home);
+
+    // Convert Windows path to WSL path
+    const wsl_home = windows.windowsToWslPath(allocator, home) catch {
+        try stderr.writeAll("Error: Could not convert path to WSL format\n");
+        try stderr.flush();
+        return 1;
+    };
+    defer allocator.free(wsl_home);
+
+    var rootfs_buf: [1024]u8 = undefined;
+    const rootfs_path = std.fmt.bufPrint(&rootfs_buf, "{s}/.isolazi/containers/{s}/rootfs", .{ wsl_home, full_id }) catch {
+        try stderr.writeAll("Error: Path too long\n");
+        try stderr.flush();
+        return 1;
+    };
+
+    // Build WSL command using chroot (not nsenter, since container may not have persistent PID)
+    var wsl_cmd: std.ArrayList([]const u8) = .empty;
+    defer wsl_cmd.deinit(allocator);
+
+    try wsl_cmd.append(allocator, "wsl");
+    try wsl_cmd.append(allocator, "-u");
+    try wsl_cmd.append(allocator, "root");
+    try wsl_cmd.append(allocator, "--");
+
+    // Use unshare and chroot to enter container environment
+    try wsl_cmd.append(allocator, "unshare");
+    try wsl_cmd.append(allocator, "--mount");
+    try wsl_cmd.append(allocator, "--uts");
+    try wsl_cmd.append(allocator, "--ipc");
+    try wsl_cmd.append(allocator, "--pid");
+    try wsl_cmd.append(allocator, "--fork");
+    try wsl_cmd.append(allocator, "--mount-proc");
+    try wsl_cmd.append(allocator, "chroot");
+    try wsl_cmd.append(allocator, rootfs_path);
+
+    // Set working directory if specified
+    if (workdir) |w| {
+        try wsl_cmd.append(allocator, "sh");
+        try wsl_cmd.append(allocator, "-c");
+
+        // Build command with cd and env
+        var cmd_buf: [2048]u8 = undefined;
+        var cmd_len: usize = 0;
+
+        // Add cd
+        const cd_prefix = "cd ";
+        @memcpy(cmd_buf[cmd_len..][0..cd_prefix.len], cd_prefix);
+        cmd_len += cd_prefix.len;
+        @memcpy(cmd_buf[cmd_len..][0..w.len], w);
+        cmd_len += w.len;
+        cmd_buf[cmd_len] = ' ';
+        cmd_len += 1;
+        cmd_buf[cmd_len] = '&';
+        cmd_len += 1;
+        cmd_buf[cmd_len] = '&';
+        cmd_len += 1;
+        cmd_buf[cmd_len] = ' ';
+        cmd_len += 1;
+
+        // Add env vars
+        for (env_vars.items) |env| {
+            @memcpy(cmd_buf[cmd_len..][0..env.len], env);
+            cmd_len += env.len;
+            cmd_buf[cmd_len] = ' ';
+            cmd_len += 1;
+        }
+
+        // Add command
+        for (args[command_start..]) |arg| {
+            @memcpy(cmd_buf[cmd_len..][0..arg.len], arg);
+            cmd_len += arg.len;
+            cmd_buf[cmd_len] = ' ';
+            cmd_len += 1;
+        }
+
+        const cmd_str = try allocator.dupe(u8, cmd_buf[0..cmd_len]);
+        defer allocator.free(cmd_str);
+        try wsl_cmd.append(allocator, cmd_str);
+    } else {
+        // Add user switch if specified
+        if (user) |u| {
+            try wsl_cmd.append(allocator, "su");
+            try wsl_cmd.append(allocator, "-");
+            try wsl_cmd.append(allocator, u);
+            try wsl_cmd.append(allocator, "-c");
+
+            // Build quoted command string
+            var cmd_buf: [2048]u8 = undefined;
+            var cmd_len: usize = 0;
+
+            // Add env vars
+            for (env_vars.items) |env| {
+                @memcpy(cmd_buf[cmd_len..][0..env.len], env);
+                cmd_len += env.len;
+                cmd_buf[cmd_len] = ' ';
+                cmd_len += 1;
+            }
+
+            // Add command
+            for (args[command_start..]) |arg| {
+                @memcpy(cmd_buf[cmd_len..][0..arg.len], arg);
+                cmd_len += arg.len;
+                cmd_buf[cmd_len] = ' ';
+                cmd_len += 1;
+            }
+
+            const cmd_str = try allocator.dupe(u8, cmd_buf[0..cmd_len]);
+            defer allocator.free(cmd_str);
+            try wsl_cmd.append(allocator, cmd_str);
+        } else {
+            // Add environment variables via env command
+            if (env_vars.items.len > 0) {
+                try wsl_cmd.append(allocator, "env");
+                for (env_vars.items) |env| {
+                    try wsl_cmd.append(allocator, env);
+                }
+            }
+
+            // Add the command and arguments
+            for (args[command_start..]) |arg| {
+                try wsl_cmd.append(allocator, arg);
+            }
+        }
+    }
+
+    // Execute via WSL
+    var child = std.process.Child.init(wsl_cmd.items, allocator);
+
+    if (detach) {
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Ignore;
+    } else {
+        // Interactive/tty modes use inherited stdio for terminal passthrough
+        child.stdin_behavior = if (interactive or tty) .Inherit else .Pipe;
+        child.stdout_behavior = .Inherit;
+        child.stderr_behavior = .Inherit;
+    }
+
+    try child.spawn();
+
+    if (detach) {
+        return 0;
+    }
+
+    const term = try child.wait();
+    return switch (term) {
+        .Exited => |code| code,
+        .Signal => |sig| @truncate(128 +% sig),
+        else => 1,
+    };
+}
+
 /// Run on macOS using Apple Virtualization framework.
 /// Only compiled on macOS platforms.
 const runOnMacOS = if (builtin.os.tag == .macos) struct {
@@ -1675,6 +1983,9 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
             }
             if (std.mem.eql(u8, cmd, "prune")) {
                 return pruneMacOS(allocator, stdout, stderr);
+            }
+            if (std.mem.eql(u8, cmd, "exec")) {
+                return execContainerMacOS(allocator, args, stdout, stderr);
             }
             if (std.mem.eql(u8, cmd, "vm")) {
                 return vmCommandMacOS(allocator, args, stdout, stderr);
@@ -1947,6 +2258,18 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
         };
         defer allocator.free(rootfs_path);
 
+        // Register container with ContainerManager for state tracking
+        var manager = isolazi.container.ContainerManager.init(allocator) catch |err| {
+            try stderr.print("Warning: Failed to initialize container manager: {}\n", .{err});
+            try stderr.flush();
+            return 1;
+        };
+        defer manager.deinit();
+
+        // Build command string for state tracking
+        var cmd_display: [256]u8 = undefined;
+        var cmd_display_len: usize = 0;
+
         // Get command to run (default: /bin/sh, or entrypoint for known images)
         var cmd_args: std.ArrayList([]const u8) = .empty;
         defer cmd_args.deinit(allocator);
@@ -1956,13 +2279,30 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
         if (opts.command_args.len > 0) {
             for (opts.command_args) |arg| {
                 try cmd_args.append(allocator, arg);
+                // Build display string
+                if (cmd_display_len > 0 and cmd_display_len < 255) {
+                    cmd_display[cmd_display_len] = ' ';
+                    cmd_display_len += 1;
+                }
+                const copy_len = @min(arg.len, 255 - cmd_display_len);
+                @memcpy(cmd_display[cmd_display_len..][0..copy_len], arg[0..copy_len]);
+                cmd_display_len += copy_len;
             }
         } else if (is_postgres) {
             try cmd_args.append(allocator, "docker-entrypoint.sh");
             try cmd_args.append(allocator, "postgres");
+            const entry = "docker-entrypoint.sh postgres";
+            @memcpy(cmd_display[0..entry.len], entry);
+            cmd_display_len = entry.len;
         } else {
             try cmd_args.append(allocator, "/bin/sh");
+            const sh = "/bin/sh";
+            @memcpy(cmd_display[0..sh.len], sh);
+            cmd_display_len = sh.len;
         }
+
+        // Register container state
+        _ = manager.createContainerWithId(&container_id, opts.image_name, cmd_display[0..cmd_display_len], null) catch {};
 
         if (opts.detach_mode) {
             try stdout.print("{s}\n", .{container_id});
@@ -2061,8 +2401,12 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
         }
 
         // Run in VM using appropriate hypervisor
+        // Update state to running
+        manager.updateState(&container_id, .running, null, null) catch {};
+
+        var exit_code: u8 = 0;
         if (std.mem.eql(u8, hypervisor.?, "vfkit")) {
-            return isolazi.macos.virtualization.runWithVfkit(
+            exit_code = isolazi.macos.virtualization.runWithVfkit(
                 allocator,
                 vm_assets.?.kernel_path,
                 vm_assets.?.initramfs_path,
@@ -2073,13 +2417,14 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
                 port_pairs.items,
                 opts.rootless,
             ) catch |err| {
+                manager.updateState(&container_id, .stopped, null, 1) catch {};
                 try stderr.print("Error: Failed to run in VM: {}\n", .{err});
                 try stderr.flush();
                 return 1;
             };
         } else {
             // Use Lima
-            return isolazi.macos.virtualization.runWithLima(
+            exit_code = isolazi.macos.virtualization.runWithLima(
                 allocator,
                 "", // Lima manages its own kernel
                 rootfs_path,
@@ -2089,11 +2434,16 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
                 port_pairs.items,
                 opts.rootless,
             ) catch |err| {
+                manager.updateState(&container_id, .stopped, null, 1) catch {};
                 try stderr.print("Error: Failed to run with Lima: {}\n", .{err});
                 try stderr.flush();
                 return 1;
             };
         }
+
+        // Update state to stopped after container exits
+        manager.updateState(&container_id, .stopped, null, exit_code) catch {};
+        return exit_code;
     }
 
     /// List containers on macOS
@@ -2524,6 +2874,237 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
         return 0;
     }
 
+    /// Execute a command in a running container on macOS via Lima/vfkit
+    fn execContainerMacOS(
+        allocator: std.mem.Allocator,
+        args: []const []const u8,
+        stdout: anytype,
+        stderr: anytype,
+    ) !u8 {
+        _ = stdout;
+
+        // Parse exec options
+        if (args.len < 4) {
+            try stderr.writeAll("Error: Missing container ID or command\n");
+            try stderr.writeAll("Usage: isolazi exec [options] <container> <command> [args...]\n");
+            try stderr.writeAll("\nOptions:\n");
+            try stderr.writeAll("  -i, --interactive    Keep STDIN open\n");
+            try stderr.writeAll("  -t, --tty            Allocate a pseudo-TTY\n");
+            try stderr.writeAll("  -d, --detach         Run in background\n");
+            try stderr.writeAll("  -e, --env KEY=VALUE  Set environment variable\n");
+            try stderr.writeAll("  -u, --user <user>    Run as specified user\n");
+            try stderr.writeAll("  -w, --workdir <path> Working directory\n");
+            try stderr.flush();
+            return 1;
+        }
+
+        // Check for hypervisor backend
+        const hypervisor = isolazi.macos.virtualization.findHypervisor(allocator);
+        if (hypervisor == null) {
+            try stderr.writeAll("Error: No hypervisor backend found.\n");
+            try stderr.writeAll("\nInstall one of the following:\n");
+            try stderr.writeAll("  - Lima (recommended): brew install lima\n");
+            try stderr.writeAll("  - vfkit: brew install vfkit\n");
+            try stderr.flush();
+            return 1;
+        }
+
+        // Parse arguments
+        var container_id: ?[]const u8 = null;
+        var command_start: usize = 0;
+        var interactive = false;
+        var tty = false;
+        var detach = false;
+        var user: ?[]const u8 = null;
+        var workdir: ?[]const u8 = null;
+        var env_vars: std.ArrayList([]const u8) = .empty;
+        defer env_vars.deinit(allocator);
+
+        var arg_idx: usize = 2; // Skip "isolazi" and "exec"
+        while (arg_idx < args.len) : (arg_idx += 1) {
+            const arg = args[arg_idx];
+
+            if (std.mem.eql(u8, arg, "-i") or std.mem.eql(u8, arg, "--interactive")) {
+                interactive = true;
+            } else if (std.mem.eql(u8, arg, "-t") or std.mem.eql(u8, arg, "--tty")) {
+                tty = true;
+            } else if (std.mem.eql(u8, arg, "-it")) {
+                interactive = true;
+                tty = true;
+            } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--detach")) {
+                detach = true;
+            } else if (std.mem.eql(u8, arg, "-u") or std.mem.eql(u8, arg, "--user")) {
+                arg_idx += 1;
+                if (arg_idx >= args.len) {
+                    try stderr.writeAll("Error: --user requires a value\n");
+                    try stderr.flush();
+                    return 1;
+                }
+                user = args[arg_idx];
+            } else if (std.mem.eql(u8, arg, "-w") or std.mem.eql(u8, arg, "--workdir")) {
+                arg_idx += 1;
+                if (arg_idx >= args.len) {
+                    try stderr.writeAll("Error: --workdir requires a value\n");
+                    try stderr.flush();
+                    return 1;
+                }
+                workdir = args[arg_idx];
+            } else if (std.mem.eql(u8, arg, "-e") or std.mem.eql(u8, arg, "--env")) {
+                arg_idx += 1;
+                if (arg_idx >= args.len) {
+                    try stderr.writeAll("Error: --env requires a value\n");
+                    try stderr.flush();
+                    return 1;
+                }
+                try env_vars.append(allocator, args[arg_idx]);
+            } else if (arg.len > 0 and arg[0] != '-') {
+                if (container_id == null) {
+                    container_id = arg;
+                } else {
+                    command_start = arg_idx;
+                    break;
+                }
+            }
+        }
+
+        if (container_id == null) {
+            try stderr.writeAll("Error: Missing container ID\n");
+            try stderr.flush();
+            return 1;
+        }
+
+        if (command_start == 0) {
+            try stderr.writeAll("Error: Missing command to execute\n");
+            try stderr.flush();
+            return 1;
+        }
+
+        // Find container and get PID
+        var manager = isolazi.container.ContainerManager.init(allocator) catch |err| {
+            try stderr.print("Error: Failed to initialize container manager: {}\n", .{err});
+            try stderr.flush();
+            return 1;
+        };
+        defer manager.deinit();
+
+        const full_id = manager.findContainer(container_id.?) catch {
+            try stderr.print("Error: No such container: {s}\n", .{container_id.?});
+            try stderr.flush();
+            return 1;
+        };
+        defer allocator.free(full_id);
+
+        var info = manager.getContainer(full_id) catch {
+            try stderr.print("Error: Failed to get container info\n", .{});
+            try stderr.flush();
+            return 1;
+        };
+        defer info.deinit();
+
+        if (info.state != .running) {
+            try stderr.print("Error: Container {s} is not running\n", .{info.shortId()});
+            try stderr.flush();
+            return 1;
+        }
+
+        const target_pid = info.pid orelse {
+            try stderr.writeAll("Error: Container has no PID recorded\n");
+            try stderr.flush();
+            return 1;
+        };
+
+        // Build Lima/limactl command to exec via nsenter in VM
+        var lima_cmd: std.ArrayList([]const u8) = .empty;
+        defer lima_cmd.deinit(allocator);
+
+        if (std.mem.eql(u8, hypervisor.?, "limactl") or std.mem.eql(u8, hypervisor.?, "lima")) {
+            // Lima approach: limactl shell default nsenter ...
+            try lima_cmd.append(allocator, "limactl");
+            try lima_cmd.append(allocator, "shell");
+            try lima_cmd.append(allocator, "default");
+            try lima_cmd.append(allocator, "--");
+            try lima_cmd.append(allocator, "sudo");
+        } else {
+            // vfkit or other - use SSH approach
+            // For simplicity, assume lima is available
+            try stderr.writeAll("Error: exec currently requires Lima on macOS\n");
+            try stderr.writeAll("\nInstall Lima: brew install lima\n");
+            try stderr.writeAll("Start Lima: limactl start\n");
+            try stderr.flush();
+            return 1;
+        }
+
+        // Use nsenter to enter container namespaces
+        try lima_cmd.append(allocator, "nsenter");
+        try lima_cmd.append(allocator, "--target");
+
+        // Format PID as string
+        var pid_buf: [16]u8 = undefined;
+        const pid_str = std.fmt.bufPrint(&pid_buf, "{d}", .{target_pid}) catch "0";
+        try lima_cmd.append(allocator, pid_str);
+
+        // Enter all namespaces
+        try lima_cmd.append(allocator, "--mount");
+        try lima_cmd.append(allocator, "--uts");
+        try lima_cmd.append(allocator, "--ipc");
+        try lima_cmd.append(allocator, "--net");
+        try lima_cmd.append(allocator, "--pid");
+        try lima_cmd.append(allocator, "--cgroup");
+
+        // Set user if specified
+        if (user) |u| {
+            try lima_cmd.append(allocator, "--setuid");
+            try lima_cmd.append(allocator, u);
+        }
+
+        // Set working directory if specified
+        if (workdir) |w| {
+            try lima_cmd.append(allocator, "--wd");
+            try lima_cmd.append(allocator, w);
+        }
+
+        // Add environment variables via env command
+        if (env_vars.items.len > 0) {
+            try lima_cmd.append(allocator, "env");
+            for (env_vars.items) |env| {
+                try lima_cmd.append(allocator, env);
+            }
+        }
+
+        // Add the command and arguments
+        for (args[command_start..]) |arg| {
+            try lima_cmd.append(allocator, arg);
+        }
+
+        // Execute via Lima
+        var child = std.process.Child.init(lima_cmd.items, allocator);
+
+        // Configure stdin/stdout/stderr behavior based on options
+        if (detach) {
+            child.stdin_behavior = .Ignore;
+            child.stdout_behavior = .Ignore;
+            child.stderr_behavior = .Ignore;
+        } else {
+            // Interactive mode requires stdin, tty enables terminal passthrough
+            child.stdin_behavior = if (interactive or tty) .Inherit else .Pipe;
+            child.stdout_behavior = .Inherit;
+            child.stderr_behavior = .Inherit;
+        }
+
+        try child.spawn();
+
+        if (detach) {
+            return 0;
+        }
+
+        const term = try child.wait();
+        return switch (term) {
+            .Exited => |code| code,
+            .Signal => |sig| @truncate(128 +% sig),
+            else => 1,
+        };
+    }
+
     /// VM management commands (macOS specific)
     fn vmCommandMacOS(
         allocator: std.mem.Allocator,
@@ -2673,6 +3254,9 @@ const runOnLinux = if (builtin.os.tag == .linux) struct {
             },
             .run => |run_cmd| {
                 return runContainerLinuxImpl(allocator, run_cmd, stdout, stderr);
+            },
+            .exec => |exec_cmd| {
+                return execContainerLinuxImpl(allocator, exec_cmd, stdout, stderr);
             },
         }
     }
@@ -2931,16 +3515,148 @@ const runOnLinux = if (builtin.os.tag == .linux) struct {
         }
 
         // Create and run the container
-        var cid_buf: [12]u8 = if (container_id) |cid| cid else [_]u8{ 'u', 'n', 'k', 'n', 'o', 'w', 'n', '0', '0', '0', '0', '0' };
-        const result = isolazi.runtime.run(&cfg, allocator, &cid_buf) catch |err| {
+        // Expand 12-byte container_id to 32-byte for state tracking
+        var cid_buf_short: [12]u8 = if (container_id) |cid| cid else [_]u8{ 'u', 'n', 'k', 'n', 'o', 'w', 'n', '0', '0', '0', '0', '0' };
+        var cid_buf: [32]u8 = undefined;
+        @memcpy(cid_buf[0..12], &cid_buf_short);
+        // Pad with zeros
+        @memset(cid_buf[12..], '0');
+
+        // Register container with ContainerManager for state tracking
+        var manager = isolazi.container.ContainerManager.init(allocator) catch |err| {
+            try stderr.print("Warning: Failed to initialize container manager: {}\n", .{err});
+            try stderr.flush();
+            return 1;
+        };
+        defer manager.deinit();
+
+        // Build command string for state tracking
+        var cmd_display: [256]u8 = undefined;
+        const cmd_len = @min(run_cmd.command.len, 255);
+        @memcpy(cmd_display[0..cmd_len], run_cmd.command[0..cmd_len]);
+
+        // Register container and update to running
+        _ = manager.createContainerWithId(&cid_buf, run_cmd.rootfs, cmd_display[0..cmd_len], null) catch {};
+        manager.updateState(&cid_buf, .running, null, null) catch {};
+
+        const result = isolazi.runtime.run(&cfg, allocator, &cid_buf_short) catch |err| {
+            // Update state to stopped on error
+            manager.updateState(&cid_buf, .stopped, null, 1) catch {};
             try stderr.print("Error: Container execution failed: {}\n", .{err});
             try stderr.flush();
             return 1;
         };
 
+        // Update container state to stopped
+        manager.updateState(&cid_buf, .stopped, null, result.exit_code) catch {};
+
         // Return the container's exit code
         if (result.signaled) {
             try stderr.print("Container killed by signal {}\n", .{result.signal});
+            try stderr.flush();
+        }
+
+        return result.exit_code;
+    }
+
+    /// Execute a command in a running container on Linux using nsenter
+    fn execContainerLinuxImpl(
+        allocator: std.mem.Allocator,
+        exec_cmd: isolazi.cli.ExecCommand,
+        stdout: anytype,
+        stderr: anytype,
+    ) !u8 {
+        _ = stdout;
+
+        // Check if running as root
+        const uid = std.os.linux.getuid();
+        if (uid != 0) {
+            try stderr.writeAll("Error: Isolazi exec must be run as root.\n");
+            try stderr.writeAll("nsenter requires CAP_SYS_ADMIN privileges.\n");
+            try stderr.writeAll("\nHint: Run with 'sudo isolazi exec ...'\n");
+            try stderr.flush();
+            return 1;
+        }
+
+        // Find the container
+        var manager = isolazi.container.ContainerManager.init(allocator) catch |err| {
+            try stderr.print("Error: Failed to initialize container manager: {}\n", .{err});
+            try stderr.flush();
+            return 1;
+        };
+        defer manager.deinit();
+
+        const full_id = manager.findContainer(exec_cmd.container_id) catch {
+            try stderr.print("Error: No such container: {s}\n", .{exec_cmd.container_id});
+            try stderr.flush();
+            return 1;
+        };
+        defer allocator.free(full_id);
+
+        var info = manager.getContainer(full_id) catch {
+            try stderr.print("Error: Failed to get container info\n", .{});
+            try stderr.flush();
+            return 1;
+        };
+        defer info.deinit();
+
+        // Check container is running
+        if (info.state != .running) {
+            try stderr.print("Error: Container {s} is not running\n", .{info.shortId()});
+            try stderr.flush();
+            return 1;
+        }
+
+        const target_pid = info.pid orelse {
+            try stderr.writeAll("Error: Container has no PID recorded\n");
+            try stderr.flush();
+            return 1;
+        };
+
+        // Build environment variables
+        var env_list: std.ArrayList([]const u8) = .empty;
+        defer env_list.deinit(allocator);
+
+        for (exec_cmd.env_vars) |env| {
+            var env_buf: [512]u8 = undefined;
+            const env_str = std.fmt.bufPrint(&env_buf, "{s}={s}", .{ env.key, env.value }) catch continue;
+            const duped = try allocator.dupe(u8, env_str);
+            try env_list.append(allocator, duped);
+        }
+        defer {
+            for (env_list.items) |item| {
+                allocator.free(item);
+            }
+        }
+
+        // Create exec configuration
+        const exec_cfg = isolazi.runtime.ExecConfig{
+            .target_pid = target_pid,
+            .command = exec_cmd.command,
+            .args = exec_cmd.args,
+            .env = env_list.items,
+            .cwd = exec_cmd.cwd,
+            .user = exec_cmd.user,
+            .namespaces = .{
+                .mount = true,
+                .uts = true,
+                .ipc = true,
+                .net = true,
+                .pid = true,
+                .user = false, // Usually skip user ns for exec
+                .cgroup = true,
+            },
+        };
+
+        // Execute in container
+        const result = isolazi.runtime.execInContainer(allocator, exec_cfg) catch |err| {
+            try stderr.print("Error: Failed to execute in container: {}\n", .{err});
+            try stderr.flush();
+            return 1;
+        };
+
+        if (result.signaled) {
+            try stderr.print("Command killed by signal {}\n", .{result.signal});
             try stderr.flush();
         }
 

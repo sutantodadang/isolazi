@@ -4,13 +4,14 @@ A minimal container runtime written in Zig, inspired by Docker, Podman, and OCI 
 
 ## Features
 
-- 🐳 **Docker-like CLI** - Familiar commands: `run`, `pull`, `ps`, `stop`, `rm`
+- 🐳 **Docker-like CLI** - Familiar commands: `run`, `pull`, `ps`, `stop`, `rm`, `exec`
 - 📦 **OCI Image Support** - Pull images from Docker Hub and other registries
 - 🔒 **Process Isolation** - Linux namespaces (PID, mount, UTS, IPC, **network**, **user**, **cgroup**)
 - 🌐 **Network Isolation** - veth pairs, bridge networking, NAT, and port forwarding
 - 👤 **Rootless Containers** - User namespace support for unprivileged container execution
 - ⚙️ **Resource Limits** - cgroup v2 support for memory, CPU, and I/O limits
 - 🗂️ **Filesystem Isolation** - Using `pivot_root` or `chroot`
+- 🔧 **Exec into Containers** - Execute commands in running containers using `nsenter`
 - 🪟 **Windows Support** - Run containers via WSL2 backend
 - 🍎 **macOS Support** - Run containers via Apple Virtualization framework
 - ⚡ **Fast & Lightweight** - Written in Zig with minimal dependencies
@@ -136,6 +137,28 @@ isolazi inspect myapp
 isolazi prune
 ```
 
+### Execute Commands in Running Containers
+
+```bash
+# Run an interactive shell in a running container
+isolazi exec -it <container_id> /bin/sh
+
+# Run a command in a running container
+isolazi exec <container_id> ls -la /
+
+# Run command with environment variables
+isolazi exec -e MYVAR=value <container_id> env
+
+# Run command as a different user
+isolazi exec -u nobody <container_id> id
+
+# Run command in a specific working directory
+isolazi exec -w /tmp <container_id> pwd
+
+# Run command in background (detached)
+isolazi exec -d <container_id> sleep 100
+```
+
 ### Image Management
 
 ```bash
@@ -154,6 +177,7 @@ isolazi <COMMAND> [OPTIONS]
 
 COMMANDS:
     run [-d] <image> [command]       Run a command in a new container
+    exec [OPTIONS] <container> <cmd> Execute a command in a running container
     create [--name NAME] <image>     Create a container without starting
     start <container>                Start a stopped container
     stop <container>                 Stop a running container
@@ -187,6 +211,14 @@ OPTIONS for 'run':
     --io-weight <1-10000>     Block I/O weight (default: 100)
     --oom-score-adj <-1000..1000>  OOM killer score adjustment
     --oom-kill-disable        Disable OOM killer for this container
+
+OPTIONS for 'exec':
+    -i, --interactive         Keep STDIN open
+    -t, --tty                 Allocate a pseudo-TTY
+    -d, --detach              Run command in background
+    -e, --env KEY=VALUE       Set environment variable
+    -u, --user <user>         Run command as specified user
+    -w, --workdir <path>      Working directory inside the container
 
 OPTIONS for 'ps':
     -a, --all            Show all containers (default: only running)
@@ -222,8 +254,9 @@ isolazi/
 │   │   ├── reference.zig # Image reference parsing
 │   │   └── registry.zig  # Registry client
 │   ├── runtime/          # Container runtime (Linux)
+│   │   └── container.zig # Container execution and exec support
 │   ├── linux/            # Linux-specific (namespaces, networking)
-│   │   ├── syscalls.zig  # Low-level Linux syscall wrappers
+│   │   ├── syscalls.zig  # Low-level Linux syscall wrappers (setns, nsenter)
 │   │   ├── network.zig   # Container networking (veth, bridge, NAT)
 │   │   ├── userns.zig    # User namespace for rootless containers
 │   │   └── cgroup.zig    # cgroup v2 resource limits

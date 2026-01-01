@@ -438,6 +438,201 @@ pub fn run(config: *const Config, allocator: std.mem.Allocator, container_id: []
     return runtime.run();
 }
 
+/// Configuration for exec command
+pub const ExecConfig = struct {
+    /// Target container PID
+    target_pid: std.os.linux.pid_t,
+    /// Command to execute
+    command: []const u8,
+    /// Command arguments (argv[0] should be command)
+    args: []const []const u8,
+    /// Environment variables (KEY=VALUE format)
+    env: []const []const u8,
+    /// Working directory (null = inherit from container)
+    cwd: ?[]const u8,
+    /// User to run as (null = root)
+    user: ?[]const u8,
+    /// Which namespaces to enter
+    namespaces: struct {
+        mount: bool = true,
+        uts: bool = true,
+        ipc: bool = true,
+        net: bool = true,
+        pid: bool = true,
+        user: bool = false, // Usually skip user ns for exec
+        cgroup: bool = true,
+    } = .{},
+};
+
+/// Execute a command in a running container's namespaces using nsenter.
+///
+/// This function:
+/// 1. Forks a new process
+/// 2. In child: enters the target container's namespaces using setns()
+/// 3. Executes the specified command
+/// 4. Parent waits for child and returns exit status
+///
+/// SECURITY: Requires CAP_SYS_ADMIN and CAP_SYS_PTRACE capabilities.
+pub fn execInContainer(allocator: std.mem.Allocator, exec_cfg: ExecConfig) RuntimeError!RunResult {
+    // Fork a new process
+    const pid = try linux.fork();
+
+    if (pid == 0) {
+        // Child process - enter namespaces and exec
+
+        // Build list of namespaces to enter
+        // Order matters: user ns should be first if used
+        var ns_list: [7]linux.NamespaceType = undefined;
+        var ns_count: usize = 0;
+
+        if (exec_cfg.namespaces.user) {
+            ns_list[ns_count] = .user;
+            ns_count += 1;
+        }
+        if (exec_cfg.namespaces.mount) {
+            ns_list[ns_count] = .mnt;
+            ns_count += 1;
+        }
+        if (exec_cfg.namespaces.uts) {
+            ns_list[ns_count] = .uts;
+            ns_count += 1;
+        }
+        if (exec_cfg.namespaces.ipc) {
+            ns_list[ns_count] = .ipc;
+            ns_count += 1;
+        }
+        if (exec_cfg.namespaces.net) {
+            ns_list[ns_count] = .net;
+            ns_count += 1;
+        }
+        if (exec_cfg.namespaces.pid) {
+            ns_list[ns_count] = .pid;
+            ns_count += 1;
+        }
+        if (exec_cfg.namespaces.cgroup) {
+            ns_list[ns_count] = .cgroup;
+            ns_count += 1;
+        }
+
+        // Enter namespaces
+        linux.enterNamespaces(exec_cfg.target_pid, ns_list[0..ns_count]) catch |err| {
+            std.debug.print("Failed to enter namespaces: {}\n", .{err});
+            std.process.exit(1);
+        };
+
+        // Change working directory if specified
+        if (exec_cfg.cwd) |cwd| {
+            var cwd_buf: [4096]u8 = undefined;
+            const cwd_z = std.fmt.bufPrintZ(&cwd_buf, "{s}", .{cwd}) catch {
+                std.debug.print("Working directory path too long\n", .{});
+                std.process.exit(1);
+            };
+            linux.chdir(cwd_z.ptr) catch |err| {
+                std.debug.print("Failed to change directory: {}\n", .{err});
+                std.process.exit(1);
+            };
+        }
+
+        // Build argv for execve
+        // We need null-terminated strings for execve
+        var argv_ptrs: [256]?[*:0]const u8 = undefined;
+        var argv_count: usize = 0;
+
+        for (exec_cfg.args) |arg| {
+            if (argv_count >= argv_ptrs.len - 1) break;
+            // Need to ensure args are null-terminated
+            // Since they come from CLI, they should be from the arg slice
+            // We'll use a buffer for safety
+            var arg_buf: [4096]u8 = undefined;
+            const arg_z = std.fmt.bufPrintZ(&arg_buf, "{s}", .{arg}) catch {
+                std.debug.print("Argument too long\n", .{});
+                std.process.exit(1);
+            };
+            // Store pointer - this is safe as arg_buf lives until execve
+            // Actually we need heap allocation or static storage
+            const duped = allocator.dupeZ(u8, arg_z) catch {
+                std.debug.print("Out of memory\n", .{});
+                std.process.exit(1);
+            };
+            argv_ptrs[argv_count] = duped.ptr;
+            argv_count += 1;
+        }
+        argv_ptrs[argv_count] = null;
+
+        // Build envp for execve
+        var envp_ptrs: [256]?[*:0]const u8 = undefined;
+        var envp_count: usize = 0;
+
+        // Add default environment
+        const default_env = [_][]const u8{
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "TERM=xterm",
+            "HOME=/root",
+        };
+
+        for (default_env) |env| {
+            if (envp_count >= envp_ptrs.len - 1) break;
+            const duped = allocator.dupeZ(u8, env) catch {
+                std.debug.print("Out of memory\n", .{});
+                std.process.exit(1);
+            };
+            envp_ptrs[envp_count] = duped.ptr;
+            envp_count += 1;
+        }
+
+        // Add user-specified environment
+        for (exec_cfg.env) |env| {
+            if (envp_count >= envp_ptrs.len - 1) break;
+            const duped = allocator.dupeZ(u8, env) catch {
+                std.debug.print("Out of memory\n", .{});
+                std.process.exit(1);
+            };
+            envp_ptrs[envp_count] = duped.ptr;
+            envp_count += 1;
+        }
+        envp_ptrs[envp_count] = null;
+
+        // Get command path
+        var cmd_buf: [4096]u8 = undefined;
+        const cmd_z = std.fmt.bufPrintZ(&cmd_buf, "{s}", .{exec_cfg.command}) catch {
+            std.debug.print("Command path too long\n", .{});
+            std.process.exit(1);
+        };
+
+        // Execute the command
+        linux.execve(
+            cmd_z.ptr,
+            @ptrCast(&argv_ptrs),
+            @ptrCast(&envp_ptrs),
+        ) catch |err| {
+            std.debug.print("Failed to execute command: {}\n", .{err});
+            std.process.exit(127);
+        };
+
+        unreachable;
+    } else {
+        // Parent process - wait for child
+        const wait_result = try linux.waitpid(pid, 0);
+        const status = wait_result.status;
+
+        const signaled = ((status & 0x7f) + 1) >> 1 > 0;
+
+        if (signaled) {
+            return RunResult{
+                .exit_code = 128 + @as(u8, @truncate(status & 0x7f)),
+                .signaled = true,
+                .signal = @truncate(status & 0x7f),
+            };
+        } else {
+            return RunResult{
+                .exit_code = @truncate((status >> 8) & 0xff),
+                .signaled = false,
+                .signal = 0,
+            };
+        }
+    }
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
