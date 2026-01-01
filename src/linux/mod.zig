@@ -20,6 +20,8 @@ pub const cgroup = @import("cgroup.zig");
 pub const CloneFlags = syscalls.CloneFlags;
 pub const MountFlags = syscalls.MountFlags;
 pub const SyscallError = syscalls.SyscallError;
+pub const NsType = syscalls.NsType;
+pub const NamespaceType = syscalls.NamespaceType;
 
 pub const unshare = syscalls.unshare;
 pub const mount = syscalls.mount;
@@ -34,6 +36,10 @@ pub const chdir = syscalls.chdir;
 pub const mkdir = syscalls.mkdir;
 pub const rmdir = syscalls.rmdir;
 pub const close = syscalls.close;
+pub const setns = syscalls.setns;
+pub const openFile = syscalls.openFile;
+pub const enterNamespace = syscalls.enterNamespace;
+pub const enterNamespaces = syscalls.enterNamespaces;
 
 // Network module exports
 pub const NetworkManager = network.NetworkManager;
