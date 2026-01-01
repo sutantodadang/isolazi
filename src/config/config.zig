@@ -32,6 +32,155 @@ pub const MAX_PORTS = 32;
 /// Maximum number of UID/GID mappings for user namespace
 pub const MAX_ID_MAPPINGS = 8;
 
+/// Maximum number of I/O device limits
+pub const MAX_IO_DEVICES = 8;
+
+/// Resource limits for memory
+pub const MemoryLimitConfig = struct {
+    /// Hard memory limit in bytes (0 = unlimited)
+    max: u64 = 0,
+    /// High watermark - triggers memory pressure at this level (0 = disabled)
+    high: u64 = 0,
+    /// Swap limit in bytes (0 = same as memory max)
+    swap_max: u64 = 0,
+    /// Enable swap (if false, swap_max is set to 0)
+    swap_enabled: bool = true,
+
+    /// Parse a memory string like "512m", "1g", "1024k", "1073741824"
+    pub fn parse(s: []const u8) !u64 {
+        if (s.len == 0) return 0;
+
+        const last = s[s.len - 1];
+        var multiplier: u64 = 1;
+        var num_str = s;
+
+        if (last == 'k' or last == 'K') {
+            multiplier = 1024;
+            num_str = s[0 .. s.len - 1];
+        } else if (last == 'm' or last == 'M') {
+            multiplier = 1024 * 1024;
+            num_str = s[0 .. s.len - 1];
+        } else if (last == 'g' or last == 'G') {
+            multiplier = 1024 * 1024 * 1024;
+            num_str = s[0 .. s.len - 1];
+        } else if (last == 't' or last == 'T') {
+            multiplier = 1024 * 1024 * 1024 * 1024;
+            num_str = s[0 .. s.len - 1];
+        }
+
+        const value = std.fmt.parseInt(u64, num_str, 10) catch
+            return error.InvalidMemoryLimit;
+
+        if (value > std.math.maxInt(u64) / multiplier) {
+            return error.InvalidMemoryLimit;
+        }
+
+        return value * multiplier;
+    }
+};
+
+/// Resource limits for CPU
+pub const CpuLimitConfig = struct {
+    /// CPU quota in microseconds per period (0 = unlimited)
+    quota: u64 = 0,
+    /// CPU period in microseconds (default 100ms = 100000)
+    period: u64 = 100000,
+    /// CPU weight for scheduling (1-10000, default 100)
+    weight: u32 = 100,
+
+    /// Parse a CPU specification like "2" (cores), "0.5", "200%"
+    pub fn parseSpec(s: []const u8) !CpuLimitConfig {
+        var result = CpuLimitConfig{};
+
+        if (std.mem.endsWith(u8, s, "%")) {
+            const percent_str = s[0 .. s.len - 1];
+            const percent = std.fmt.parseFloat(f64, percent_str) catch
+                return error.InvalidCpuLimit;
+            result.quota = @intFromFloat(percent * 1000);
+            result.period = 100000;
+        } else if (std.mem.indexOf(u8, s, ".")) |_| {
+            const cores = std.fmt.parseFloat(f64, s) catch
+                return error.InvalidCpuLimit;
+            result.quota = @intFromFloat(cores * 100000);
+            result.period = 100000;
+        } else {
+            const value = std.fmt.parseInt(u64, s, 10) catch
+                return error.InvalidCpuLimit;
+            if (value <= 128) {
+                result.quota = value * 100000;
+                result.period = 100000;
+            } else {
+                result.quota = value;
+                result.period = 100000;
+            }
+        }
+
+        return result;
+    }
+};
+
+/// Device I/O limit entry
+pub const DeviceIoLimit = struct {
+    /// Device major number
+    major: u32 = 0,
+    /// Device minor number
+    minor: u32 = 0,
+    /// Read bytes per second limit (0 = unlimited)
+    rbps: u64 = 0,
+    /// Write bytes per second limit (0 = unlimited)
+    wbps: u64 = 0,
+    /// Read I/O operations per second (0 = unlimited)
+    riops: u64 = 0,
+    /// Write I/O operations per second (0 = unlimited)
+    wiops: u64 = 0,
+    /// Is this entry active?
+    active: bool = false,
+};
+
+/// Resource limits for I/O
+pub const IoLimitConfig = struct {
+    /// I/O weight for scheduling (1-10000, default 100)
+    weight: u32 = 100,
+    /// Device-specific limits
+    device_limits: [MAX_IO_DEVICES]DeviceIoLimit = std.mem.zeroes([MAX_IO_DEVICES]DeviceIoLimit),
+    device_count: usize = 0,
+};
+
+/// OOM killer configuration
+pub const OomConfig = struct {
+    /// Disable OOM killer for this cgroup
+    disable_oom_kill: bool = false,
+    /// OOM score adjustment (-1000 to 1000)
+    oom_score_adj: i16 = 0,
+    /// Enable OOM kill for the entire cgroup
+    oom_group: bool = false,
+};
+
+/// Complete resource limits configuration
+pub const ResourceLimits = struct {
+    /// Memory limits
+    memory: MemoryLimitConfig = .{},
+    /// CPU limits
+    cpu: CpuLimitConfig = .{},
+    /// I/O limits
+    io: IoLimitConfig = .{},
+    /// OOM configuration
+    oom: OomConfig = .{},
+
+    /// Are any limits configured?
+    pub fn hasLimits(self: *const ResourceLimits) bool {
+        return self.memory.max > 0 or
+            self.memory.high > 0 or
+            self.cpu.quota > 0 or
+            self.cpu.weight != 100 or
+            self.io.weight != 100 or
+            self.io.device_count > 0 or
+            self.oom.disable_oom_kill or
+            self.oom.oom_score_adj != 0 or
+            self.oom.oom_group;
+    }
+};
+
 /// A UID/GID mapping entry for user namespaces
 /// Maps a range of IDs from parent namespace to child namespace
 pub const IdMapping = struct {
@@ -146,8 +295,8 @@ pub const Namespaces = packed struct {
     uts: bool = true,
     ipc: bool = true,
     network: bool = true, // Network namespace with veth/bridge
-    user: bool = false, // Not implemented yet
-    cgroup: bool = false, // Not implemented yet
+    user: bool = false, // User namespace for rootless containers
+    cgroup: bool = false, // Cgroup namespace for resource isolation
 
     /// Return the combined clone flags for namespace creation.
     pub fn toCloneFlags(self: Namespaces) u64 {
@@ -163,7 +312,7 @@ pub const Namespaces = packed struct {
         return flags;
     }
 
-    /// Default configuration with PID, mount, UTS, and IPC namespaces.
+    /// Default configuration with PID, mount, UTS, IPC, and network namespaces.
     pub const default = Namespaces{};
 
     /// Minimal configuration (mount only, for testing).
@@ -172,6 +321,20 @@ pub const Namespaces = packed struct {
         .mount = true,
         .uts = false,
         .ipc = false,
+        .network = false,
+        .user = false,
+        .cgroup = false,
+    };
+
+    /// Full isolation including cgroup namespace.
+    pub const full = Namespaces{
+        .pid = true,
+        .mount = true,
+        .uts = true,
+        .ipc = true,
+        .network = true,
+        .user = false,
+        .cgroup = true,
     };
 };
 
@@ -262,6 +425,9 @@ pub const Config = struct {
 
     /// Enable rootless mode (user namespace with current user mapped to root)
     rootless: bool = false,
+
+    /// Resource limits (memory, CPU, I/O, OOM)
+    resource_limits: ResourceLimits = .{},
 
     /// Initialize a new configuration with the given rootfs path.
     pub fn init(rootfs: []const u8) !Config {
@@ -399,6 +565,115 @@ pub const Config = struct {
         // The actual UID/GID will be determined at runtime
         self.uid_map_count = 0;
         self.gid_map_count = 0;
+    }
+
+    /// Set memory limit from a spec string like "512m", "1g", "1024k"
+    pub fn setMemoryLimit(self: *Config, spec: []const u8) !void {
+        self.resource_limits.memory.max = try MemoryLimitConfig.parse(spec);
+        // Enable cgroup namespace when resource limits are used
+        if (self.resource_limits.hasLimits()) {
+            self.namespaces.cgroup = true;
+        }
+    }
+
+    /// Set memory high watermark from a spec string
+    pub fn setMemoryHigh(self: *Config, spec: []const u8) !void {
+        self.resource_limits.memory.high = try MemoryLimitConfig.parse(spec);
+        if (self.resource_limits.hasLimits()) {
+            self.namespaces.cgroup = true;
+        }
+    }
+
+    /// Set swap limit from a spec string (or "0" to disable swap)
+    pub fn setSwapLimit(self: *Config, spec: []const u8) !void {
+        if (std.mem.eql(u8, spec, "0") or std.mem.eql(u8, spec, "none")) {
+            self.resource_limits.memory.swap_enabled = false;
+        } else {
+            self.resource_limits.memory.swap_max = try MemoryLimitConfig.parse(spec);
+        }
+    }
+
+    /// Set CPU limit from a spec string like "2", "0.5", "200%"
+    pub fn setCpuLimit(self: *Config, spec: []const u8) !void {
+        self.resource_limits.cpu = try CpuLimitConfig.parseSpec(spec);
+        if (self.resource_limits.hasLimits()) {
+            self.namespaces.cgroup = true;
+        }
+    }
+
+    /// Set CPU quota directly (microseconds per period)
+    pub fn setCpuQuota(self: *Config, quota: u64) void {
+        self.resource_limits.cpu.quota = quota;
+        if (self.resource_limits.hasLimits()) {
+            self.namespaces.cgroup = true;
+        }
+    }
+
+    /// Set CPU period (microseconds)
+    pub fn setCpuPeriod(self: *Config, period: u64) void {
+        self.resource_limits.cpu.period = period;
+    }
+
+    /// Set CPU weight (1-10000)
+    pub fn setCpuWeight(self: *Config, weight: u32) void {
+        self.resource_limits.cpu.weight = weight;
+        if (self.resource_limits.hasLimits()) {
+            self.namespaces.cgroup = true;
+        }
+    }
+
+    /// Set I/O weight (1-10000)
+    pub fn setIoWeight(self: *Config, weight: u32) void {
+        self.resource_limits.io.weight = weight;
+        if (self.resource_limits.hasLimits()) {
+            self.namespaces.cgroup = true;
+        }
+    }
+
+    /// Add a device I/O limit
+    pub fn addDeviceIoLimit(
+        self: *Config,
+        major: u32,
+        minor: u32,
+        rbps: u64,
+        wbps: u64,
+        riops: u64,
+        wiops: u64,
+    ) !void {
+        if (self.resource_limits.io.device_count >= MAX_IO_DEVICES) {
+            return error.TooManyDeviceLimits;
+        }
+        self.resource_limits.io.device_limits[self.resource_limits.io.device_count] = .{
+            .major = major,
+            .minor = minor,
+            .rbps = rbps,
+            .wbps = wbps,
+            .riops = riops,
+            .wiops = wiops,
+            .active = true,
+        };
+        self.resource_limits.io.device_count += 1;
+        self.namespaces.cgroup = true;
+    }
+
+    /// Set OOM score adjustment (-1000 to 1000)
+    pub fn setOomScoreAdj(self: *Config, adj: i16) !void {
+        if (adj < -1000 or adj > 1000) {
+            return error.InvalidOomScoreAdj;
+        }
+        self.resource_limits.oom.oom_score_adj = adj;
+    }
+
+    /// Disable OOM killer for the container
+    pub fn disableOomKiller(self: *Config) void {
+        self.resource_limits.oom.disable_oom_kill = true;
+        self.namespaces.cgroup = true;
+    }
+
+    /// Enable cgroup-level OOM kill (kills all processes in cgroup on OOM)
+    pub fn enableOomGroup(self: *Config) void {
+        self.resource_limits.oom.oom_group = true;
+        self.namespaces.cgroup = true;
     }
 
     /// Get active UID mappings.

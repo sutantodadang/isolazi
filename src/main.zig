@@ -440,10 +440,25 @@ fn parseRunOptions(allocator: std.mem.Allocator, args: []const []const u8) !RunO
                 }
             }
         } else if (arg.len > 0 and arg[0] == '-') {
-            // Skip unknown flags with values
-            if (std.mem.eql(u8, arg, "--hostname") or std.mem.eql(u8, arg, "--cwd")) {
+            // Skip flags with values (these will be passed through to Linux binary)
+            if (std.mem.eql(u8, arg, "--hostname") or
+                std.mem.eql(u8, arg, "--cwd") or
+                std.mem.eql(u8, arg, "-m") or
+                std.mem.eql(u8, arg, "--memory") or
+                std.mem.eql(u8, arg, "--memory-swap") or
+                std.mem.eql(u8, arg, "-c") or
+                std.mem.eql(u8, arg, "--cpus") or
+                std.mem.eql(u8, arg, "--cpu-quota") or
+                std.mem.eql(u8, arg, "--cpu-period") or
+                std.mem.eql(u8, arg, "--cpu-weight") or
+                std.mem.eql(u8, arg, "--cpu-shares") or
+                std.mem.eql(u8, arg, "--io-weight") or
+                std.mem.eql(u8, arg, "--blkio-weight") or
+                std.mem.eql(u8, arg, "--oom-score-adj"))
+            {
                 arg_idx += 1; // Skip the value
             }
+            // Boolean flags (no value to skip): --oom-kill-disable, --chroot
         } else if (!image_found) {
             opts.image_name = arg;
             image_found = true;

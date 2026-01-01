@@ -6,9 +6,10 @@ A minimal container runtime written in Zig, inspired by Docker, Podman, and OCI 
 
 - 🐳 **Docker-like CLI** - Familiar commands: `run`, `pull`, `ps`, `stop`, `rm`
 - 📦 **OCI Image Support** - Pull images from Docker Hub and other registries
-- 🔒 **Process Isolation** - Linux namespaces (PID, mount, UTS, IPC, **network**, **user**)
+- 🔒 **Process Isolation** - Linux namespaces (PID, mount, UTS, IPC, **network**, **user**, **cgroup**)
 - 🌐 **Network Isolation** - veth pairs, bridge networking, NAT, and port forwarding
 - 👤 **Rootless Containers** - User namespace support for unprivileged container execution
+- ⚙️ **Resource Limits** - cgroup v2 support for memory, CPU, and I/O limits
 - 🗂️ **Filesystem Isolation** - Using `pivot_root` or `chroot`
 - 🪟 **Windows Support** - Run containers via WSL2 backend
 - 🍎 **macOS Support** - Run containers via Apple Virtualization framework
@@ -79,6 +80,29 @@ isolazi run --rootless alpine /bin/sh
 
 # Rootless with custom UID/GID mapping
 isolazi run --rootless --uid-map 0:1000:1 --gid-map 0:1000:1 alpine /bin/sh
+
+# With resource limits (cgroup v2)
+isolazi run --memory 512m --cpus 2 alpine /bin/sh
+
+# Memory limits
+isolazi run -m 256m alpine stress --vm 1 --vm-bytes 128M
+
+# CPU limits (quota-based)
+isolazi run --cpus 1.5 alpine /bin/sh          # 1.5 CPU cores
+isolazi run --cpu-quota 50000 alpine /bin/sh   # 50% of one CPU
+
+# CPU weight (relative priority)
+isolazi run --cpu-weight 512 alpine /bin/sh    # Lower priority (default: 100)
+
+# I/O weight
+isolazi run --io-weight 50 alpine dd if=/dev/zero of=/tmp/test bs=1M count=100
+
+# OOM configuration
+isolazi run --oom-score-adj 500 alpine /bin/sh       # More likely to be killed
+isolazi run --oom-kill-disable alpine /bin/sh        # Disable OOM killer
+
+# Combine resource limits
+isolazi run -d -m 1g --cpus 2 --io-weight 100 -p 8080:80 nginx
 ```
 
 ### Container Management
@@ -152,6 +176,17 @@ OPTIONS for 'run':
     --rootless                Run container without root privileges (user namespace)
     --uid-map C:H:S           Map container UID C to host UID H for S IDs
     --gid-map C:H:S           Map container GID C to host GID H for S IDs
+    
+    Resource Limits (cgroup v2):
+    -m, --memory <size>       Memory limit (e.g., 512m, 1g, 1073741824)
+    --memory-swap <size>      Swap limit (memory + swap)
+    -c, --cpus <num>          CPU cores limit (e.g., 2, 0.5, 1.5)
+    --cpu-quota <usec>        CPU quota in microseconds per period
+    --cpu-period <usec>       CPU period (default: 100000)
+    --cpu-weight <1-10000>    CPU weight for scheduling (default: 100)
+    --io-weight <1-10000>     Block I/O weight (default: 100)
+    --oom-score-adj <-1000..1000>  OOM killer score adjustment
+    --oom-kill-disable        Disable OOM killer for this container
 
 OPTIONS for 'ps':
     -a, --all            Show all containers (default: only running)
@@ -190,7 +225,8 @@ isolazi/
 │   ├── linux/            # Linux-specific (namespaces, networking)
 │   │   ├── syscalls.zig  # Low-level Linux syscall wrappers
 │   │   ├── network.zig   # Container networking (veth, bridge, NAT)
-│   │   └── userns.zig    # User namespace for rootless containers
+│   │   ├── userns.zig    # User namespace for rootless containers
+│   │   └── cgroup.zig    # cgroup v2 resource limits
 │   ├── fs/               # Filesystem operations
 │   ├── windows/          # WSL2 backend
 │   └── macos/            # Apple Virtualization backend
@@ -295,9 +331,37 @@ isolazi stores data in `~/.isolazi/`:
 
 - ✅ User namespace support (rootless containers) - **Implemented**
 - ✅ Network namespace isolation - **Implemented**
+- ✅ Cgroup v2 resource limits - **Implemented**
 - Seccomp filters
 - AppArmor/SELinux profiles
-- Proper cgroup limits
+
+### Resource Limits (cgroup v2)
+
+isolazi uses Linux cgroup v2 for resource management:
+
+```bash
+# Memory limit - container is killed if exceeded
+isolazi run --memory 256m alpine stress --vm 1 --vm-bytes 512M
+
+# CPU limit - container gets 1.5 CPU cores max
+isolazi run --cpus 1.5 alpine stress --cpu 4
+
+# Combined limits for production workloads
+isolazi run -d -m 1g --cpus 2 --io-weight 100 nginx
+```
+
+**Cgroup v2 Controllers:**
+| Controller | Options | Description |
+|------------|---------|-------------|
+| memory | `-m`, `--memory-swap` | Hard memory limit, swap limit |
+| cpu | `--cpus`, `--cpu-quota`, `--cpu-period`, `--cpu-weight` | CPU quota and scheduling weight |
+| io | `--io-weight` | Block I/O scheduling priority |
+| oom | `--oom-score-adj`, `--oom-kill-disable` | OOM killer behavior |
+
+**Requirements:**
+- Linux kernel 4.15+ with cgroup v2 (unified hierarchy)
+- cgroup v2 mounted at `/sys/fs/cgroup`
+- Root or delegated cgroup permissions
 
 ### Rootless Containers
 

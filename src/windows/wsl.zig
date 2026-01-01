@@ -15,6 +15,11 @@
 //!     └── wait for exit ◄──────────────────┘
 //! ```
 //!
+//! Resource Limits (cgroup v2):
+//! Resource limit flags (--memory, --cpus, etc.) are passed through to the
+//! Linux isolazi binary running inside WSL2. The Linux binary handles cgroup
+//! setup natively via /sys/fs/cgroup (cgroup v2).
+//!
 //! Requirements:
 //! - WSL2 installed and configured
 //! - A Linux distribution installed in WSL

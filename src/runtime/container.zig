@@ -62,6 +62,7 @@ pub const RuntimeError = error{
     ConfigurationError,
     InvalidRootfs,
     PipeError,
+    CgroupSetupFailed,
 } || linux.SyscallError || fs_mod.FsError;
 
 /// Result of container execution.
@@ -81,6 +82,8 @@ pub const Runtime = struct {
     container_id: []const u8,
     /// Network configuration (populated during run if network namespace enabled)
     network_config: ?linux.ContainerNetwork = null,
+    /// Cgroup manager (populated if resource limits are configured)
+    cgroup_manager: ?*linux.CgroupManager = null,
 
     pub fn init(cfg: *const Config, allocator: std.mem.Allocator, container_id: []const u8) Runtime {
         return Runtime{
@@ -107,11 +110,12 @@ pub const Runtime = struct {
         // These are needed for:
         // 1. User namespace: parent must write uid_map/gid_map after child unshares
         // 2. Network namespace: parent creates veth and moves to child ns
+        // 3. Cgroup: parent creates cgroup and adds child PID
         var child_ready_pipe: [2]std.posix.fd_t = undefined;
         var parent_done_pipe: [2]std.posix.fd_t = undefined;
 
-        // We need pipes if network or user namespace is enabled
-        const needs_sync = cfg.namespaces.network or cfg.namespaces.user;
+        // We need pipes if network, user namespace, or cgroup is enabled
+        const needs_sync = cfg.namespaces.network or cfg.namespaces.user or cfg.resource_limits.hasLimits();
 
         if (needs_sync) {
             child_ready_pipe = std.posix.pipe() catch return RuntimeError.PipeError;
@@ -151,7 +155,7 @@ pub const Runtime = struct {
                 std.posix.close(parent_done_pipe[0]); // Close read end
             }
 
-            // Set up user namespace mappings, network and wait for the container to finish
+            // Set up user namespace mappings, cgroup, network and wait for the container to finish
             return self.parentProcess(
                 pid,
                 if (needs_sync) child_ready_pipe[0] else null,
@@ -174,23 +178,27 @@ pub const Runtime = struct {
         // unshare() creates new namespaces for the current process.
         // Note: For PID namespace, the current process is NOT moved into it;
         // only its children will be. Since we'll exec, this is fine.
+        // Note: Cgroup namespace is entered here but resource limits are applied by parent
         const ns_flags = cfg.namespaces.toCloneFlags();
         try linux.unshare(ns_flags);
 
-        // Step 2: Synchronize with parent for user namespace and/or network setup
-        const needs_sync = cfg.namespaces.network or cfg.namespaces.user;
+        // Step 2: Synchronize with parent for user namespace, cgroup, and/or network setup
+        const needs_sync = cfg.namespaces.network or cfg.namespaces.user or cfg.resource_limits.hasLimits();
 
         if (needs_sync) {
             if (child_ready_write) |fd| {
                 // Signal parent that we've entered the namespaces
-                // Parent will write uid_map/gid_map if user namespace is enabled
+                // Parent will:
+                // - Write uid_map/gid_map if user namespace is enabled
+                // - Set up cgroup and add this process if resource limits are configured
+                // - Set up network if network namespace is enabled
                 const ready_byte: [1]u8 = .{1};
                 _ = std.posix.write(fd, &ready_byte) catch {};
                 std.posix.close(fd);
             }
 
             if (parent_done_read) |fd| {
-                // Wait for parent to complete user namespace mapping and/or network setup
+                // Wait for parent to complete user namespace mapping, cgroup, and/or network setup
                 var done_byte: [1]u8 = undefined;
                 _ = std.posix.read(fd, &done_byte) catch {};
                 std.posix.close(fd);
@@ -258,7 +266,7 @@ pub const Runtime = struct {
         const cfg = self.config;
         var net_config: ?linux.ContainerNetwork = null;
 
-        const needs_sync = cfg.namespaces.network or cfg.namespaces.user;
+        const needs_sync = cfg.namespaces.network or cfg.namespaces.user or cfg.resource_limits.hasLimits();
 
         if (needs_sync) {
             if (child_ready_read) |fd| {
@@ -355,8 +363,26 @@ pub const Runtime = struct {
                 self.network_config = net_config;
             }
 
+            // Step 3: Set up cgroup and apply resource limits if configured
+            if (cfg.resource_limits.hasLimits()) {
+                // Create cgroup and add child process
+                if (linux.isCgroupV2Available()) {
+                    self.cgroup_manager = linux.setupContainerCgroup(
+                        self.allocator,
+                        self.container_id,
+                        &cfg.resource_limits,
+                        child_pid,
+                    ) catch |err| blk: {
+                        std.debug.print("Warning: Cgroup setup failed: {}\n", .{err});
+                        break :blk null;
+                    };
+                } else {
+                    std.debug.print("Warning: Cgroup v2 not available, resource limits will not be applied\n", .{});
+                }
+            }
+
             if (parent_done_write) |fd| {
-                // Signal child that user namespace mapping and network setup are complete
+                // Signal child that user namespace mapping, cgroup, and network setup are complete
                 const done_byte: [1]u8 = .{1};
                 _ = std.posix.write(fd, &done_byte) catch {};
                 std.posix.close(fd);
@@ -366,6 +392,12 @@ pub const Runtime = struct {
         // Wait for the child to exit
         const wait_result = try linux.waitpid(child_pid, 0);
         const status = wait_result.status;
+
+        // Cleanup cgroup resources
+        if (self.cgroup_manager) |cg_mgr| {
+            linux.cleanupContainerCgroup(self.allocator, cg_mgr);
+            self.cgroup_manager = null;
+        }
 
         // Cleanup network resources
         if (net_config) |nc| {
