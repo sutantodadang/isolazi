@@ -39,6 +39,10 @@ pub const CliError = error{
     InvalidEnvVar,
     InvalidVolumeMount,
     InvalidPortMapping,
+    InvalidMemoryLimit,
+    InvalidCpuLimit,
+    InvalidIoLimit,
+    InvalidOomScoreAdj,
 };
 
 /// Maximum number of environment variables
@@ -104,6 +108,17 @@ pub const RunCommand = struct {
     rootless: bool = false, // Enable rootless mode (user namespace)
     uid_maps: []const IdMap = &[_]IdMap{}, // Custom UID mappings
     gid_maps: []const IdMap = &[_]IdMap{}, // Custom GID mappings
+
+    // Resource limits
+    memory_limit: ?[]const u8 = null, // e.g., "512m", "1g"
+    memory_swap: ?[]const u8 = null, // Swap limit
+    cpu_limit: ?[]const u8 = null, // e.g., "2", "0.5", "200%"
+    cpu_quota: ?u64 = null, // CPU quota in microseconds
+    cpu_period: ?u64 = null, // CPU period in microseconds
+    cpu_weight: ?u32 = null, // CPU weight (1-10000)
+    io_weight: ?u32 = null, // I/O weight (1-10000)
+    oom_score_adj: ?i16 = null, // OOM score adjustment (-1000 to 1000)
+    oom_kill_disable: bool = false, // Disable OOM killer
 };
 
 /// Arguments for the 'pull' command
@@ -251,6 +266,51 @@ fn parseRunCommand(args: []const []const u8) CliError!Command {
                 const gid_map = parseIdMap(map_str) orelse return CliError.InvalidArgument;
                 gid_maps_buf[gid_maps_count] = gid_map;
                 gid_maps_count += 1;
+            } else if (std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--memory")) {
+                // Memory limit: --memory 512m
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                run_cmd.memory_limit = args[i];
+            } else if (std.mem.eql(u8, arg, "--memory-swap")) {
+                // Memory swap limit: --memory-swap 1g
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                run_cmd.memory_swap = args[i];
+            } else if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--cpus")) {
+                // CPU limit: --cpus 2
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                run_cmd.cpu_limit = args[i];
+            } else if (std.mem.eql(u8, arg, "--cpu-quota")) {
+                // CPU quota: --cpu-quota 100000
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                run_cmd.cpu_quota = std.fmt.parseInt(u64, args[i], 10) catch return CliError.InvalidCpuLimit;
+            } else if (std.mem.eql(u8, arg, "--cpu-period")) {
+                // CPU period: --cpu-period 100000
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                run_cmd.cpu_period = std.fmt.parseInt(u64, args[i], 10) catch return CliError.InvalidCpuLimit;
+            } else if (std.mem.eql(u8, arg, "--cpu-weight") or std.mem.eql(u8, arg, "--cpu-shares")) {
+                // CPU weight: --cpu-weight 512
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                run_cmd.cpu_weight = std.fmt.parseInt(u32, args[i], 10) catch return CliError.InvalidCpuLimit;
+            } else if (std.mem.eql(u8, arg, "--io-weight") or std.mem.eql(u8, arg, "--blkio-weight")) {
+                // I/O weight: --io-weight 500
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                run_cmd.io_weight = std.fmt.parseInt(u32, args[i], 10) catch return CliError.InvalidIoLimit;
+            } else if (std.mem.eql(u8, arg, "--oom-score-adj")) {
+                // OOM score adjustment: --oom-score-adj -500
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                const adj = std.fmt.parseInt(i16, args[i], 10) catch return CliError.InvalidOomScoreAdj;
+                if (adj < -1000 or adj > 1000) return CliError.InvalidOomScoreAdj;
+                run_cmd.oom_score_adj = adj;
+            } else if (std.mem.eql(u8, arg, "--oom-kill-disable")) {
+                // Disable OOM killer
+                run_cmd.oom_kill_disable = true;
             } else {
                 return CliError.InvalidArgument;
             }
@@ -506,6 +566,43 @@ pub fn buildConfig(run_cmd: *const RunCommand) !Config {
     // Use chroot instead of pivot_root if requested
     cfg.use_pivot_root = !run_cmd.use_chroot;
 
+    // Apply resource limits
+    if (run_cmd.memory_limit) |mem| {
+        cfg.setMemoryLimit(mem) catch return error.PathTooLong; // Reuse error type
+    }
+
+    if (run_cmd.memory_swap) |swap| {
+        cfg.setSwapLimit(swap) catch return error.PathTooLong;
+    }
+
+    if (run_cmd.cpu_limit) |cpu| {
+        cfg.setCpuLimit(cpu) catch return error.PathTooLong;
+    }
+
+    if (run_cmd.cpu_quota) |quota| {
+        cfg.setCpuQuota(quota);
+    }
+
+    if (run_cmd.cpu_period) |period| {
+        cfg.setCpuPeriod(period);
+    }
+
+    if (run_cmd.cpu_weight) |weight| {
+        cfg.setCpuWeight(weight);
+    }
+
+    if (run_cmd.io_weight) |weight| {
+        cfg.setIoWeight(weight);
+    }
+
+    if (run_cmd.oom_score_adj) |adj| {
+        cfg.setOomScoreAdj(adj) catch {};
+    }
+
+    if (run_cmd.oom_kill_disable) {
+        cfg.disableOomKiller();
+    }
+
     return cfg;
 }
 
@@ -542,6 +639,17 @@ pub fn printHelp(writer: anytype) !void {
         \\    --uid-map C:H[:N]         Map container UID C to host UID H (N count, default 1)
         \\    --gid-map C:H[:N]         Map container GID C to host GID H (N count, default 1)
         \\
+        \\RESOURCE LIMITS:
+        \\    -m, --memory <limit>      Memory limit (e.g., 512m, 1g, 2048k)
+        \\    --memory-swap <limit>     Swap limit (0 to disable, default: same as memory)
+        \\    -c, --cpus <num>          Number of CPUs (e.g., 2, 0.5, 1.5)
+        \\    --cpu-quota <usec>        CPU quota per period (microseconds)
+        \\    --cpu-period <usec>       CPU period (default: 100000 = 100ms)
+        \\    --cpu-weight <weight>     CPU weight for scheduling (1-10000, default: 100)
+        \\    --io-weight <weight>      Block I/O weight (1-10000, default: 100)
+        \\    --oom-score-adj <adj>     OOM score adjustment (-1000 to 1000)
+        \\    --oom-kill-disable        Disable OOM killer (use with caution)
+        \\
         \\OPTIONS for 'ps':
         \\    -a, --all            Show all containers (default: only running)
         \\
@@ -562,6 +670,8 @@ pub fn printHelp(writer: anytype) !void {
         \\    isolazi run postgres:16-alpine -d -p 5432:5432 -v /mydata:/var/lib/postgresql -e POSTGRES_PASSWORD=secret
         \\    isolazi run --rootless alpine /bin/sh
         \\    isolazi run --uid-map 0:1000:1 --gid-map 0:1000:1 alpine /bin/sh
+        \\    isolazi run --memory 512m --cpus 2 alpine stress --vm 1 --vm-bytes 256M
+        \\    isolazi run -m 1g --cpu-weight 200 --io-weight 500 alpine /bin/sh
         \\    isolazi create --name myapp alpine
         \\    isolazi start myapp
         \\    isolazi ps -a
@@ -595,6 +705,10 @@ pub fn printError(writer: anytype, err: CliError) !void {
         CliError.InvalidEnvVar => "Invalid environment variable format (use KEY=VALUE)",
         CliError.InvalidVolumeMount => "Invalid volume mount format (use /host/path:/container/path[:ro])",
         CliError.InvalidPortMapping => "Invalid port mapping format (use HOST_PORT:CONTAINER_PORT[/tcp|udp])",
+        CliError.InvalidMemoryLimit => "Invalid memory limit format (use e.g., 512m, 1g, 2048k)",
+        CliError.InvalidCpuLimit => "Invalid CPU limit format (use e.g., 2, 0.5, 200% or microseconds)",
+        CliError.InvalidIoLimit => "Invalid I/O limit format (use weight 1-10000)",
+        CliError.InvalidOomScoreAdj => "Invalid OOM score adjustment (use -1000 to 1000)",
     };
     try writer.print("Error: {s}\n", .{msg});
     try writer.writeAll("Run 'isolazi help' for usage information.\n");

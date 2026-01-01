@@ -55,6 +55,113 @@ pub const VMConfig = struct {
     shared_directories: []const SharedDirectory = &.{},
     /// Network mode
     network_mode: NetworkMode = .nat,
+
+    // Resource limits (maps to cgroup-like behavior in VM)
+    /// Memory limit for the container (0 = use vm memory_size)
+    container_memory_limit: u64 = 0,
+    /// CPU limit as number of cores (0 = use all vm cpu_count)
+    container_cpu_limit: f64 = 0,
+    /// CPU weight (1-10000, default 100)
+    cpu_weight: u32 = 100,
+    /// I/O weight (1-10000, default 100)
+    io_weight: u32 = 100,
+    /// OOM score adjustment (-1000 to 1000)
+    oom_score_adj: i16 = 0,
+
+    /// Create a VMConfig from resource limits
+    pub fn withResourceLimits(memory_limit: u64, cpu_limit: f64) VMConfig {
+        var config = VMConfig{};
+
+        // Set VM memory to container limit (with minimum 256MB overhead for kernel/init)
+        if (memory_limit > 0) {
+            const min_vm_memory = 256 * 1024 * 1024; // 256MB minimum
+            config.memory_size = memory_limit + min_vm_memory;
+            config.container_memory_limit = memory_limit;
+        }
+
+        // Set VM CPU count based on CPU limit (round up to nearest integer)
+        if (cpu_limit > 0) {
+            const cpu_count: u32 = @intFromFloat(@ceil(cpu_limit));
+            config.cpu_count = @max(cpu_count, 1);
+            config.container_cpu_limit = cpu_limit;
+        }
+
+        return config;
+    }
+};
+
+/// Resource limits configuration for macOS (passed to Linux VM)
+/// These are applied using cgroup v2 inside the Lima/vfkit Linux VM.
+pub const ResourceLimitsConfig = struct {
+    /// Memory limit in bytes (0 = unlimited)
+    memory_max: u64 = 0,
+    /// CPU quota in microseconds per period (0 = unlimited)
+    cpu_quota: u64 = 0,
+    /// CPU period in microseconds (default 100ms)
+    cpu_period: u64 = 100000,
+    /// CPU weight (1-10000, default 100)
+    cpu_weight: u32 = 100,
+    /// I/O weight (1-10000, default 100)
+    io_weight: u32 = 100,
+    /// OOM score adjustment (-1000 to 1000)
+    oom_score_adj: i16 = 0,
+    /// Disable OOM killer
+    oom_kill_disable: bool = false,
+
+    /// Check if any limits are configured
+    pub fn hasLimits(self: *const ResourceLimitsConfig) bool {
+        return self.memory_max > 0 or
+            self.cpu_quota > 0 or
+            self.cpu_weight != 100 or
+            self.io_weight != 100 or
+            self.oom_score_adj != 0 or
+            self.oom_kill_disable;
+    }
+
+    /// Build command line arguments for isolazi inside the VM
+    pub fn toCmdArgs(self: *const ResourceLimitsConfig, allocator: std.mem.Allocator) !std.ArrayList([]const u8) {
+        var args: std.ArrayList([]const u8) = .empty;
+
+        if (self.memory_max > 0) {
+            try args.append(allocator, "--memory");
+            const mem_str = try std.fmt.allocPrint(allocator, "{d}", .{self.memory_max});
+            try args.append(allocator, mem_str);
+        }
+
+        if (self.cpu_quota > 0) {
+            try args.append(allocator, "--cpu-quota");
+            const quota_str = try std.fmt.allocPrint(allocator, "{d}", .{self.cpu_quota});
+            try args.append(allocator, quota_str);
+
+            try args.append(allocator, "--cpu-period");
+            const period_str = try std.fmt.allocPrint(allocator, "{d}", .{self.cpu_period});
+            try args.append(allocator, period_str);
+        }
+
+        if (self.cpu_weight != 100) {
+            try args.append(allocator, "--cpu-weight");
+            const weight_str = try std.fmt.allocPrint(allocator, "{d}", .{self.cpu_weight});
+            try args.append(allocator, weight_str);
+        }
+
+        if (self.io_weight != 100) {
+            try args.append(allocator, "--io-weight");
+            const io_str = try std.fmt.allocPrint(allocator, "{d}", .{self.io_weight});
+            try args.append(allocator, io_str);
+        }
+
+        if (self.oom_score_adj != 0) {
+            try args.append(allocator, "--oom-score-adj");
+            const oom_str = try std.fmt.allocPrint(allocator, "{d}", .{self.oom_score_adj});
+            try args.append(allocator, oom_str);
+        }
+
+        if (self.oom_kill_disable) {
+            try args.append(allocator, "--oom-kill-disable");
+        }
+
+        return args;
+    }
 };
 
 /// Shared directory configuration for VirtioFS
@@ -824,6 +931,7 @@ pub fn runWithVfkit(
 
 /// Run using Lima (Linux virtual machines on macOS)
 /// Lima provides a seamless Linux VM experience with automatic file sharing.
+/// Resource limits are applied inside the Linux VM using cgroup v2.
 pub fn runWithLima(
     allocator: std.mem.Allocator,
     _: []const u8, // kernel_path - Lima manages its own kernel
@@ -833,6 +941,21 @@ pub fn runWithLima(
     volumes: []const VolumePair,
     port_mappings: []const PortMapping,
     rootless: bool,
+) !u8 {
+    return runWithLimaEx(allocator, "", rootfs_path, command, env_vars, volumes, port_mappings, rootless, null);
+}
+
+/// Extended Lima runner with resource limits support
+pub fn runWithLimaEx(
+    allocator: std.mem.Allocator,
+    _: []const u8, // kernel_path - Lima manages its own kernel
+    rootfs_path: []const u8,
+    command: []const []const u8,
+    env_vars: []const EnvPair,
+    volumes: []const VolumePair,
+    port_mappings: []const PortMapping,
+    rootless: bool,
+    resource_limits: ?*const ResourceLimitsConfig,
 ) !u8 {
     // First, ensure Lima VM "isolazi" exists and is running
     // Try to start it (will succeed if already running)
@@ -847,7 +970,7 @@ pub fn runWithLima(
         // VM might not exist, try to create it
         _ = try createLimaInstance(allocator);
         // After creating, try to start again
-        return runWithLima(allocator, "", rootfs_path, command, env_vars, volumes, port_mappings, rootless);
+        return runWithLimaEx(allocator, "", rootfs_path, command, env_vars, volumes, port_mappings, rootless, resource_limits);
     };
 
     if (start_result.term.Exited != 0) {

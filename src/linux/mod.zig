@@ -5,6 +5,7 @@
 //! - Namespace management helpers
 //! - Network namespace and container networking (network.zig)
 //! - User namespace for rootless containers (userns.zig)
+//! - Cgroup v2 resource management (cgroup.zig)
 //! - Constants and flags for Linux primitives
 //!
 //! PLATFORM: This module is Linux-only. Windows support requires
@@ -13,6 +14,7 @@
 pub const syscalls = @import("syscalls.zig");
 pub const network = @import("network.zig");
 pub const userns = @import("userns.zig");
+pub const cgroup = @import("cgroup.zig");
 
 // Re-export commonly used items
 pub const CloneFlags = syscalls.CloneFlags;
@@ -51,3 +53,16 @@ pub const canCreateUserNamespace = userns.canCreateUserNamespace;
 pub const isRoot = userns.isRoot;
 pub const getCurrentUid = userns.getCurrentUid;
 pub const getCurrentGid = userns.getCurrentGid;
+
+// Cgroup v2 module exports
+pub const CgroupManager = cgroup.CgroupManager;
+pub const CgroupError = cgroup.CgroupError;
+pub const ResourceLimits = cgroup.ResourceLimits;
+pub const MemoryLimit = cgroup.MemoryLimit;
+pub const CpuLimit = cgroup.CpuLimit;
+pub const IoLimit = cgroup.IoLimit;
+pub const OomConfig = cgroup.OomConfig;
+pub const CpuStats = cgroup.CpuStats;
+pub const isCgroupV2Available = cgroup.isCgroupV2Available;
+pub const setupContainerCgroup = cgroup.setupContainerCgroup;
+pub const cleanupContainerCgroup = cgroup.cleanupContainerCgroup;
