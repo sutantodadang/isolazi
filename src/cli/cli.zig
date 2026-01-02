@@ -89,6 +89,7 @@ pub const Command = union(enum) {
     run: RunCommand,
     pull: PullCommand,
     exec: ExecCommand,
+    logs: LogsCommand,
     images: void,
     version: void,
     help: void,
@@ -153,6 +154,17 @@ pub const ExecCommand = struct {
     user: ?[]const u8 = null, // -u, user to run as
 };
 
+/// Arguments for the 'logs' command
+/// Display container stdout/stderr logs
+pub const LogsCommand = struct {
+    container_id: []const u8,
+    follow: bool = false, // -f, --follow: follow log output
+    timestamps: bool = false, // --timestamps: show timestamps
+    tail: usize = 0, // --tail N: show last N lines (0 = all)
+    stdout_only: bool = false, // --stdout: show only stdout
+    stderr_only: bool = false, // --stderr: show only stderr
+};
+
 /// Parse command-line arguments.
 ///
 /// Expected format:
@@ -198,6 +210,10 @@ pub fn parse(args: []const []const u8) CliError!Command {
         return parseExecCommand(args[2..]);
     }
 
+    if (std.mem.eql(u8, cmd, "logs")) {
+        return parseLogsCommand(args[2..]);
+    }
+
     return CliError.UnknownCommand;
 }
 
@@ -229,7 +245,9 @@ fn parseRunCommand(args: []const []const u8) CliError!Command {
     while (i < args.len) : (i += 1) {
         const arg = args[i];
 
-        if (arg.len > 0 and arg[0] == '-') {
+        // Only check for flags BEFORE the image name (positional_count == 0)
+        // After image name, everything is command arguments (including shell -c args)
+        if (arg.len > 0 and arg[0] == '-' and positional_count == 0) {
             // Option
             if (std.mem.eql(u8, arg, "--hostname")) {
                 i += 1;
@@ -545,6 +563,56 @@ fn parseExecCommand(args: []const []const u8) CliError!Command {
     return Command{ .exec = exec_cmd };
 }
 
+/// Parse the 'logs' subcommand arguments.
+fn parseLogsCommand(args: []const []const u8) CliError!Command {
+    if (args.len < 1) {
+        return CliError.MissingContainerId;
+    }
+
+    var logs_cmd = LogsCommand{
+        .container_id = undefined,
+    };
+
+    var i: usize = 0;
+    var container_found = false;
+
+    // Parse options and positional arguments
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+
+        if (arg.len > 0 and arg[0] == '-') {
+            // Option
+            if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--follow")) {
+                logs_cmd.follow = true;
+            } else if (std.mem.eql(u8, arg, "--timestamps") or std.mem.eql(u8, arg, "-t")) {
+                logs_cmd.timestamps = true;
+            } else if (std.mem.eql(u8, arg, "--tail") or std.mem.eql(u8, arg, "-n")) {
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                logs_cmd.tail = std.fmt.parseInt(usize, args[i], 10) catch return CliError.InvalidArgument;
+            } else if (std.mem.eql(u8, arg, "--stdout")) {
+                logs_cmd.stdout_only = true;
+            } else if (std.mem.eql(u8, arg, "--stderr")) {
+                logs_cmd.stderr_only = true;
+            } else {
+                return CliError.InvalidArgument;
+            }
+        } else {
+            // Positional argument (container ID)
+            if (!container_found) {
+                logs_cmd.container_id = arg;
+                container_found = true;
+            }
+        }
+    }
+
+    if (!container_found) {
+        return CliError.MissingContainerId;
+    }
+
+    return Command{ .logs = logs_cmd };
+}
+
 /// Parse an environment variable string "KEY=VALUE"
 fn parseEnvVar(s: []const u8) ?EnvVar {
     const eq_pos = std.mem.indexOf(u8, s, "=") orelse return null;
@@ -755,6 +823,7 @@ pub fn printHelp(writer: anytype) !void {
         \\COMMANDS:
         \\    run [-d] <image> [command]       Run a command in a new container
         \\    exec <container> <command>       Execute a command in a running container
+        \\    logs [-f] <container>            Display container logs
         \\    create [--name NAME] <image>     Create a container without starting
         \\    start <container>                Start a stopped container
         \\    stop <container>                 Stop a running container
@@ -785,6 +854,13 @@ pub fn printHelp(writer: anytype) !void {
         \\    -e, --env KEY=VALUE       Set environment variable
         \\    -u, --user <user>         Run as specified user (name or UID)
         \\    -w, --workdir <path>      Working directory inside the container
+        \\
+        \\OPTIONS for 'logs':
+        \\    -f, --follow              Follow log output (stream new logs)
+        \\    -n, --tail <N>            Number of lines to show from the end
+        \\    -t, --timestamps          Show timestamps with each line
+        \\    --stdout                  Show only stdout logs
+        \\    --stderr                  Show only stderr logs
         \\
         \\RESOURCE LIMITS:
         \\    -m, --memory <limit>      Memory limit (e.g., 512m, 1g, 2048k)
@@ -841,6 +917,9 @@ pub fn printHelp(writer: anytype) !void {
         \\    isolazi exec mycontainer /bin/sh
         \\    isolazi exec -it mycontainer /bin/bash
         \\    isolazi exec -e MY_VAR=value mycontainer env
+        \\    isolazi logs mycontainer
+        \\    isolazi logs -f mycontainer
+        \\    isolazi logs --tail 100 mycontainer
         \\
     );
 }

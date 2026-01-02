@@ -126,6 +126,9 @@ const runOnWindows = if (builtin.os.tag == .windows) struct {
             if (std.mem.eql(u8, cmd, "prune")) {
                 return pruneWindows(allocator, stdout, stderr);
             }
+            if (std.mem.eql(u8, cmd, "logs")) {
+                return logsContainerWindows(allocator, args, stdout, stderr);
+            }
         }
 
         // Check if WSL is available (only needed for 'run' command)
@@ -470,7 +473,9 @@ fn parseRunOptions(allocator: std.mem.Allocator, args: []const []const u8) !RunO
                     gid_map_count += 1;
                 }
             }
-        } else if (arg.len > 0 and arg[0] == '-') {
+        } else if (arg.len > 0 and arg[0] == '-' and !image_found) {
+            // Only check for flags BEFORE the image name is found
+            // After image name, everything is command arguments (including shell -c args)
             // Skip flags with values (these will be passed through to Linux binary)
             if (std.mem.eql(u8, arg, "--hostname") or
                 std.mem.eql(u8, arg, "--cwd") or
@@ -776,6 +781,47 @@ fn runContainerWindows(
     };
     defer allocator.free(rootfs_path);
 
+    // Create log files in the container directory (parent of rootfs)
+    // rootfs_path is like: ~/.isolazi/containers/<id>/rootfs
+    // We need to create logs in: ~/.isolazi/containers/<id>/
+    const container_dir = std.fs.path.dirname(rootfs_path) orelse rootfs_path;
+    const stdout_log_path = try std.fmt.allocPrint(allocator, "{s}/stdout.log", .{container_dir});
+    defer allocator.free(stdout_log_path);
+    const stderr_log_path = try std.fmt.allocPrint(allocator, "{s}/stderr.log", .{container_dir});
+    defer allocator.free(stderr_log_path);
+
+    // Create empty log files
+    {
+        const stdout_file = std.fs.cwd().createFile(stdout_log_path, .{}) catch |err| {
+            try stderr.print("Warning: Failed to create stdout.log: {}\n", .{err});
+            try stderr.flush();
+            return 1;
+        };
+        stdout_file.close();
+
+        const stderr_file = std.fs.cwd().createFile(stderr_log_path, .{}) catch |err| {
+            try stderr.print("Warning: Failed to create stderr.log: {}\n", .{err});
+            try stderr.flush();
+            return 1;
+        };
+        stderr_file.close();
+    }
+
+    // Convert log paths to WSL paths
+    const wsl_stdout_log = windows.windowsToWslPath(allocator, stdout_log_path) catch |err| {
+        try stderr.print("Error: Failed to convert stdout log path: {}\n", .{err});
+        try stderr.flush();
+        return 1;
+    };
+    defer allocator.free(wsl_stdout_log);
+
+    const wsl_stderr_log = windows.windowsToWslPath(allocator, stderr_log_path) catch |err| {
+        try stderr.print("Error: Failed to convert stderr log path: {}\n", .{err});
+        try stderr.flush();
+        return 1;
+    };
+    defer allocator.free(wsl_stderr_log);
+
     // Convert Windows path to WSL path
     const wsl_rootfs = windows.windowsToWslPath(allocator, rootfs_path) catch |err| {
         try stderr.print("Error: Failed to convert path: {}\n", .{err});
@@ -927,7 +973,8 @@ fn runContainerWindows(
 
     // Add chroot command with env vars
     // Use env -i to clear inherited environment and set fresh vars
-    try script_buf.appendSlice(allocator, "exec chroot ");
+    // Note: Don't use 'exec' to allow shell redirection to work properly for log capture
+    try script_buf.appendSlice(allocator, "chroot ");
     try script_buf.appendSlice(allocator, wsl_rootfs);
     try script_buf.appendSlice(allocator, " /usr/bin/env -i ");
 
@@ -977,15 +1024,61 @@ fn runContainerWindows(
         try script_buf.append(allocator, ' ');
     }
 
-    // Run the command
-    for (cmd_args.items) |arg| {
-        try script_buf.appendSlice(allocator, arg);
-        try script_buf.append(allocator, ' ');
+    // Run the command with log capture
+    // Wrap command with output redirection to capture logs
+    // In detach mode: redirect to log files only
+    // In interactive mode: use tee to capture to log files while showing on console
+
+    // Helper function to quote argument if it contains spaces or special chars
+    const quoteArg = struct {
+        fn quote(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, arg: []const u8) !void {
+            const needs_quoting = for (arg) |c| {
+                if (c == ' ' or c == '\t' or c == '"' or c == '\'' or c == '$' or c == '`' or c == '\\' or c == '!' or c == '*' or c == '?' or c == '[' or c == ']' or c == '(' or c == ')' or c == '{' or c == '}' or c == '<' or c == '>' or c == '|' or c == '&' or c == ';' or c == '\n') break true;
+            } else false;
+
+            if (needs_quoting) {
+                try buf.append(alloc, '\'');
+                for (arg) |c| {
+                    if (c == '\'') {
+                        // Escape single quote: ' -> '\''
+                        try buf.appendSlice(alloc, "'\\''");
+                    } else {
+                        try buf.append(alloc, c);
+                    }
+                }
+                try buf.append(alloc, '\'');
+            } else {
+                try buf.appendSlice(alloc, arg);
+            }
+            try buf.append(alloc, ' ');
+        }
+    }.quote;
+
+    if (opts.detach_mode) {
+        // Detach mode: just add command and redirections
+        // The redirection happens at the outer shell level
+        for (cmd_args.items) |arg| {
+            try quoteArg(&script_buf, allocator, arg);
+        }
+        // Note: These redirections apply to the chroot command output
+    } else {
+        // Interactive mode: use tee to capture stdout while showing on console
+        // stderr goes to both console and stderr.log via tee
+        // Format: cmd 2>&1 | tee stdout.log
+        for (cmd_args.items) |arg| {
+            try quoteArg(&script_buf, allocator, arg);
+        }
+        try script_buf.appendSlice(allocator, "2>&1 | tee ");
+        try script_buf.appendSlice(allocator, wsl_stdout_log);
     }
 
-    // For detach mode, redirect output inside the script
+    // For detach mode, add redirections at the end of the entire script
     if (opts.detach_mode) {
-        try script_buf.appendSlice(allocator, ">/dev/null 2>&1");
+        // Close the script with redirections
+        try script_buf.appendSlice(allocator, " >> ");
+        try script_buf.appendSlice(allocator, wsl_stdout_log);
+        try script_buf.appendSlice(allocator, " 2>> ");
+        try script_buf.appendSlice(allocator, wsl_stderr_log);
     }
 
     try wsl_cmd.append(allocator, script_buf.items);
@@ -1655,6 +1748,125 @@ fn pruneWindows(
     return 0;
 }
 
+/// Display container logs on Windows
+fn logsContainerWindows(
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+    stdout: anytype,
+    stderr: anytype,
+) !u8 {
+    // Parse logs options
+    if (args.len < 3) {
+        try stderr.writeAll("Error: Missing container ID\n");
+        try stderr.writeAll("Usage: isolazi logs [options] <container>\n");
+        try stderr.writeAll("\nOptions:\n");
+        try stderr.writeAll("  -f, --follow         Follow log output (stream new logs)\n");
+        try stderr.writeAll("  -n, --tail <N>       Number of lines to show from the end\n");
+        try stderr.writeAll("  -t, --timestamps     Show timestamps with each line\n");
+        try stderr.writeAll("  --stdout             Show only stdout logs\n");
+        try stderr.writeAll("  --stderr             Show only stderr logs\n");
+        try stderr.flush();
+        return 1;
+    }
+
+    // Parse arguments
+    var container_id: ?[]const u8 = null;
+    var follow = false;
+    var timestamps = false;
+    var tail: usize = 0;
+    var stdout_only = false;
+    var stderr_only = false;
+
+    var arg_idx: usize = 2; // Skip "isolazi" and "logs"
+    while (arg_idx < args.len) : (arg_idx += 1) {
+        const arg = args[arg_idx];
+
+        if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--follow")) {
+            follow = true;
+        } else if (std.mem.eql(u8, arg, "-t") or std.mem.eql(u8, arg, "--timestamps")) {
+            timestamps = true;
+        } else if (std.mem.eql(u8, arg, "-n") or std.mem.eql(u8, arg, "--tail")) {
+            arg_idx += 1;
+            if (arg_idx >= args.len) {
+                try stderr.writeAll("Error: --tail requires a number\n");
+                try stderr.flush();
+                return 1;
+            }
+            tail = std.fmt.parseInt(usize, args[arg_idx], 10) catch {
+                try stderr.writeAll("Error: Invalid tail value\n");
+                try stderr.flush();
+                return 1;
+            };
+        } else if (std.mem.eql(u8, arg, "--stdout")) {
+            stdout_only = true;
+        } else if (std.mem.eql(u8, arg, "--stderr")) {
+            stderr_only = true;
+        } else if (arg.len > 0 and arg[0] != '-') {
+            if (container_id == null) {
+                container_id = arg;
+            }
+        }
+    }
+
+    if (container_id == null) {
+        try stderr.writeAll("Error: Missing container ID\n");
+        try stderr.flush();
+        return 1;
+    }
+
+    // Find container
+    var manager = isolazi.container.ContainerManager.init(allocator) catch |err| {
+        try stderr.print("Error: Failed to initialize container manager: {}\n", .{err});
+        try stderr.flush();
+        return 1;
+    };
+    defer manager.deinit();
+
+    const full_id = manager.findContainer(container_id.?) catch {
+        try stderr.print("Error: No such container: {s}\n", .{container_id.?});
+        try stderr.flush();
+        return 1;
+    };
+    defer allocator.free(full_id);
+
+    // Initialize container logs
+    var logs = isolazi.container.ContainerLogs.init(allocator, full_id) catch |err| {
+        try stderr.print("Error: Failed to initialize logs: {}\n", .{err});
+        try stderr.flush();
+        return 1;
+    };
+    defer logs.deinit();
+
+    // Determine which stream to show
+    const stream: isolazi.container.LogStream = if (stdout_only and !stderr_only)
+        .stdout
+    else if (stderr_only and !stdout_only)
+        .stderr
+    else
+        .both;
+
+    // Stream logs to stdout
+    const options = isolazi.container.LogOptions{
+        .follow = follow,
+        .timestamps = timestamps,
+        .tail = tail,
+        .stream = stream,
+        .poll_interval_ms = 100,
+    };
+
+    logs.streamLogs(stdout, options) catch |err| {
+        // In follow mode, this will block until interrupted
+        if (err != error.BrokenPipe) {
+            try stderr.print("Error reading logs: {}\n", .{err});
+            try stderr.flush();
+            return 1;
+        }
+    };
+
+    try stdout.flush();
+    return 0;
+}
+
 /// Execute a command in a running container on Windows via WSL nsenter
 fn execContainerWindows(
     allocator: std.mem.Allocator,
@@ -2013,6 +2225,9 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
             }
             if (std.mem.eql(u8, cmd, "exec")) {
                 return execContainerMacOS(allocator, args, stdout, stderr);
+            }
+            if (std.mem.eql(u8, cmd, "logs")) {
+                return logsContainerMacOS(allocator, args, stdout, stderr);
             }
             if (std.mem.eql(u8, cmd, "vm")) {
                 return vmCommandMacOS(allocator, args, stdout, stderr);
@@ -2901,6 +3116,125 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
         return 0;
     }
 
+    /// Display container logs on macOS
+    fn logsContainerMacOS(
+        allocator: std.mem.Allocator,
+        args: []const []const u8,
+        stdout: anytype,
+        stderr: anytype,
+    ) !u8 {
+        // Parse logs options
+        if (args.len < 3) {
+            try stderr.writeAll("Error: Missing container ID\n");
+            try stderr.writeAll("Usage: isolazi logs [options] <container>\n");
+            try stderr.writeAll("\nOptions:\n");
+            try stderr.writeAll("  -f, --follow         Follow log output (stream new logs)\n");
+            try stderr.writeAll("  -n, --tail <N>       Number of lines to show from the end\n");
+            try stderr.writeAll("  -t, --timestamps     Show timestamps with each line\n");
+            try stderr.writeAll("  --stdout             Show only stdout logs\n");
+            try stderr.writeAll("  --stderr             Show only stderr logs\n");
+            try stderr.flush();
+            return 1;
+        }
+
+        // Parse arguments
+        var container_id: ?[]const u8 = null;
+        var follow = false;
+        var timestamps = false;
+        var tail: usize = 0;
+        var stdout_only = false;
+        var stderr_only = false;
+
+        var arg_idx: usize = 2; // Skip "isolazi" and "logs"
+        while (arg_idx < args.len) : (arg_idx += 1) {
+            const arg = args[arg_idx];
+
+            if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--follow")) {
+                follow = true;
+            } else if (std.mem.eql(u8, arg, "-t") or std.mem.eql(u8, arg, "--timestamps")) {
+                timestamps = true;
+            } else if (std.mem.eql(u8, arg, "-n") or std.mem.eql(u8, arg, "--tail")) {
+                arg_idx += 1;
+                if (arg_idx >= args.len) {
+                    try stderr.writeAll("Error: --tail requires a number\n");
+                    try stderr.flush();
+                    return 1;
+                }
+                tail = std.fmt.parseInt(usize, args[arg_idx], 10) catch {
+                    try stderr.writeAll("Error: Invalid tail value\n");
+                    try stderr.flush();
+                    return 1;
+                };
+            } else if (std.mem.eql(u8, arg, "--stdout")) {
+                stdout_only = true;
+            } else if (std.mem.eql(u8, arg, "--stderr")) {
+                stderr_only = true;
+            } else if (arg.len > 0 and arg[0] != '-') {
+                if (container_id == null) {
+                    container_id = arg;
+                }
+            }
+        }
+
+        if (container_id == null) {
+            try stderr.writeAll("Error: Missing container ID\n");
+            try stderr.flush();
+            return 1;
+        }
+
+        // Find container
+        var manager = isolazi.container.ContainerManager.init(allocator) catch |err| {
+            try stderr.print("Error: Failed to initialize container manager: {}\n", .{err});
+            try stderr.flush();
+            return 1;
+        };
+        defer manager.deinit();
+
+        const full_id = manager.findContainer(container_id.?) catch {
+            try stderr.print("Error: No such container: {s}\n", .{container_id.?});
+            try stderr.flush();
+            return 1;
+        };
+        defer allocator.free(full_id);
+
+        // Initialize container logs
+        var logs = isolazi.container.ContainerLogs.init(allocator, full_id) catch |err| {
+            try stderr.print("Error: Failed to initialize logs: {}\n", .{err});
+            try stderr.flush();
+            return 1;
+        };
+        defer logs.deinit();
+
+        // Determine which stream to show
+        const stream: isolazi.container.LogStream = if (stdout_only and !stderr_only)
+            .stdout
+        else if (stderr_only and !stdout_only)
+            .stderr
+        else
+            .both;
+
+        // Stream logs to stdout
+        const options = isolazi.container.LogOptions{
+            .follow = follow,
+            .timestamps = timestamps,
+            .tail = tail,
+            .stream = stream,
+            .poll_interval_ms = 100,
+        };
+
+        logs.streamLogs(stdout, options) catch |err| {
+            // In follow mode, this will block until interrupted
+            if (err != error.BrokenPipe) {
+                try stderr.print("Error reading logs: {}\n", .{err});
+                try stderr.flush();
+                return 1;
+            }
+        };
+
+        try stdout.flush();
+        return 0;
+    }
+
     /// Execute a command in a running container on macOS via Lima/vfkit
     fn execContainerMacOS(
         allocator: std.mem.Allocator,
@@ -3284,6 +3618,9 @@ const runOnLinux = if (builtin.os.tag == .linux) struct {
             },
             .exec => |exec_cmd| {
                 return execContainerLinuxImpl(allocator, exec_cmd, stdout, stderr);
+            },
+            .logs => |logs_cmd| {
+                return logsContainerLinuxImpl(allocator, logs_cmd, stdout, stderr);
             },
         }
     }
@@ -3688,6 +4025,66 @@ const runOnLinux = if (builtin.os.tag == .linux) struct {
         }
 
         return result.exit_code;
+    }
+
+    /// Display container logs on Linux
+    fn logsContainerLinuxImpl(
+        allocator: std.mem.Allocator,
+        logs_cmd: isolazi.cli.LogsCommand,
+        stdout: anytype,
+        stderr: anytype,
+    ) !u8 {
+        // Find container
+        var manager = isolazi.container.ContainerManager.init(allocator) catch |err| {
+            try stderr.print("Error: Failed to initialize container manager: {}\n", .{err});
+            try stderr.flush();
+            return 1;
+        };
+        defer manager.deinit();
+
+        const full_id = manager.findContainer(logs_cmd.container_id) catch {
+            try stderr.print("Error: No such container: {s}\n", .{logs_cmd.container_id});
+            try stderr.flush();
+            return 1;
+        };
+        defer allocator.free(full_id);
+
+        // Initialize container logs
+        var logs = isolazi.container.ContainerLogs.init(allocator, full_id) catch |err| {
+            try stderr.print("Error: Failed to initialize logs: {}\n", .{err});
+            try stderr.flush();
+            return 1;
+        };
+        defer logs.deinit();
+
+        // Determine which stream to show
+        const stream: isolazi.container.LogStream = if (logs_cmd.stdout_only and !logs_cmd.stderr_only)
+            .stdout
+        else if (logs_cmd.stderr_only and !logs_cmd.stdout_only)
+            .stderr
+        else
+            .both;
+
+        // Stream logs to stdout
+        const options = isolazi.container.LogOptions{
+            .follow = logs_cmd.follow,
+            .timestamps = logs_cmd.timestamps,
+            .tail = logs_cmd.tail,
+            .stream = stream,
+            .poll_interval_ms = 100,
+        };
+
+        logs.streamLogs(stdout, options) catch |err| {
+            // In follow mode, this will block until interrupted
+            if (err != error.BrokenPipe) {
+                try stderr.print("Error reading logs: {}\n", .{err});
+                try stderr.flush();
+                return 1;
+            }
+        };
+
+        try stdout.flush();
+        return 0;
     }
 }.call else struct {
     fn call(
