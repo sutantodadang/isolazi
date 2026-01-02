@@ -150,6 +150,31 @@ isolazi inspect myapp
 isolazi prune
 ```
 
+### Container Logs
+
+```bash
+# View container logs (stdout and stderr)
+isolazi logs <container_id>
+
+# Follow log output (like tail -f)
+isolazi logs -f <container_id>
+
+# Show last N lines
+isolazi logs --tail 100 <container_id>
+isolazi logs -n 50 <container_id>
+
+# Show timestamps
+isolazi logs -t <container_id>
+isolazi logs --timestamps <container_id>
+
+# Show only stdout or stderr
+isolazi logs --stdout <container_id>
+isolazi logs --stderr <container_id>
+
+# Combine options
+isolazi logs -f --tail 20 -t <container_id>
+```
+
 ### Execute Commands in Running Containers
 
 ```bash
@@ -191,6 +216,7 @@ isolazi <COMMAND> [OPTIONS]
 COMMANDS:
     run [-d] <image> [command]       Run a command in a new container
     exec [OPTIONS] <container> <cmd> Execute a command in a running container
+    logs [-f] <container>            Display container logs
     create [--name NAME] <image>     Create a container without starting
     start <container>                Start a stopped container
     stop <container>                 Stop a running container
@@ -236,6 +262,13 @@ OPTIONS for 'exec':
     -e, --env KEY=VALUE       Set environment variable
     -u, --user <user>         Run command as specified user
     -w, --workdir <path>      Working directory inside the container
+
+OPTIONS for 'logs':
+    -f, --follow              Follow log output (stream new logs)
+    -n, --tail <N>            Show last N lines
+    -t, --timestamps          Show timestamps with each line
+    --stdout                  Show only stdout logs
+    --stderr                  Show only stderr logs
 
 OPTIONS for 'ps':
     -a, --all            Show all containers (default: only running)

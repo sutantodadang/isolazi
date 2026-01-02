@@ -9,6 +9,7 @@ pub const Command = cli.Command;
 pub const RunCommand = cli.RunCommand;
 pub const PullCommand = cli.PullCommand;
 pub const ExecCommand = cli.ExecCommand;
+pub const LogsCommand = cli.LogsCommand;
 pub const CliError = cli.CliError;
 
 pub const parse = cli.parse;
