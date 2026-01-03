@@ -362,6 +362,15 @@ const RunOptions = struct {
         minimal,
         strict,
     };
+
+    pub fn deinit(self: RunOptions, allocator: std.mem.Allocator) void {
+        if (self.env_vars.len > 0) allocator.free(self.env_vars);
+        if (self.volumes.len > 0) allocator.free(self.volumes);
+        if (self.ports.len > 0) allocator.free(self.ports);
+        if (self.uid_maps.len > 0) allocator.free(self.uid_maps);
+        if (self.gid_maps.len > 0) allocator.free(self.gid_maps);
+        if (self.command_args.len > 0) allocator.free(self.command_args);
+    }
 };
 
 /// Parse run command arguments (shared by all platforms)
@@ -646,12 +655,7 @@ fn runContainerWindows(
         try stderr.flush();
         return 1;
     };
-    defer {
-        if (opts.env_vars.len > 0) allocator.free(opts.env_vars);
-        if (opts.volumes.len > 0) allocator.free(opts.volumes);
-        if (opts.ports.len > 0) allocator.free(opts.ports);
-        if (opts.command_args.len > 0) allocator.free(opts.command_args);
-    }
+    defer opts.deinit(allocator);
 
     // Check if we have an image argument
     if (opts.image_name.len == 0) {
@@ -844,6 +848,9 @@ fn runContainerWindows(
         if (std.mem.indexOf(u8, image_name, "postgres") != null) {
             try cmd_args.append(allocator, "docker-entrypoint.sh");
             try cmd_args.append(allocator, "postgres");
+        } else if (std.mem.indexOf(u8, image_name, "rabbitmq") != null) {
+            try cmd_args.append(allocator, "docker-entrypoint.sh");
+            try cmd_args.append(allocator, "rabbitmq-server");
         } else {
             // Default command
             try cmd_args.append(allocator, "/bin/sh");
@@ -953,20 +960,27 @@ fn runContainerWindows(
     // Set up port forwarding using iptables in WSL2
     // This forwards from WSL2's network namespace to the container
     for (opts.ports) |port| {
-        // Enable IP forwarding and set up DNAT rule
-        try script_buf.appendSlice(allocator, "iptables -t nat -A PREROUTING -p ");
-        if (port.protocol == .udp) {
-            try script_buf.appendSlice(allocator, "udp");
-        } else {
-            try script_buf.appendSlice(allocator, "tcp");
-        }
-        try script_buf.appendSlice(allocator, " --dport ");
+        const proto_str = if (port.protocol == .udp) "udp" else "tcp";
         var host_port_buf: [8]u8 = undefined;
         const host_port_str = std.fmt.bufPrint(&host_port_buf, "{d}", .{port.host_port}) catch "0";
-        try script_buf.appendSlice(allocator, host_port_str);
-        try script_buf.appendSlice(allocator, " -j REDIRECT --to-port ");
         var cont_port_buf: [8]u8 = undefined;
         const cont_port_str = std.fmt.bufPrint(&cont_port_buf, "{d}", .{port.container_port}) catch "0";
+
+        // PREROUTING rule for incoming traffic
+        try script_buf.appendSlice(allocator, "iptables -t nat -A PREROUTING -p ");
+        try script_buf.appendSlice(allocator, proto_str);
+        try script_buf.appendSlice(allocator, " --dport ");
+        try script_buf.appendSlice(allocator, host_port_str);
+        try script_buf.appendSlice(allocator, " -j REDIRECT --to-port ");
+        try script_buf.appendSlice(allocator, cont_port_str);
+        try script_buf.appendSlice(allocator, " 2>/dev/null; ");
+
+        // OUTPUT rule for localhost traffic (important for Windows localhost access)
+        try script_buf.appendSlice(allocator, "iptables -t nat -A OUTPUT -p ");
+        try script_buf.appendSlice(allocator, proto_str);
+        try script_buf.appendSlice(allocator, " --dport ");
+        try script_buf.appendSlice(allocator, host_port_str);
+        try script_buf.appendSlice(allocator, " -j REDIRECT --to-port ");
         try script_buf.appendSlice(allocator, cont_port_str);
         try script_buf.appendSlice(allocator, " 2>/dev/null; ");
     }
@@ -979,10 +993,13 @@ fn runContainerWindows(
     try script_buf.appendSlice(allocator, " /usr/bin/env -i ");
 
     // Set minimal required environment
-    try script_buf.appendSlice(allocator, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ");
+    try script_buf.appendSlice(allocator, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/lib/postgresql/17/bin:/usr/lib/postgresql/16/bin:/usr/lib/postgresql/15/bin:/opt/rabbitmq/sbin:/usr/lib/rabbitmq/bin:/opt/erlang/bin ");
     try script_buf.appendSlice(allocator, "HOME=/root ");
     try script_buf.appendSlice(allocator, "TERM=xterm ");
     try script_buf.appendSlice(allocator, "LANG=C.UTF-8 ");
+    try script_buf.appendSlice(allocator, "ISOLAZI_ID=");
+    try script_buf.appendSlice(allocator, container_id[0..]);
+    try script_buf.appendSlice(allocator, " ");
 
     // For postgres, auto-set PGDATA if not provided
     var has_pgdata = false;
@@ -2359,23 +2376,11 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
         stdout: anytype,
         stderr: anytype,
     ) !u8 {
-        // Check if virtualization is available
-        if (!isolazi.macos.isVirtualizationAvailable(allocator)) {
-            try stderr.writeAll("Error: Apple Virtualization is not available.\n");
-            try stderr.writeAll("\nRequirements:\n");
-            try stderr.writeAll("  - macOS 12.0 (Monterey) or later\n");
-            try stderr.writeAll("  - Virtualization-capable hardware\n");
-            try stderr.flush();
-            return 1;
-        }
-
-        // Check for hypervisor backend
-        const hypervisor = isolazi.macos.virtualization.findHypervisor(allocator);
-        if (hypervisor == null) {
-            try stderr.writeAll("Error: No hypervisor backend found.\n");
-            try stderr.writeAll("\nInstall one of the following:\n");
-            try stderr.writeAll("  - vfkit (recommended): brew install vfkit\n");
-            try stderr.writeAll("  - Lima: brew install lima\n");
+        // Check if Lima is installed
+        if (!isolazi.macos.virtualization.isLimaInstalled(allocator)) {
+            try stderr.writeAll("Error: Lima is not installed.\n");
+            try stderr.writeAll("\nPlease install Lima to run containers on macOS:\n");
+            try stderr.writeAll("  brew install lima\n");
             try stderr.flush();
             return 1;
         }
@@ -2386,6 +2391,7 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
             try stderr.flush();
             return 1;
         };
+        defer opts.deinit(allocator);
 
         if (opts.image_name.len == 0) {
             try stderr.writeAll("Error: Missing image name\n");
@@ -2517,6 +2523,7 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
         defer cmd_args.deinit(allocator);
 
         const is_postgres = std.mem.indexOf(u8, opts.image_name, "postgres") != null;
+        const is_rabbitmq = std.mem.indexOf(u8, opts.image_name, "rabbitmq") != null;
 
         if (opts.command_args.len > 0) {
             for (opts.command_args) |arg| {
@@ -2536,6 +2543,12 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
             const entry = "docker-entrypoint.sh postgres";
             @memcpy(cmd_display[0..entry.len], entry);
             cmd_display_len = entry.len;
+        } else if (is_rabbitmq) {
+            try cmd_args.append(allocator, "docker-entrypoint.sh");
+            try cmd_args.append(allocator, "rabbitmq-server");
+            const entry = "docker-entrypoint.sh rabbitmq-server";
+            @memcpy(cmd_display[0..entry.len], entry);
+            cmd_display_len = entry.len;
         } else {
             try cmd_args.append(allocator, "/bin/sh");
             const sh = "/bin/sh";
@@ -2550,7 +2563,7 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
             try stdout.print("{s}\n", .{container_id});
             try stdout.flush();
         } else {
-            try stdout.print("Starting container with {s}...\n", .{hypervisor.?});
+            try stdout.print("Starting container...\n", .{});
             try stdout.flush();
         }
 
@@ -2610,81 +2623,56 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
             try stdout.flush();
         }
 
-        // Ensure VM assets are available (only needed for vfkit)
-        const VMAssets = struct {
-            kernel_path: []const u8,
-            initramfs_path: ?[]const u8,
-        };
-        var vm_assets: ?VMAssets = null;
-
-        if (std.mem.eql(u8, hypervisor.?, "vfkit")) {
-            const assets = isolazi.macos.virtualization.ensureVMAssets(allocator) catch {
-                try stderr.writeAll("Error: Linux VM kernel not found.\n");
-                try stderr.writeAll("\nTo setup the VM environment:\n");
-                try stderr.writeAll("  1. Download Linux kernel and initramfs for ARM64:\n");
-                try stderr.writeAll("     - https://github.com/gokrazy/kernel.arm64/releases\n");
-                try stderr.writeAll("  2. Place files at:\n");
-                try stderr.writeAll("     ~/Library/Application Support/isolazi/vm/vmlinuz\n");
-                try stderr.writeAll("     ~/Library/Application Support/isolazi/vm/initramfs\n");
-                try stderr.writeAll("\nAlternatively, use Lima as the backend (brew install lima).\n");
-                try stderr.flush();
-                return 1;
-            };
-            vm_assets = VMAssets{
-                .kernel_path = assets.kernel_path,
-                .initramfs_path = assets.initramfs_path,
-            };
-        }
-        defer {
-            if (vm_assets) |assets| {
-                allocator.free(assets.kernel_path);
-                if (assets.initramfs_path) |p| allocator.free(p);
-            }
-        }
-
         // Run in VM using appropriate hypervisor
         // Update state to running
         manager.updateState(&container_id, .running, null, null) catch {};
 
         var exit_code: u8 = 0;
-        if (std.mem.eql(u8, hypervisor.?, "vfkit")) {
-            exit_code = isolazi.macos.virtualization.runWithVfkit(
-                allocator,
-                vm_assets.?.kernel_path,
-                vm_assets.?.initramfs_path,
-                rootfs_path,
-                cmd_args.items,
-                env_pairs.items,
-                vol_pairs.items,
-                port_pairs.items,
-                opts.rootless,
-            ) catch |err| {
-                manager.updateState(&container_id, .stopped, null, 1) catch {};
-                try stderr.print("Error: Failed to run in VM: {}\n", .{err});
-                try stderr.flush();
-                return 1;
-            };
-        } else {
-            // Use Lima
-            exit_code = isolazi.macos.virtualization.runWithLima(
-                allocator,
-                "", // Lima manages its own kernel
-                rootfs_path,
-                cmd_args.items,
-                env_pairs.items,
-                vol_pairs.items,
-                port_pairs.items,
-                opts.rootless,
-            ) catch |err| {
-                manager.updateState(&container_id, .stopped, null, 1) catch {};
-                try stderr.print("Error: Failed to run with Lima: {}\n", .{err});
-                try stderr.flush();
-                return 1;
-            };
+        try stdout.print("Running in Lima VM...\n", .{});
+        try stdout.flush();
+
+        // Setup logging for detach mode
+        var stdout_path: ?[]const u8 = null;
+        var stderr_path: ?[]const u8 = null;
+        if (opts.detach_mode) {
+            const logs = try isolazi.container.logs.createLogFiles(allocator, &container_id);
+            stdout_path = logs.stdout_path;
+            stderr_path = logs.stderr_path;
+        }
+        defer {
+            if (stdout_path) |p| allocator.free(p);
+            if (stderr_path) |p| allocator.free(p);
         }
 
-        // Update state to stopped after container exits
-        manager.updateState(&container_id, .stopped, null, exit_code) catch {};
+        // Use Lima
+        const result = isolazi.macos.virtualization.runWithLima(
+            allocator,
+            "", // Lima manages its own kernel
+            rootfs_path,
+            cmd_args.items,
+            env_pairs.items,
+            vol_pairs.items,
+            port_pairs.items,
+            opts.rootless,
+            opts.detach_mode,
+            stdout_path,
+            stderr_path,
+        ) catch |err| {
+            manager.updateState(&container_id, .stopped, null, 1) catch {};
+            try stderr.print("Error: Failed to run with Lima: {}\n", .{err});
+            try stderr.flush();
+            return 1;
+        };
+
+        exit_code = result.exit_code;
+
+        // Update state to stopped after container exits, unless detached
+        if (!opts.detach_mode) {
+            manager.updateState(&container_id, .stopped, null, exit_code) catch {};
+        } else if (result.pid) |pid| {
+            // If detached, update PID in state so we can track it
+            manager.updateState(&container_id, .running, @intCast(pid), null) catch {};
+        }
         return exit_code;
     }
 
@@ -3260,12 +3248,11 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
         }
 
         // Check for hypervisor backend
-        const hypervisor = isolazi.macos.virtualization.findHypervisor(allocator);
-        if (hypervisor == null) {
-            try stderr.writeAll("Error: No hypervisor backend found.\n");
-            try stderr.writeAll("\nInstall one of the following:\n");
-            try stderr.writeAll("  - Lima (recommended): brew install lima\n");
-            try stderr.writeAll("  - vfkit: brew install vfkit\n");
+        // Check if Lima is installed
+        if (!isolazi.macos.virtualization.isLimaInstalled(allocator)) {
+            try stderr.writeAll("Error: Lima is not installed.\n");
+            try stderr.writeAll("\nPlease install Lima to run containers on macOS:\n");
+            try stderr.writeAll("  brew install lima\n");
             try stderr.flush();
             return 1;
         }
@@ -3378,22 +3365,12 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
         var lima_cmd: std.ArrayList([]const u8) = .empty;
         defer lima_cmd.deinit(allocator);
 
-        if (std.mem.eql(u8, hypervisor.?, "limactl") or std.mem.eql(u8, hypervisor.?, "lima")) {
-            // Lima approach: limactl shell default nsenter ...
-            try lima_cmd.append(allocator, "limactl");
-            try lima_cmd.append(allocator, "shell");
-            try lima_cmd.append(allocator, "default");
-            try lima_cmd.append(allocator, "--");
-            try lima_cmd.append(allocator, "sudo");
-        } else {
-            // vfkit or other - use SSH approach
-            // For simplicity, assume lima is available
-            try stderr.writeAll("Error: exec currently requires Lima on macOS\n");
-            try stderr.writeAll("\nInstall Lima: brew install lima\n");
-            try stderr.writeAll("Start Lima: limactl start\n");
-            try stderr.flush();
-            return 1;
-        }
+        // Lima approach: limactl shell default nsenter ...
+        try lima_cmd.append(allocator, "limactl");
+        try lima_cmd.append(allocator, "shell");
+        try lima_cmd.append(allocator, "default");
+        try lima_cmd.append(allocator, "--");
+        try lima_cmd.append(allocator, "sudo");
 
         // Use nsenter to enter container namespaces
         try lima_cmd.append(allocator, "nsenter");
@@ -3490,10 +3467,10 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
             try stdout.writeAll("VM Status: ");
             if (isolazi.macos.isVirtualizationAvailable(allocator)) {
                 try stdout.writeAll("Virtualization available\n");
-                if (isolazi.macos.virtualization.findHypervisor(allocator)) |hyp| {
-                    try stdout.print("Hypervisor: {s}\n", .{hyp});
+                if (isolazi.macos.virtualization.isLimaInstalled(allocator)) {
+                    try stdout.print("Hypervisor: Lima (installed)\n", .{});
                 } else {
-                    try stdout.writeAll("Hypervisor: Not found\n");
+                    try stdout.writeAll("Hypervisor: Lima (not found)\n");
                 }
             } else {
                 try stdout.writeAll("Virtualization not available\n");
@@ -3515,32 +3492,6 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
             defer allocator.free(data_dir);
 
             try stdout.print("  Data dir: {s}\n", .{data_dir});
-
-            // Check for kernel
-            const vm_dir = isolazi.macos.virtualization.getVMAssetsDir(allocator) catch {
-                try stdout.writeAll("  Kernel: (error)\n");
-                try stdout.flush();
-                return 0;
-            };
-            defer allocator.free(vm_dir);
-
-            var kernel_path_buf: [512]u8 = undefined;
-            const kernel_path = std.fmt.bufPrint(&kernel_path_buf, "{s}/vmlinuz", .{vm_dir}) catch {
-                try stdout.writeAll("  Kernel: (error)\n");
-                try stdout.flush();
-                return 0;
-            };
-
-            const kernel_exists = blk: {
-                std.fs.accessAbsolute(kernel_path, .{}) catch break :blk false;
-                break :blk true;
-            };
-
-            if (kernel_exists) {
-                try stdout.print("  Kernel: {s}\n", .{kernel_path});
-            } else {
-                try stdout.writeAll("  Kernel: Not found\n");
-            }
 
             try stdout.flush();
             return 0;
@@ -3830,12 +3781,13 @@ const runOnLinux = if (builtin.os.tag == .linux) struct {
         var modified_run_cmd = run_cmd;
         modified_run_cmd.rootfs = rootfs_path;
 
-        // Check if this is a postgres image - auto-configure
+        // Check if this is a postgres or rabbitmq image - auto-configure
         const is_postgres = std.mem.indexOf(u8, run_cmd.rootfs, "postgres") != null;
+        const is_rabbitmq = std.mem.indexOf(u8, run_cmd.rootfs, "rabbitmq") != null;
 
         // If no command specified, use entrypoint for known images
         if (modified_run_cmd.command.len == 0 or std.mem.eql(u8, modified_run_cmd.command, "/bin/sh")) {
-            if (is_postgres) {
+            if (is_postgres or is_rabbitmq) {
                 modified_run_cmd.command = "docker-entrypoint.sh";
                 // Args will be set after buildConfig
             }
@@ -3850,6 +3802,11 @@ const runOnLinux = if (builtin.os.tag == .linux) struct {
         // For postgres, add default arg "postgres" if entrypoint
         if (is_postgres and std.mem.eql(u8, modified_run_cmd.command, "docker-entrypoint.sh")) {
             cfg.addArg("postgres") catch {};
+        }
+
+        // For rabbitmq, add default arg "rabbitmq-server" if entrypoint
+        if (is_rabbitmq and std.mem.eql(u8, modified_run_cmd.command, "docker-entrypoint.sh")) {
+            cfg.addArg("rabbitmq-server") catch {};
         }
 
         // For postgres, auto-set PGDATA if not provided
@@ -3876,6 +3833,13 @@ const runOnLinux = if (builtin.os.tag == .linux) struct {
                     cfg.addEnv("PGDATA=/var/lib/postgresql/data") catch {};
                 }
             }
+        }
+
+        // Add container ID tag for robust process stopping
+        {
+            var cid_tag_buf: [64]u8 = undefined;
+            const cid_tag = std.fmt.bufPrint(&cid_tag_buf, "ISOLAZI_ID={s}", .{if (container_id) |cid| cid[0..] else "unknown"}) catch "ISOLAZI_ID=unknown";
+            cfg.addEnv(cid_tag) catch {};
         }
 
         // Create and run the container

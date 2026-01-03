@@ -24,7 +24,7 @@ A minimal container runtime written in Zig, inspired by Docker, Podman, and OCI 
 - [Zig](https://ziglang.org/download/) 0.15.2 or later
 - Linux kernel with namespace support (for native execution)
 - WSL2 (for Windows)
-- macOS 12.0+ with vfkit or Lima (for macOS)
+- macOS 12.0+ with Lima (for macOS)
 
 ### Build from Source
 
@@ -313,7 +313,7 @@ isolazi/
 │   │   └── seccomp.zig   # Seccomp syscall filtering
 │   ├── fs/               # Filesystem operations
 │   ├── windows/          # WSL2 backend
-│   └── macos/            # Apple Virtualization backend
+│   └── macos/            # Lima VM backend
 ├── build.zig
 └── build.zig.zon
 ```
@@ -407,7 +407,7 @@ Containers use network namespace isolation with bridge networking:
 |----------|--------|-------|
 | Linux | ✅ Native | Full namespace isolation |
 | Windows | ✅ WSL2 | Containers run in WSL2 |
-| macOS | ✅ Virtualization | Containers run in Linux VM |
+| macOS | ✅ Lima | Containers run in Linux VM |
 
 ### Windows (WSL2)
 
@@ -417,16 +417,12 @@ On Windows, isolazi uses WSL2 as the container backend:
 2. Containers are executed inside WSL2 using `unshare` and `chroot`
 3. Requires WSL2 to be installed (`wsl --install`)
 
-### macOS (Apple Virtualization)
-
-On macOS, isolazi uses Apple's Virtualization framework to run a lightweight Linux VM:
+On macOS, isolazi uses [Lima](https://github.com/lima-vm/lima) to run a lightweight Linux VM:
 
 1. Images are pulled natively on macOS
-2. Containers are executed inside a Linux VM using VirtioFS for filesystem sharing
+2. Containers are executed inside a Linux VM with automatic file sharing
 3. Requires macOS 12.0 (Monterey) or later
-4. Needs a hypervisor backend:
-   - **vfkit** (recommended): `brew install vfkit` - Uses native Virtualization.framework
-   - **Lima**: `brew install lima` - Easy-to-use Linux VM manager with automatic file sharing
+4. Needs Lima installed: `brew install lima`
 
 #### macOS VM Management
 
@@ -440,22 +436,12 @@ isolazi vm info
 
 #### macOS Setup
 
-1. Install a hypervisor:
+1. Install Lima:
    ```bash
-   # Recommended: vfkit (native, fast, requires manual kernel setup)
-   brew install vfkit
-   
-   # Alternative: Lima (easier setup, auto-manages VM)
    brew install lima
    ```
 
-2. For vfkit users - download Linux kernel:
-   ```bash
-   mkdir -p ~/Library/Application\ Support/isolazi/vm
-   # Place your vmlinuz kernel file there
-   ```
-
-3. Lima users don't need manual kernel setup - Lima automatically downloads and manages the Linux VM.
+2. Lima automatically downloads and manages the Linux VM for isolazi on the first run.
 
 ## Data Storage
 
@@ -524,7 +510,7 @@ isolazi run --rootless --uid-map 0:1000:1 --gid-map 0:1000:1 alpine id
 - No root privileges required on the host
 - Container root (UID 0) is mapped to your unprivileged user
 - Improved security isolation
-- Works on Linux, Windows (WSL2), and macOS (Lima/vfkit)
+- Works on Linux, Windows (WSL2), and macOS (Lima)
 
 ## Requirements
 
@@ -539,7 +525,7 @@ isolazi run --rootless --uid-map 0:1000:1 --gid-map 0:1000:1 alpine id
 
 ### macOS
 - macOS 12.0 (Monterey) or later
-- vfkit or Lima installed
+- Lima installed
 - Network access for pulling images
 
 ## Contributing

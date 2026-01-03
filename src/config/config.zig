@@ -586,7 +586,7 @@ pub const Config = struct {
 
         // Initialize env array with basic environment
         config.env = std.mem.zeroes([MAX_ENV][PATH_MAX:0]u8);
-        try config.addEnv("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+        try config.addEnv("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/lib/postgresql/17/bin:/usr/lib/postgresql/16/bin:/usr/lib/postgresql/15/bin:/opt/rabbitmq/sbin:/usr/lib/rabbitmq/bin:/opt/erlang/bin");
         try config.addEnv("TERM=xterm");
 
         return config;

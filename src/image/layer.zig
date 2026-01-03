@@ -81,6 +81,9 @@ fn extractLayerWindows(allocator: std.mem.Allocator, layer_path: []const u8, tar
         return ExtractionError.DecompressionFailed;
     }
 
+    // Process OCI whiteouts (using the same logic, but we need to convert paths)
+    processWhiteouts(allocator, target_dir) catch {};
+
     return 1; // Return 1 as we extracted the layer
 }
 
@@ -105,7 +108,86 @@ fn extractLayerLinux(allocator: std.mem.Allocator, layer_path: []const u8, targe
         return ExtractionError.DecompressionFailed;
     }
 
+    // Process OCI whiteouts
+    processWhiteouts(allocator, target_dir) catch |err| {
+        std.debug.print("Warning: Failed to process whiteouts: {}\n", .{err});
+    };
+
     return 1;
+}
+
+/// Handle OCI whiteout files (.wh.<filename>)
+fn processWhiteouts(allocator: std.mem.Allocator, target_dir: []const u8) !void {
+    // Find all whiteout files
+    var result: std.process.Child.RunResult = undefined;
+
+    if (builtin.os.tag == .windows) {
+        const wsl_target = try windowsToWslPath(allocator, target_dir);
+        defer allocator.free(wsl_target);
+
+        result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &[_][]const u8{ "wsl", "-u", "root", "--", "find", wsl_target, "-name", ".wh.*" },
+        }) catch return;
+    } else {
+        result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &[_][]const u8{ "find", target_dir, "-name", ".wh.*" },
+        }) catch return;
+    }
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    var iter = std.mem.tokenizeScalar(u8, result.stdout, '\n');
+    while (iter.next()) |wh_path| {
+        const path = std.mem.trim(u8, wh_path, " \t\r\n");
+        if (path.len == 0) continue;
+
+        const basename = std.fs.path.basename(path);
+        const dirname = std.fs.path.dirname(path) orelse continue;
+
+        if (std.mem.eql(u8, basename, ".wh..wh..opq")) {
+            // Opaque whiteout: remove all files in this directory from previous layers
+            // For now, just remove the marker
+            if (builtin.os.tag == .windows) {
+                _ = std.process.Child.run(.{
+                    .allocator = allocator,
+                    .argv = &[_][]const u8{ "wsl", "-u", "root", "--", "rm", "-f", path },
+                }) catch {};
+            } else {
+                std.fs.deleteFileAbsolute(path) catch {};
+            }
+        } else if (std.mem.startsWith(u8, basename, ".wh.")) {
+            // Regular whiteout: remove the masked file
+            const masked_name = basename[4..];
+            const masked_path = try std.fs.path.join(allocator, &[_][]const u8{ dirname, masked_name });
+            defer allocator.free(masked_path);
+
+            // Recursively delete the masked file or directory
+            if (builtin.os.tag == .windows) {
+                _ = std.process.Child.run(.{
+                    .allocator = allocator,
+                    .argv = &[_][]const u8{ "wsl", "-u", "root", "--", "rm", "-rf", masked_path },
+                }) catch {};
+                // Also remove the whiteout marker itself via WSL
+                _ = std.process.Child.run(.{
+                    .allocator = allocator,
+                    .argv = &[_][]const u8{ "wsl", "-u", "root", "--", "rm", "-f", path },
+                }) catch {};
+            } else {
+                const result_rm = std.process.Child.run(.{
+                    .allocator = allocator,
+                    .argv = &[_][]const u8{ "rm", "-rf", masked_path },
+                }) catch null;
+                if (result_rm) |r| {
+                    allocator.free(r.stdout);
+                    allocator.free(r.stderr);
+                }
+                // Remove the whiteout marker itself
+                std.fs.deleteFileAbsolute(path) catch {};
+            }
+        }
+    }
 }
 
 /// Convert Windows path to WSL path
