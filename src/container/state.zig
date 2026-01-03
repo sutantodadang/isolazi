@@ -319,19 +319,70 @@ pub const ContainerManager = struct {
         const id_str = root.get("id").?.string;
         @memcpy(&id, id_str[0..32]);
 
+        const image_val = root.get("image").?.string;
+        const cmd_val = root.get("command").?.string;
+        var container_state = ContainerState.fromString(root.get("state").?.string) orelse .created;
+        const pid_val = if (root.get("pid")) |v| if (v == .integer) @as(i32, @intCast(v.integer)) else null else null;
+
+        // Liveness check for running containers
+        if (container_state == .running) {
+            if (pid_val) |pid| {
+                var alive = true;
+                if (builtin.os.tag == .windows) {
+                    // WSL check for Windows
+                    alive = self.isPidAliveWSL(pid) catch true;
+                } else {
+                    // Unix check using kill(pid, 0)
+                    std.posix.kill(pid, 0) catch |err| {
+                        if (err == error.ProcessNotFound) {
+                            alive = false;
+                        }
+                    };
+                }
+
+                if (!alive and builtin.os.tag == .macos) {
+                    // On macOS, try fallback to Lima check
+                    const macos = @import("../macos/virtualization.zig");
+                    alive = macos.isContainerAliveInLima(self.allocator, id_str) catch false;
+                }
+
+                if (!alive) {
+                    container_state = .stopped;
+                    // We don't update persistence here to avoid side effects in a getter,
+                    // but ps will show it as stopped.
+                }
+            }
+        }
+
         return ContainerInfo{
             .id = id,
-            .image = try self.allocator.dupe(u8, root.get("image").?.string),
-            .command = try self.allocator.dupe(u8, root.get("command").?.string),
-            .state = ContainerState.fromString(root.get("state").?.string) orelse .created,
+            .image = try self.allocator.dupe(u8, image_val),
+            .command = try self.allocator.dupe(u8, cmd_val),
+            .state = container_state,
             .created_at = root.get("created_at").?.integer,
             .started_at = if (root.get("started_at")) |v| if (v == .integer) v.integer else null else null,
             .finished_at = if (root.get("finished_at")) |v| if (v == .integer) v.integer else null else null,
-            .pid = if (root.get("pid")) |v| if (v == .integer) @intCast(v.integer) else null else null,
+            .pid = pid_val,
             .exit_code = if (root.get("exit_code")) |v| if (v == .integer) @intCast(v.integer) else null else null,
             .name = if (root.get("name")) |v| if (v == .string) try self.allocator.dupe(u8, v.string) else null else null,
             .allocator = self.allocator,
         };
+    }
+
+    /// Helper to check if a PID is alive in WSL2
+    fn isPidAliveWSL(self: *Self, pid: i32) !bool {
+        const pid_str = try std.fmt.allocPrint(self.allocator, "{d}", .{pid});
+        defer self.allocator.free(pid_str);
+
+        const result = std.process.Child.run(.{
+            .allocator = self.allocator,
+            .argv = &[_][]const u8{ "wsl", "-u", "root", "--", "ps", "-p", pid_str },
+        }) catch return false;
+
+        defer self.allocator.free(result.stdout);
+        defer self.allocator.free(result.stderr);
+
+        return result.term.Exited == 0;
     }
 
     /// List all containers
@@ -407,21 +458,46 @@ pub const ContainerManager = struct {
             return error.ContainerNotRunning;
         }
 
-        // On Windows, we need to kill through WSL
         if (builtin.os.tag == .windows) {
             if (info.pid) |pid| {
+                const pid_str = std.fmt.allocPrint(self.allocator, "{d}", .{pid}) catch "0";
+                defer if (!std.mem.eql(u8, pid_str, "0")) self.allocator.free(pid_str);
                 // Try to kill the process via WSL
-                var child = std.process.Child.init(&.{
-                    "wsl",                                                 "-u", "root", "--", "kill", "-TERM",
-                    try std.fmt.allocPrint(self.allocator, "{d}", .{pid}),
-                }, self.allocator);
-                child.spawn() catch {};
-                _ = child.wait() catch {};
+                _ = std.process.Child.run(.{
+                    .allocator = self.allocator,
+                    .argv = &[_][]const u8{ "wsl", "-u", "root", "--", "kill", "-TERM", pid_str },
+                }) catch null;
             }
+            // Also call pkill in WSL using the tag
+            const tag = std.fmt.allocPrint(self.allocator, "ISOLAZI_ID={s}", .{container_id}) catch "";
+            defer if (tag.len > 0) self.allocator.free(tag);
+            if (tag.len > 0) {
+                _ = std.process.Child.run(.{
+                    .allocator = self.allocator,
+                    .argv = &[_][]const u8{ "wsl", "-u", "root", "--", "pkill", "-f", tag },
+                }) catch null;
+            }
+        } else if (builtin.os.tag == .macos) {
+            // On macOS, kill the local proxy process AND the remote processes in VM
+            if (info.pid) |pid| {
+                _ = std.posix.kill(pid, std.posix.SIG.TERM) catch {};
+            }
+            // Also call pkill in VM to be sure
+            const macos = @import("../macos/virtualization.zig");
+            _ = macos.stopInLima(self.allocator, container_id) catch {};
         } else {
             // On Linux, use kill syscall
             if (info.pid) |pid| {
                 _ = std.posix.kill(pid, std.posix.SIG.TERM) catch {};
+            }
+            // Also call pkill using the tag for any orphaned processes in the same namespace group
+            const tag = std.fmt.allocPrint(self.allocator, "ISOLAZI_ID={s}", .{container_id}) catch "";
+            defer if (tag.len > 0) self.allocator.free(tag);
+            if (tag.len > 0) {
+                _ = std.process.Child.run(.{
+                    .allocator = self.allocator,
+                    .argv = &[_][]const u8{ "pkill", "-f", tag },
+                }) catch null;
             }
         }
 

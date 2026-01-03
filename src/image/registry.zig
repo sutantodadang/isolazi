@@ -228,6 +228,51 @@ pub const RegistryClient = struct {
 
         return self.runCurl(args.items);
     }
+
+    /// Download a blob (layer or config) directly to a file for better memory efficiency
+    pub fn downloadBlobToFile(
+        self: *Self,
+        repository: []const u8,
+        digest: []const u8,
+        dest_path: []const u8,
+    ) !void {
+        // Handle Docker Hub - add library/ prefix for official images
+        var repo_buf: [512]u8 = undefined;
+        const api_repo = if (!std.mem.containsAtLeast(u8, repository, 1, "/"))
+            try std.fmt.bufPrint(&repo_buf, "library/{s}", .{repository})
+        else
+            repository;
+
+        // Build blob URL
+        var url_buf: [2048]u8 = undefined;
+        const url = try std.fmt.bufPrint(
+            &url_buf,
+            "https://registry-1.docker.io/v2/{s}/blobs/{s}",
+            .{ api_repo, digest },
+        );
+
+        // Build curl args
+        var args: std.ArrayList([]const u8) = .empty;
+        defer args.deinit(self.allocator);
+
+        try args.append(self.allocator, "-o");
+        try args.append(self.allocator, dest_path);
+
+        // Store auth_header to free later
+        var auth_header: ?[]const u8 = null;
+        defer if (auth_header) |h| self.allocator.free(h);
+
+        if (self.auth_token) |token| {
+            try args.append(self.allocator, "-H");
+            auth_header = try std.fmt.allocPrint(self.allocator, "Authorization: Bearer {s}", .{token});
+            try args.append(self.allocator, auth_header.?);
+        }
+
+        try args.append(self.allocator, url);
+
+        const result = try self.runCurl(args.items);
+        self.allocator.free(result);
+    }
 };
 
 // =============================================================================
