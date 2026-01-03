@@ -610,9 +610,8 @@ pub fn ensureVMAssets(allocator: std.mem.Allocator) !struct {
         const kernel_url = "https://raw.githubusercontent.com/gokrazy/kernel.arm64/main/vmlinuz";
 
         std.debug.print("Downloading Linux kernel from gokrazy/kernel.arm64...\n", .{});
+        // Don't manually free here - errdefer will handle cleanup on error
         downloadFile(allocator, kernel_url, kernel_path) catch {
-            allocator.free(kernel_path);
-            allocator.free(initramfs_path);
             return VirtualizationError.KernelNotFound;
         };
         std.debug.print("Kernel downloaded to: {s}\n", .{kernel_path});
@@ -625,9 +624,8 @@ pub fn ensureVMAssets(allocator: std.mem.Allocator) !struct {
     };
 
     if (!initramfs_exists) {
+        // Don't manually free here - errdefer will handle cleanup on error
         createMinimalInitramfs(allocator, initramfs_path) catch {
-            allocator.free(kernel_path);
-            allocator.free(initramfs_path);
             return VirtualizationError.InitramfsNotFound;
         };
     }
