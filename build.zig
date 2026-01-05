@@ -153,4 +153,46 @@ pub fn build(b: *std.Build) void {
     //
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
+
+    // =========================================================================
+    // Benchmark Suite
+    // =========================================================================
+
+    // Add benchmark module
+    const bench_mod = b.addModule("bench", .{
+        .root_source_file = b.path("src/bench/mod.zig"),
+        .target = target,
+    });
+
+    // Add benchmark executable
+    const bench_exe = b.addExecutable(.{
+        .name = "isolazi-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/bench_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "isolazi", .module = mod },
+                .{ .name = "bench", .module = bench_mod },
+            },
+        }),
+    });
+
+    b.installArtifact(bench_exe);
+
+    // Add benchmark run step
+    const bench_step = b.step("bench", "Run benchmarks");
+    const run_bench = b.addRunArtifact(bench_exe);
+    run_bench.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_bench.addArgs(args);
+    }
+    bench_step.dependOn(&run_bench.step);
+
+    // Add benchmark tests
+    const bench_tests = b.addTest(.{
+        .root_module = bench_mod,
+    });
+    const run_bench_tests = b.addRunArtifact(bench_tests);
+    test_step.dependOn(&run_bench_tests.step);
 }
