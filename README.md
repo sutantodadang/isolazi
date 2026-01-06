@@ -19,22 +19,84 @@ A minimal container runtime written in Zig, inspired by Docker, Podman, and OCI 
 
 ## Installation
 
+### Quick Install (Recommended)
+
+**macOS / Linux:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/sutantodadang/isolazi/main/install.sh | bash
+```
+
+Or clone and run locally:
+```bash
+git clone https://github.com/sutantodadang/isolazi.git
+cd isolazi
+./install.sh
+```
+
+**Windows (PowerShell as Administrator):**
+```powershell
+irm https://raw.githubusercontent.com/sutantodadang/isolazi/main/install.ps1 | iex
+```
+
+Or clone and run locally:
+```powershell
+git clone https://github.com/sutantodadang/isolazi.git
+cd isolazi
+.\install.ps1
+```
+
+The installer will:
+- ✅ Download pre-built binary from GitHub releases
+- ✅ Auto-detect your platform (macOS/Linux, x86_64/arm64)
+- ✅ Install the binary to `~/.isolazi/bin`
+- ✅ Add to your PATH (supports zsh, bash, fish, PowerShell)
+
+**Install specific version:**
+```bash
+# macOS / Linux
+ISOLAZI_VERSION=v0.1.11 curl -fsSL https://raw.githubusercontent.com/sutantodadang/isolazi/main/install.sh | bash
+
+# Windows
+.\install.ps1 -Version v0.1.11
+```
+
+**Uninstall:**
+```bash
+# macOS / Linux
+./install.sh --uninstall
+
+# Windows
+.\install.ps1 -Uninstall
+```
+
 ### Prerequisites
 
-- [Zig](https://ziglang.org/download/) 0.15.2 or later
+- [Zig](https://ziglang.org/download/) 0.15.2 or later (auto-installed by script)
 - Linux kernel with namespace support (for native execution)
 - WSL2 (for Windows)
 - macOS 12.0+ with Lima (for macOS)
 
-### Build from Source
+### Manual Build from Source
 
 ```bash
-git clone https://github.com/nicefacer/isolazi.git
+git clone https://github.com/sutantodadang/isolazi.git
 cd isolazi
 zig build -Doptimize=ReleaseFast
 ```
 
 The binary will be available at `zig-out/bin/isolazi`.
+
+To manually add to PATH:
+```bash
+# Bash
+echo 'export PATH="$PATH:$HOME/.isolazi/bin"' >> ~/.bashrc
+
+# Zsh
+echo 'export PATH="$PATH:$HOME/.isolazi/bin"' >> ~/.zshrc
+
+# Fish
+echo 'set -gx PATH $PATH $HOME/.isolazi/bin' >> ~/.config/fish/config.fish
+```
 
 ## Quick Start
 
