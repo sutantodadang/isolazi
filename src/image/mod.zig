@@ -195,7 +195,7 @@ pub fn pullImage(
     }
 
     if (to_download.items.len > 0) {
-        // Parallel download logic
+        // Parallel download logic - using WSL ext4 filesystem for better I/O
         const ThreadData = struct {
             client: *RegistryClient,
             img_cache: *ImageCache,

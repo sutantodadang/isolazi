@@ -8,6 +8,7 @@ A minimal container runtime written in Zig, inspired by Docker, Podman, and OCI 
 - 📦 **OCI Image Support** - Pull images from Docker Hub and other registries
 - 🔒 **Process Isolation** - Linux namespaces (PID, mount, UTS, IPC, **network**, **user**, **cgroup**)
 - 🛡️ **Seccomp Filtering** - Block dangerous syscalls with configurable profiles
+- 🔐 **AppArmor/SELinux** - Mandatory Access Control for defense-in-depth security
 - 🌐 **Network Isolation** - veth pairs, bridge networking, NAT, and port forwarding
 - 👤 **Rootless Containers** - User namespace support for unprivileged container execution
 - ⚙️ **Resource Limits** - cgroup v2 support for memory, CPU, and I/O limits
@@ -254,6 +255,15 @@ OPTIONS for 'run':
     Security Options:
     --seccomp <profile>       Seccomp profile: default, minimal, strict, disabled
     --no-seccomp              Disable seccomp filtering (less secure)
+    --apparmor [profile]      Enable AppArmor with optional profile (default: isolazi-default)
+    --apparmor-mode <mode>    AppArmor mode: enforce, complain, unconfined
+    --no-apparmor             Disable AppArmor restrictions
+    --selinux [context]       Enable SELinux with optional context
+    --selinux-type <type>     SELinux type: container_t, container_net_t, container_file_t, spc_t
+    --selinux-mcs <cats>      SELinux MCS categories (e.g., c1,c2)
+    --no-selinux              Disable SELinux labeling
+    --security-opt <opt>      Security option (Docker-compatible): apparmor=profile, label=context
+    --privileged              Disable all security features (NOT recommended)
 
 OPTIONS for 'exec':
     -i, --interactive         Keep STDIN open
@@ -305,15 +315,17 @@ isolazi/
 │   │   └── registry.zig  # Registry client
 │   ├── runtime/          # Container runtime (Linux)
 │   │   └── container.zig # Container execution and exec support
-│   ├── linux/            # Linux-specific (namespaces, networking)
+│   ├── linux/            # Linux-specific (namespaces, networking, security)
 │   │   ├── syscalls.zig  # Low-level Linux syscall wrappers (setns, nsenter)
 │   │   ├── network.zig   # Container networking (veth, bridge, NAT)
 │   │   ├── userns.zig    # User namespace for rootless containers
 │   │   ├── cgroup.zig    # cgroup v2 resource limits
-│   │   └── seccomp.zig   # Seccomp syscall filtering
+│   │   ├── seccomp.zig   # Seccomp syscall filtering
+│   │   ├── apparmor.zig  # AppArmor MAC profile management
+│   │   └── selinux.zig   # SELinux context and labeling
 │   ├── fs/               # Filesystem operations
-│   ├── windows/          # WSL2 backend
-│   └── macos/            # Lima VM backend
+│   ├── windows/          # WSL2 backend (LSM passthrough)
+│   └── macos/            # Lima VM backend (LSM passthrough)
 ├── build.zig
 └── build.zig.zon
 ```
@@ -368,15 +380,127 @@ isolazi run --no-seccomp alpine /bin/sh
 3. Filter is installed via `seccomp(SECCOMP_SET_MODE_FILTER)`
 4. Container process and all children are restricted
 
+### AppArmor (Linux Security Module)
+
+AppArmor provides Mandatory Access Control (MAC) to restrict what a container can do. It's particularly effective at preventing file access and capability-based attacks.
+
+**AppArmor Modes:**
+
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| `enforce` | Actively blocks policy violations (default) | Production containers |
+| `complain` | Logs violations without blocking | Testing and debugging |
+| `unconfined` | No restrictions | When AppArmor isn't needed |
+
+**Default Profile Restrictions:**
+- Blocks access to `/proc/kcore`, `/proc/kmem`, `/proc/sysrq-trigger`
+- Blocks `/sys/firmware/**` to prevent firmware tampering
+- Blocks container runtime sockets (`/var/run/docker.sock`, etc.)
+- Denies `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE`, `CAP_SYS_MODULE`
+- Denies raw network access and kernel keyring access
+
+**Usage Examples:**
+
+```bash
+# Enable AppArmor with default profile
+isolazi run --apparmor alpine /bin/sh
+
+# Use a custom AppArmor profile
+isolazi run --apparmor my-profile alpine /bin/sh
+
+# AppArmor in complain mode (log only)
+isolazi run --apparmor --apparmor-mode complain alpine /bin/sh
+
+# Disable AppArmor
+isolazi run --no-apparmor alpine /bin/sh
+
+# Docker-compatible security option
+isolazi run --security-opt apparmor=my-profile alpine /bin/sh
+```
+
+**Platform Support:**
+- **Linux**: Native AppArmor support (requires AppArmor enabled in kernel)
+- **Windows (WSL2)**: Passed through to Linux isolazi inside WSL
+- **macOS (Lima)**: Passed through to Linux VM (if AppArmor is available)
+
+### SELinux (Security-Enhanced Linux)
+
+SELinux provides Type Enforcement (TE) and Multi-Category Security (MCS) for fine-grained access control between containers.
+
+**SELinux Types:**
+
+| Type | Description | Use Case |
+|------|-------------|----------|
+| `container_t` | Standard container type (default) | Most containers |
+| `container_net_t` | Container with network access | Network services |
+| `container_file_t` | Container with file access | Data processing |
+| `spc_t` | Super Privileged Container | System administration |
+
+**MCS Categories:**
+MCS categories (c0-c1023) provide isolation between containers. Each container gets unique categories, preventing one container from accessing another's files.
+
+**Usage Examples:**
+
+```bash
+# Enable SELinux with default context
+isolazi run --selinux alpine /bin/sh
+
+# Use a custom SELinux context
+isolazi run --selinux system_u:system_r:container_t:s0 alpine /bin/sh
+
+# SELinux with specific type
+isolazi run --selinux --selinux-type container_net_t alpine /bin/sh
+
+# SELinux with MCS categories for isolation
+isolazi run --selinux --selinux-mcs c100,c200 alpine /bin/sh
+
+# Disable SELinux
+isolazi run --no-selinux alpine /bin/sh
+
+# Docker-compatible security option
+isolazi run --security-opt label=system_u:system_r:container_t:s0:c100,c200 alpine /bin/sh
+```
+
+**Platform Support:**
+- **Linux**: Native SELinux support (requires SELinux enabled in kernel)
+- **Windows (WSL2)**: Passed through to Linux isolazi inside WSL
+- **macOS (Lima)**: Passed through to Linux VM (if SELinux is available)
+
+### Combining Security Features
+
+For maximum security, combine multiple security layers:
+
+```bash
+# Full security stack: seccomp + AppArmor + SELinux + resource limits
+isolazi run --seccomp strict \
+            --apparmor \
+            --selinux --selinux-mcs c100,c200 \
+            --memory 512m --cpus 1 \
+            alpine /bin/sh
+
+# Production-ready secure container
+isolazi run -d -p 8080:80 \
+            --seccomp default \
+            --apparmor my-nginx-profile \
+            --selinux --selinux-type container_net_t \
+            --memory 256m --cpus 0.5 \
+            nginx
+
+# Disable all security for debugging (NOT recommended for production)
+isolazi run --privileged alpine /bin/sh
+```
+
 ### Security Layers
 
 Isolazi provides multiple security layers:
 
 1. **Namespaces** - Process, mount, network, UTS, IPC, user, cgroup isolation
 2. **Seccomp** - Syscall filtering to block dangerous operations
-3. **Pivot Root** - Complete filesystem isolation
-4. **User Namespace** - Run as non-root on host (rootless containers)
-5. **Cgroups** - Resource limits to prevent DoS
+3. **AppArmor** - Mandatory Access Control for file and capability restrictions
+4. **SELinux** - Type Enforcement and MCS for inter-container isolation
+5. **Pivot Root** - Complete filesystem isolation
+6. **User Namespace** - Run as non-root on host (rootless containers)
+7. **Cgroups** - Resource limits to prevent DoS
 
 ## Network Architecture
 

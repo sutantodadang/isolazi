@@ -243,7 +243,17 @@ pub const Runtime = struct {
         // Step 7: Change to working directory
         try linux.chdir(cfg.getCwd());
 
-        // Step 8: Apply seccomp filter (must be done BEFORE execve)
+        // Step 8: Apply Linux Security Module (AppArmor/SELinux) profiles
+        // This must be done BEFORE execve but after filesystem setup
+        // LSM profiles restrict file access, capabilities, network, etc.
+        if (cfg.lsm.isEnabled()) {
+            applyLSMFromConfig(cfg) catch |err| {
+                std.debug.print("Warning: LSM profile application failed: {}\n", .{err});
+                // Continue without LSM - some systems may not have AppArmor/SELinux enabled
+            };
+        }
+
+        // Step 9: Apply seccomp filter (must be done BEFORE execve)
         // This restricts syscalls available to the container process
         if (cfg.seccomp.enabled and cfg.seccomp.profile_type != .disabled) {
             applySeccompFromConfig(cfg) catch |err| {
@@ -252,7 +262,7 @@ pub const Runtime = struct {
             };
         }
 
-        // Step 9: Execute the container command
+        // Step 10: Execute the container command
         // Build argv and envp arrays (on stack)
         var argv_buf: [config_mod.MAX_ARGS + 1]?[*:0]const u8 = undefined;
         var envp_buf: [config_mod.MAX_ENV + 1]?[*:0]const u8 = undefined;
@@ -688,6 +698,138 @@ fn applySeccompFromConfig(cfg: *const Config) !void {
 
     // Apply the seccomp filter
     try linux.applySeccompFilter(&linux_config);
+}
+
+// =============================================================================
+// Linux Security Module (LSM) Helper Functions
+// =============================================================================
+
+/// Apply AppArmor and/or SELinux configurations from the container config.
+///
+/// This function applies Linux Security Module restrictions to the container process.
+/// AppArmor and SELinux are mutually exclusive on most systems - only one will be
+/// active at runtime. The function tries both but expects only one to succeed.
+///
+/// SECURITY: LSM restrictions are applied BEFORE execve() but AFTER filesystem setup.
+/// This ensures the container process starts with the appropriate security context.
+///
+/// Order of operations:
+/// 1. Apply AppArmor profile (if enabled and AppArmor is available)
+/// 2. Apply SELinux context (if enabled and SELinux is available)
+/// 3. Both will gracefully fail if the respective LSM is not available
+fn applyLSMFromConfig(cfg: *const Config) !void {
+    const lsm_cfg = &cfg.lsm;
+
+    // Apply AppArmor if enabled
+    if (lsm_cfg.apparmor.isEnabled()) {
+        applyAppArmorFromConfig(&lsm_cfg.apparmor) catch |err| {
+            // Log but don't fail - AppArmor may not be available
+            std.debug.print("AppArmor application warning: {}\n", .{err});
+        };
+    }
+
+    // Apply SELinux if enabled
+    if (lsm_cfg.selinux.isEnabled()) {
+        applySELinuxFromConfig(&lsm_cfg.selinux) catch |err| {
+            // Log but don't fail - SELinux may not be available
+            std.debug.print("SELinux application warning: {}\n", .{err});
+        };
+    }
+}
+
+/// Apply AppArmor profile from config.
+///
+/// Converts config AppArmorConfig to linux apparmor module format and applies.
+fn applyAppArmorFromConfig(apparmor_cfg: *const config_mod.AppArmorConfig) !void {
+    if (!apparmor_cfg.enabled) {
+        return;
+    }
+
+    // Check if AppArmor is available on this system
+    if (!linux.isAppArmorAvailable()) {
+        std.debug.print("AppArmor not available on this system\n", .{});
+        return;
+    }
+
+    // Convert config AppArmorMode to linux apparmor mode
+    const profile_name = apparmor_cfg.getProfileName();
+
+    // Handle different modes
+    switch (apparmor_cfg.mode) {
+        .unconfined => {
+            // No AppArmor restrictions
+            return;
+        },
+        .complain => {
+            // Apply profile in complain mode
+            // For complain mode, we prepend "complain" to the profile name when setting exec context
+            var complain_buf: [config_mod.MAX_APPARMOR_PROFILE_NAME + 16]u8 = undefined;
+            const complain_name = std.fmt.bufPrint(&complain_buf, "complain {s}", .{profile_name}) catch {
+                return linux.AppArmorError.InvalidProfile;
+            };
+            try linux.setAppArmorExecProfile(complain_name);
+        },
+        .enforce => {
+            // Apply profile in enforce mode
+            try linux.setAppArmorExecProfile(profile_name);
+        },
+    }
+}
+
+/// Apply SELinux context from config.
+///
+/// Converts config SELinuxConfig to linux selinux module format and applies.
+fn applySELinuxFromConfig(selinux_cfg: *const config_mod.SELinuxConfig) !void {
+    if (!selinux_cfg.enabled) {
+        return;
+    }
+
+    // Check if SELinux is available on this system
+    if (!linux.isSELinuxAvailable()) {
+        std.debug.print("SELinux not available on this system\n", .{});
+        return;
+    }
+
+    // Check if SELinux is enforcing
+    const mode = linux.getSELinuxMode();
+    if (mode == .disabled) {
+        std.debug.print("SELinux is disabled on this system\n", .{});
+        return;
+    }
+
+    // Get the effective context string
+    var context_buf: [config_mod.MAX_SELINUX_CONTEXT_LEN]u8 = undefined;
+    const context_str = selinux_cfg.getContextString(&context_buf);
+
+    if (context_str.len == 0) {
+        return linux.SELinuxError.InvalidContext;
+    }
+
+    // Parse the context string
+    const context = linux.SecurityContext.parse(context_str) catch {
+        return linux.SELinuxError.InvalidContext;
+    };
+
+    // Set the exec context (applied at execve)
+    linux.setSELinuxExecContext(&context) catch |err| {
+        // In permissive mode, just log the error
+        if (mode == .permissive) {
+            std.debug.print("SELinux exec context failed (permissive mode): {}\n", .{err});
+            return;
+        }
+        return err;
+    };
+
+    // Set file creation context if mount label is specified
+    if (selinux_cfg.mount_label_len > 0) {
+        const mount_label = selinux_cfg.getMountLabel();
+        const file_context = linux.SecurityContext.parse(mount_label) catch {
+            return;
+        };
+        linux.setSELinuxFileCreateContext(&file_context) catch {
+            // Non-fatal - file creation context is optional
+        };
+    }
 }
 
 // =============================================================================

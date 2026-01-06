@@ -911,6 +911,38 @@ fn runContainerWindows(
     try script_buf.appendSlice(allocator, wsl_rootfs);
     try script_buf.appendSlice(allocator, "/dev/fd 2>/dev/null; ");
 
+    // Ensure /dev exists inside the rootfs and bind common device nodes from the host.
+    // This is necessary when the rootfs lives on /mnt/<drive> where creating device
+    // nodes is not supported; bind-mounting the host devices makes /dev/null etc
+    // available inside the chroot.
+    try script_buf.appendSlice(allocator, "mkdir -p ");
+    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, "/dev && ");
+    // Create placeholder files then bind host device nodes onto them
+    try script_buf.appendSlice(allocator, "touch ");
+    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, "/dev/null && mount --bind /dev/null ");
+    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, "/dev/null 2>/dev/null; ");
+
+    try script_buf.appendSlice(allocator, "touch ");
+    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, "/dev/tty && mount --bind /dev/tty ");
+    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, "/dev/tty 2>/dev/null; ");
+
+    try script_buf.appendSlice(allocator, "touch ");
+    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, "/dev/random && mount --bind /dev/random ");
+    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, "/dev/random 2>/dev/null; ");
+
+    try script_buf.appendSlice(allocator, "touch ");
+    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, "/dev/urandom && mount --bind /dev/urandom ");
+    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, "/dev/urandom 2>/dev/null; ");
+
     // For postgres images, set up required directories on tmpfs (Windows FS doesn't support chmod)
     const is_postgres = std.mem.indexOf(u8, image_name, "postgres") != null;
     if (is_postgres) {
@@ -933,6 +965,33 @@ fn runContainerWindows(
         try script_buf.appendSlice(allocator, "/var/lib/postgresql/data && chown 70:70 ");
         try script_buf.appendSlice(allocator, wsl_rootfs);
         try script_buf.appendSlice(allocator, "/var/lib/postgresql/data && ");
+    }
+
+    // For rabbitmq images, set up required directories on tmpfs (Windows FS doesn't support chmod)
+    // RabbitMQ requires .erlang.cookie to be owned by user with mode 600
+    const is_rabbitmq = std.mem.indexOf(u8, image_name, "rabbitmq") != null;
+    if (is_rabbitmq) {
+        // Mount tmpfs for /var/lib/rabbitmq so .erlang.cookie can have correct permissions
+        try script_buf.appendSlice(allocator, "mkdir -p ");
+        try script_buf.appendSlice(allocator, wsl_rootfs);
+        try script_buf.appendSlice(allocator, "/var/lib/rabbitmq && mount -t tmpfs tmpfs ");
+        try script_buf.appendSlice(allocator, wsl_rootfs);
+        try script_buf.appendSlice(allocator, "/var/lib/rabbitmq && chown 999:999 ");
+        try script_buf.appendSlice(allocator, wsl_rootfs);
+        try script_buf.appendSlice(allocator, "/var/lib/rabbitmq && chmod 700 ");
+        try script_buf.appendSlice(allocator, wsl_rootfs);
+        try script_buf.appendSlice(allocator, "/var/lib/rabbitmq && ");
+
+        // Mount tmpfs for /var/log/rabbitmq
+        try script_buf.appendSlice(allocator, "mkdir -p ");
+        try script_buf.appendSlice(allocator, wsl_rootfs);
+        try script_buf.appendSlice(allocator, "/var/log/rabbitmq && mount -t tmpfs tmpfs ");
+        try script_buf.appendSlice(allocator, wsl_rootfs);
+        try script_buf.appendSlice(allocator, "/var/log/rabbitmq && chown 999:999 ");
+        try script_buf.appendSlice(allocator, wsl_rootfs);
+        try script_buf.appendSlice(allocator, "/var/log/rabbitmq && chmod 755 ");
+        try script_buf.appendSlice(allocator, wsl_rootfs);
+        try script_buf.appendSlice(allocator, "/var/log/rabbitmq && ");
     }
 
     // Mount each volume

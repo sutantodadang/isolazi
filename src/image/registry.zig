@@ -3,7 +3,7 @@
 //! Implements the OCI Distribution Specification for pulling images:
 //! https://github.com/opencontainers/distribution-spec
 //!
-//! Uses curl as a subprocess for HTTP requests (more portable)
+//! Uses Zig's native std.http.Client for HTTP requests (no external dependencies)
 //!
 //! Workflow:
 //! 1. GET /v2/ - Check registry supports v2 API
@@ -45,22 +45,29 @@ pub const RegistryError = error{
     RateLimited,
     ServerError,
     InvalidResponse,
-    CurlNotFound,
     OutOfMemory,
     NetworkError,
+    TlsError,
+    FileError,
+    RedirectError,
 };
 
-/// Registry client for OCI image operations
+/// Registry client for OCI image operations using native Zig HTTP
 pub const RegistryClient = struct {
     allocator: std.mem.Allocator,
     auth_token: ?[]const u8,
+    http_client: std.http.Client,
 
     const Self = @This();
+
+    /// Buffer size for redirect handling
+    const REDIRECT_BUFFER_SIZE = 8 * 1024;
 
     pub fn init(allocator: std.mem.Allocator) Self {
         return Self{
             .allocator = allocator,
             .auth_token = null,
+            .http_client = std.http.Client{ .allocator = allocator },
         };
     }
 
@@ -68,51 +75,165 @@ pub const RegistryClient = struct {
         if (self.auth_token) |token| {
             self.allocator.free(token);
         }
+        self.http_client.deinit();
     }
 
-    /// Run curl and get stdout
-    fn runCurl(self: *Self, args: []const []const u8) ![]u8 {
-        var argv: std.ArrayList([]const u8) = .empty;
-        defer argv.deinit(self.allocator);
+    /// Perform an HTTP GET request using fetch API and return the response body
+    fn httpGet(
+        self: *Self,
+        url: []const u8,
+        extra_headers: []const std.http.Header,
+    ) ![]u8 {
+        const parsed_uri = std.Uri.parse(url) catch return RegistryError.InvalidResponse;
 
-        // Use curl.exe on Windows to avoid PowerShell alias
-        const curl_cmd = if (builtin.os.tag == .windows) "curl.exe" else "curl";
-        try argv.append(self.allocator, curl_cmd);
-        try argv.append(self.allocator, "-sL"); // silent, follow redirects
+        var redirect_buffer: [REDIRECT_BUFFER_SIZE]u8 = undefined;
+        var body: std.Io.Writer.Allocating = .init(self.allocator);
+        defer body.deinit();
+        try body.ensureUnusedCapacity(1024);
 
-        for (args) |arg| {
-            try argv.append(self.allocator, arg);
+        const result = self.http_client.fetch(.{
+            .location = .{ .uri = parsed_uri },
+            .method = .GET,
+            .redirect_buffer = &redirect_buffer,
+            .response_writer = &body.writer,
+            .extra_headers = extra_headers,
+        }) catch return RegistryError.NetworkError;
+
+        // Check status code
+        switch (result.status) {
+            .ok => {},
+            .unauthorized => return RegistryError.Unauthorized,
+            .not_found => return RegistryError.NotFound,
+            .too_many_requests => return RegistryError.RateLimited,
+            else => {
+                if (@intFromEnum(result.status) >= 500) {
+                    return RegistryError.ServerError;
+                }
+                return RegistryError.NetworkError;
+            },
         }
 
-        var child = std.process.Child.init(argv.items, self.allocator);
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Ignore;
+        return body.toOwnedSlice() catch return RegistryError.OutOfMemory;
+    }
 
-        try child.spawn();
+    /// Download a file via HTTP GET and write directly to disk
+    /// Handles Docker Hub's redirect to CDN by making two requests:
+    /// 1. First request with auth to get redirect URL
+    /// 2. Second request without auth to download from CDN
+    /// Uses a fresh HTTP client to avoid thread safety issues
+    /// Includes retry logic for transient network failures
+    fn httpDownloadToFile(
+        self: *Self,
+        url: []const u8,
+        dest_path: []const u8,
+        auth_headers: []const std.http.Header,
+    ) !void {
+        const max_retries: u32 = 3;
+        var attempt: u32 = 0;
 
-        const stdout_file = child.stdout orelse return RegistryError.NetworkError;
+        while (attempt < max_retries) : (attempt += 1) {
+            if (attempt > 0) {
+                // Brief delay before retry (exponential backoff: 100ms, 200ms, 400ms)
+                std.Thread.sleep(100 * std.time.ns_per_ms * (@as(u64, 1) << @intCast(attempt - 1)));
+            }
 
-        var result: std.ArrayList(u8) = .empty;
-        errdefer result.deinit(self.allocator);
-
-        var chunk_buf: [8192]u8 = undefined;
-        while (true) {
-            const n = stdout_file.read(&chunk_buf) catch break;
-            if (n == 0) break;
-            try result.appendSlice(self.allocator, chunk_buf[0..n]);
+            const result = self.httpDownloadToFileOnce(url, dest_path, auth_headers);
+            if (result) |_| {
+                return; // Success
+            } else |err| {
+                // Only retry on network errors, not auth/notfound/etc
+                if (err != RegistryError.NetworkError) {
+                    return err;
+                }
+                // On last attempt, return the error
+                if (attempt == max_retries - 1) {
+                    return err;
+                }
+                // Otherwise, retry
+            }
         }
+    }
 
-        const term = child.wait() catch return RegistryError.NetworkError;
-        switch (term) {
-            .Exited => |code| {
-                if (code != 0) {
+    /// Single attempt to download a file (called by httpDownloadToFile with retries)
+    fn httpDownloadToFileOnce(
+        self: *Self,
+        url: []const u8,
+        dest_path: []const u8,
+        auth_headers: []const std.http.Header,
+    ) !void {
+        const parsed_uri = std.Uri.parse(url) catch return RegistryError.InvalidResponse;
+
+        // Use a fresh HTTP client for downloads to avoid thread conflicts
+        var download_client = std.http.Client{ .allocator = self.allocator };
+        defer download_client.deinit();
+
+        // First request with auth - don't follow redirects automatically
+        var redirect_buffer: [REDIRECT_BUFFER_SIZE]u8 = undefined;
+
+        var req = download_client.request(.GET, parsed_uri, .{
+            .extra_headers = auth_headers,
+            .redirect_behavior = .unhandled,
+        }) catch return RegistryError.NetworkError;
+        defer req.deinit();
+
+        req.sendBodiless() catch return RegistryError.NetworkError;
+        var response = req.receiveHead(&redirect_buffer) catch return RegistryError.NetworkError;
+
+        // Check status code
+        switch (response.head.status) {
+            .ok => {
+                // No redirect, download directly using body reader
+                const file = std.fs.cwd().createFile(dest_path, .{}) catch return RegistryError.FileError;
+                defer file.close();
+
+                var transfer_buf: [16 * 1024]u8 = undefined;
+                const body_reader = response.reader(&transfer_buf);
+
+                // Stream the body to file
+                var write_buf: [16 * 1024]u8 = undefined;
+                var file_writer = file.writer(&write_buf);
+                _ = body_reader.streamRemaining(&file_writer.interface) catch return RegistryError.NetworkError;
+            },
+            .temporary_redirect, .moved_permanently, .found, .see_other => {
+                // Got a redirect - extract Location header and follow without auth
+                const redirect_url = response.head.location orelse return RegistryError.NetworkError;
+
+                // Second request without auth headers (CDN doesn't need them)
+                const redirect_uri = std.Uri.parse(redirect_url) catch return RegistryError.InvalidResponse;
+
+                var body: std.Io.Writer.Allocating = .init(self.allocator);
+                defer body.deinit();
+                try body.ensureUnusedCapacity(64 * 1024);
+
+                // Use the same download_client for the redirect request
+                const result2 = download_client.fetch(.{
+                    .location = .{ .uri = redirect_uri },
+                    .method = .GET,
+                    .redirect_buffer = &redirect_buffer,
+                    .response_writer = &body.writer,
+                    .extra_headers = &.{}, // No auth for CDN
+                }) catch return RegistryError.NetworkError;
+
+                if (result2.status != .ok) {
                     return RegistryError.NetworkError;
                 }
-            },
-            else => return RegistryError.NetworkError,
-        }
 
-        return result.toOwnedSlice(self.allocator);
+                const file = std.fs.cwd().createFile(dest_path, .{}) catch return RegistryError.FileError;
+                defer file.close();
+                const data = body.toOwnedSlice() catch return RegistryError.OutOfMemory;
+                defer self.allocator.free(data);
+                file.writeAll(data) catch return RegistryError.FileError;
+            },
+            .unauthorized => return RegistryError.Unauthorized,
+            .not_found => return RegistryError.NotFound,
+            .too_many_requests => return RegistryError.RateLimited,
+            else => {
+                if (@intFromEnum(response.head.status) >= 500) {
+                    return RegistryError.ServerError;
+                }
+                return RegistryError.NetworkError;
+            },
+        }
     }
 
     /// Authenticate with Docker Hub (get bearer token)
@@ -120,18 +241,18 @@ pub const RegistryClient = struct {
         // Handle official images - add library/ prefix
         var repo_buf: [512]u8 = undefined;
         const auth_repo = if (!std.mem.containsAtLeast(u8, repository, 1, "/"))
-            try std.fmt.bufPrint(&repo_buf, "library/{s}", .{repository})
+            std.fmt.bufPrint(&repo_buf, "library/{s}", .{repository}) catch return RegistryError.OutOfMemory
         else
             repository;
 
         var url_buf: [1024]u8 = undefined;
-        const url = try std.fmt.bufPrint(
+        const url = std.fmt.bufPrint(
             &url_buf,
             "https://auth.docker.io/token?service=registry.docker.io&scope=repository:{s}:pull",
             .{auth_repo},
-        );
+        ) catch return RegistryError.OutOfMemory;
 
-        const body = try self.runCurl(&[_][]const u8{url});
+        const body = try self.httpGet(url, &.{});
         defer self.allocator.free(body);
 
         // Parse JSON to extract token
@@ -155,38 +276,43 @@ pub const RegistryClient = struct {
         // Handle Docker Hub - add library/ prefix for official images
         var repo_buf: [512]u8 = undefined;
         const api_repo = if (!std.mem.containsAtLeast(u8, repository, 1, "/"))
-            try std.fmt.bufPrint(&repo_buf, "library/{s}", .{repository})
+            std.fmt.bufPrint(&repo_buf, "library/{s}", .{repository}) catch return RegistryError.OutOfMemory
         else
             repository;
 
         // Build manifest URL (larger buffer to accommodate sha256 digests)
         var url_buf: [4096]u8 = undefined;
-        const url = try std.fmt.bufPrint(
+        const url = std.fmt.bufPrint(
             &url_buf,
             "https://registry-1.docker.io/v2/{s}/manifests/{s}",
             .{ api_repo, tag },
-        );
+        ) catch return RegistryError.OutOfMemory;
 
-        // Build curl args
-        var args: std.ArrayList([]const u8) = .empty;
-        defer args.deinit(self.allocator);
+        // Build headers
+        var headers_buf: [2]std.http.Header = undefined;
+        var header_count: usize = 0;
 
-        try args.append(self.allocator, "-H");
-        try args.append(self.allocator, "Accept: " ++ MediaType.DOCKER_MANIFEST_V2);
+        // Accept header for manifest type
+        headers_buf[header_count] = .{
+            .name = "Accept",
+            .value = MediaType.DOCKER_MANIFEST_V2,
+        };
+        header_count += 1;
 
-        // Store auth_header to free later
-        var auth_header: ?[]const u8 = null;
-        defer if (auth_header) |h| self.allocator.free(h);
+        // Authorization header if we have a token
+        var auth_header_value: ?[]const u8 = null;
+        defer if (auth_header_value) |h| self.allocator.free(h);
 
         if (self.auth_token) |token| {
-            try args.append(self.allocator, "-H");
-            auth_header = try std.fmt.allocPrint(self.allocator, "Authorization: Bearer {s}", .{token});
-            try args.append(self.allocator, auth_header.?);
+            auth_header_value = std.fmt.allocPrint(self.allocator, "Bearer {s}", .{token}) catch return RegistryError.OutOfMemory;
+            headers_buf[header_count] = .{
+                .name = "Authorization",
+                .value = auth_header_value.?,
+            };
+            header_count += 1;
         }
 
-        try args.append(self.allocator, url);
-
-        return self.runCurl(args.items);
+        return self.httpGet(url, headers_buf[0..header_count]);
     }
 
     /// Download a blob (layer or config) to memory
@@ -198,35 +324,36 @@ pub const RegistryClient = struct {
         // Handle Docker Hub - add library/ prefix for official images
         var repo_buf: [512]u8 = undefined;
         const api_repo = if (!std.mem.containsAtLeast(u8, repository, 1, "/"))
-            try std.fmt.bufPrint(&repo_buf, "library/{s}", .{repository})
+            std.fmt.bufPrint(&repo_buf, "library/{s}", .{repository}) catch return RegistryError.OutOfMemory
         else
             repository;
 
         // Build blob URL
         var url_buf: [2048]u8 = undefined;
-        const url = try std.fmt.bufPrint(
+        const url = std.fmt.bufPrint(
             &url_buf,
             "https://registry-1.docker.io/v2/{s}/blobs/{s}",
             .{ api_repo, digest },
-        );
+        ) catch return RegistryError.OutOfMemory;
 
-        // Build curl args
-        var args: std.ArrayList([]const u8) = .empty;
-        defer args.deinit(self.allocator);
+        // Build headers
+        var headers_buf: [1]std.http.Header = undefined;
+        var header_count: usize = 0;
 
-        // Store auth_header to free later
-        var auth_header: ?[]const u8 = null;
-        defer if (auth_header) |h| self.allocator.free(h);
+        // Authorization header if we have a token
+        var auth_header_value: ?[]const u8 = null;
+        defer if (auth_header_value) |h| self.allocator.free(h);
 
         if (self.auth_token) |token| {
-            try args.append(self.allocator, "-H");
-            auth_header = try std.fmt.allocPrint(self.allocator, "Authorization: Bearer {s}", .{token});
-            try args.append(self.allocator, auth_header.?);
+            auth_header_value = std.fmt.allocPrint(self.allocator, "Bearer {s}", .{token}) catch return RegistryError.OutOfMemory;
+            headers_buf[header_count] = .{
+                .name = "Authorization",
+                .value = auth_header_value.?,
+            };
+            header_count += 1;
         }
 
-        try args.append(self.allocator, url);
-
-        return self.runCurl(args.items);
+        return self.httpGet(url, headers_buf[0..header_count]);
     }
 
     /// Download a blob (layer or config) directly to a file for better memory efficiency
@@ -239,39 +366,36 @@ pub const RegistryClient = struct {
         // Handle Docker Hub - add library/ prefix for official images
         var repo_buf: [512]u8 = undefined;
         const api_repo = if (!std.mem.containsAtLeast(u8, repository, 1, "/"))
-            try std.fmt.bufPrint(&repo_buf, "library/{s}", .{repository})
+            std.fmt.bufPrint(&repo_buf, "library/{s}", .{repository}) catch return RegistryError.OutOfMemory
         else
             repository;
 
         // Build blob URL
         var url_buf: [2048]u8 = undefined;
-        const url = try std.fmt.bufPrint(
+        const url = std.fmt.bufPrint(
             &url_buf,
             "https://registry-1.docker.io/v2/{s}/blobs/{s}",
             .{ api_repo, digest },
-        );
+        ) catch return RegistryError.OutOfMemory;
 
-        // Build curl args
-        var args: std.ArrayList([]const u8) = .empty;
-        defer args.deinit(self.allocator);
+        // Build headers
+        var headers_buf: [1]std.http.Header = undefined;
+        var header_count: usize = 0;
 
-        try args.append(self.allocator, "-o");
-        try args.append(self.allocator, dest_path);
-
-        // Store auth_header to free later
-        var auth_header: ?[]const u8 = null;
-        defer if (auth_header) |h| self.allocator.free(h);
+        // Authorization header if we have a token
+        var auth_header_value: ?[]const u8 = null;
+        defer if (auth_header_value) |h| self.allocator.free(h);
 
         if (self.auth_token) |token| {
-            try args.append(self.allocator, "-H");
-            auth_header = try std.fmt.allocPrint(self.allocator, "Authorization: Bearer {s}", .{token});
-            try args.append(self.allocator, auth_header.?);
+            auth_header_value = std.fmt.allocPrint(self.allocator, "Bearer {s}", .{token}) catch return RegistryError.OutOfMemory;
+            headers_buf[header_count] = .{
+                .name = "Authorization",
+                .value = auth_header_value.?,
+            };
+            header_count += 1;
         }
 
-        try args.append(self.allocator, url);
-
-        const result = try self.runCurl(args.items);
-        self.allocator.free(result);
+        try self.httpDownloadToFile(url, dest_path, headers_buf[0..header_count]);
     }
 };
 

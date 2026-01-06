@@ -15,6 +15,11 @@ pub const wsl = @import("wsl.zig");
 pub const WslError = wsl.WslError;
 pub const WslConfig = wsl.WslConfig;
 
+// Linux Security Module types for passthrough
+pub const LSMConfig = wsl.LSMConfig;
+pub const AppArmorMode = wsl.AppArmorMode;
+pub const SELinuxType = wsl.SELinuxType;
+
 pub const isWslAvailable = wsl.isWslAvailable;
 pub const listDistros = wsl.listDistros;
 pub const execInWsl = wsl.execInWsl;
