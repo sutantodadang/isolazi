@@ -127,11 +127,36 @@ pub const RunCommand = struct {
     seccomp_enabled: bool = true, // Enable seccomp filtering (default: true)
     seccomp_profile: SeccompProfile = .default_container, // Seccomp profile
 
+    // AppArmor Linux Security Module options
+    apparmor_enabled: bool = false, // Enable AppArmor profile
+    apparmor_profile: ?[]const u8 = null, // AppArmor profile name (null = default "isolazi-default")
+    apparmor_mode: AppArmorMode = .enforce, // AppArmor enforcement mode
+
+    // SELinux Linux Security Module options
+    selinux_enabled: bool = false, // Enable SELinux context
+    selinux_context: ?[]const u8 = null, // Custom SELinux context string
+    selinux_type: SELinuxType = .container_t, // SELinux type for container process
+    selinux_mcs_category1: ?u16 = null, // MCS category 1 for container isolation
+    selinux_mcs_category2: ?u16 = null, // MCS category 2 for container isolation
+
     pub const SeccompProfile = enum {
         disabled, // No seccomp filtering
         default_container, // Default container profile - blocks dangerous syscalls
         minimal, // Minimal profile - only blocks most critical syscalls
         strict, // Strict allowlist profile - blocks everything except explicitly allowed
+    };
+
+    pub const AppArmorMode = enum {
+        unconfined, // No AppArmor restrictions
+        complain, // Log violations but don't block
+        enforce, // Block violations (default)
+    };
+
+    pub const SELinuxType = enum {
+        container_t, // Standard container (restricted)
+        spc_t, // Super-privileged container
+        unconfined_t, // Unconfined (no SELinux restrictions)
+        custom, // Custom context string provided
     };
 };
 
@@ -381,6 +406,131 @@ fn parseRunCommand(args: []const []const u8) CliError!Command {
                 } else {
                     return CliError.InvalidArgument;
                 }
+            } else if (std.mem.eql(u8, arg, "--apparmor")) {
+                // AppArmor profile: --apparmor <profile-name>
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                const profile_str = args[i];
+                if (std.mem.eql(u8, profile_str, "unconfined") or std.mem.eql(u8, profile_str, "disabled") or std.mem.eql(u8, profile_str, "none")) {
+                    run_cmd.apparmor_enabled = false;
+                    run_cmd.apparmor_mode = .unconfined;
+                } else {
+                    run_cmd.apparmor_enabled = true;
+                    run_cmd.apparmor_profile = profile_str;
+                    run_cmd.apparmor_mode = .enforce;
+                }
+            } else if (std.mem.eql(u8, arg, "--apparmor-mode")) {
+                // AppArmor mode: --apparmor-mode <enforce|complain|unconfined>
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                const mode_str = args[i];
+                if (std.mem.eql(u8, mode_str, "enforce") or std.mem.eql(u8, mode_str, "enforcing")) {
+                    run_cmd.apparmor_mode = .enforce;
+                } else if (std.mem.eql(u8, mode_str, "complain") or std.mem.eql(u8, mode_str, "permissive")) {
+                    run_cmd.apparmor_mode = .complain;
+                } else if (std.mem.eql(u8, mode_str, "unconfined") or std.mem.eql(u8, mode_str, "disabled")) {
+                    run_cmd.apparmor_enabled = false;
+                    run_cmd.apparmor_mode = .unconfined;
+                } else {
+                    return CliError.InvalidArgument;
+                }
+            } else if (std.mem.eql(u8, arg, "--no-apparmor") or std.mem.eql(u8, arg, "--disable-apparmor")) {
+                // Disable AppArmor
+                run_cmd.apparmor_enabled = false;
+                run_cmd.apparmor_mode = .unconfined;
+            } else if (std.mem.eql(u8, arg, "--security-opt")) {
+                // Docker-compatible security option: --security-opt <option>
+                // Supports: apparmor=<profile>, label=type:<type>, label=disable
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                const opt_str = args[i];
+                if (std.mem.startsWith(u8, opt_str, "apparmor=")) {
+                    const profile = opt_str[9..];
+                    if (std.mem.eql(u8, profile, "unconfined")) {
+                        run_cmd.apparmor_enabled = false;
+                        run_cmd.apparmor_mode = .unconfined;
+                    } else {
+                        run_cmd.apparmor_enabled = true;
+                        run_cmd.apparmor_profile = profile;
+                    }
+                } else if (std.mem.startsWith(u8, opt_str, "label=type:")) {
+                    // SELinux type: label=type:<type>
+                    const type_str = opt_str[11..];
+                    run_cmd.selinux_enabled = true;
+                    if (std.mem.eql(u8, type_str, "container_t")) {
+                        run_cmd.selinux_type = .container_t;
+                    } else if (std.mem.eql(u8, type_str, "spc_t")) {
+                        run_cmd.selinux_type = .spc_t;
+                    } else if (std.mem.eql(u8, type_str, "unconfined_t")) {
+                        run_cmd.selinux_type = .unconfined_t;
+                    } else {
+                        // Custom context
+                        run_cmd.selinux_type = .custom;
+                        run_cmd.selinux_context = type_str;
+                    }
+                } else if (std.mem.eql(u8, opt_str, "label=disable") or std.mem.eql(u8, opt_str, "label:disable")) {
+                    // Disable SELinux
+                    run_cmd.selinux_enabled = false;
+                    run_cmd.selinux_type = .unconfined_t;
+                } else if (std.mem.startsWith(u8, opt_str, "label=")) {
+                    // Generic label - treat as SELinux context
+                    run_cmd.selinux_enabled = true;
+                    run_cmd.selinux_context = opt_str[6..];
+                    run_cmd.selinux_type = .custom;
+                }
+            } else if (std.mem.eql(u8, arg, "--selinux") or std.mem.eql(u8, arg, "--selinux-context")) {
+                // SELinux context: --selinux <context>
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                const context_str = args[i];
+                if (std.mem.eql(u8, context_str, "unconfined") or std.mem.eql(u8, context_str, "disabled") or std.mem.eql(u8, context_str, "none")) {
+                    run_cmd.selinux_enabled = false;
+                    run_cmd.selinux_type = .unconfined_t;
+                } else {
+                    run_cmd.selinux_enabled = true;
+                    run_cmd.selinux_context = context_str;
+                    run_cmd.selinux_type = .custom;
+                }
+            } else if (std.mem.eql(u8, arg, "--selinux-type")) {
+                // SELinux type: --selinux-type <container_t|spc_t|unconfined_t>
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                const type_str = args[i];
+                run_cmd.selinux_enabled = true;
+                if (std.mem.eql(u8, type_str, "container_t") or std.mem.eql(u8, type_str, "container")) {
+                    run_cmd.selinux_type = .container_t;
+                } else if (std.mem.eql(u8, type_str, "spc_t") or std.mem.eql(u8, type_str, "super-privileged")) {
+                    run_cmd.selinux_type = .spc_t;
+                } else if (std.mem.eql(u8, type_str, "unconfined_t") or std.mem.eql(u8, type_str, "unconfined")) {
+                    run_cmd.selinux_enabled = false;
+                    run_cmd.selinux_type = .unconfined_t;
+                } else {
+                    return CliError.InvalidArgument;
+                }
+            } else if (std.mem.eql(u8, arg, "--selinux-mcs")) {
+                // SELinux MCS categories: --selinux-mcs <c1>,<c2>
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                const mcs_str = args[i];
+                // Parse "c1,c2" format
+                var iter = std.mem.splitScalar(u8, mcs_str, ',');
+                const cat1_str = iter.next() orelse return CliError.InvalidArgument;
+                const cat2_str = iter.next() orelse cat1_str;
+                run_cmd.selinux_enabled = true;
+                run_cmd.selinux_mcs_category1 = std.fmt.parseInt(u16, cat1_str, 10) catch return CliError.InvalidArgument;
+                run_cmd.selinux_mcs_category2 = std.fmt.parseInt(u16, cat2_str, 10) catch return CliError.InvalidArgument;
+            } else if (std.mem.eql(u8, arg, "--no-selinux") or std.mem.eql(u8, arg, "--disable-selinux")) {
+                // Disable SELinux
+                run_cmd.selinux_enabled = false;
+                run_cmd.selinux_type = .unconfined_t;
+            } else if (std.mem.eql(u8, arg, "--privileged")) {
+                // Privileged container: disable all security features
+                run_cmd.seccomp_enabled = false;
+                run_cmd.seccomp_profile = .disabled;
+                run_cmd.apparmor_enabled = false;
+                run_cmd.apparmor_mode = .unconfined;
+                run_cmd.selinux_enabled = false;
+                run_cmd.selinux_type = .unconfined_t;
             } else {
                 return CliError.InvalidArgument;
             }
@@ -878,11 +1028,35 @@ pub fn printHelp(writer: anytype) !void {
         \\                              Profiles: default, minimal, strict, disabled
         \\    --no-seccomp              Disable seccomp filtering (same as --seccomp disabled)
         \\
+        \\    --apparmor <profile>      AppArmor profile name (default: isolazi-default)
+        \\    --apparmor-mode <mode>    AppArmor mode: enforce, complain, unconfined
+        \\    --no-apparmor             Disable AppArmor enforcement
+        \\
+        \\    --selinux <context>       SELinux security context (full context string)
+        \\    --selinux-type <type>     SELinux type: container_t, spc_t, unconfined_t
+        \\    --selinux-mcs <c1>,<c2>   SELinux MCS categories for isolation (e.g., 100,200)
+        \\    --no-selinux              Disable SELinux enforcement
+        \\
+        \\    --security-opt <opt>      Docker-compatible security options:
+        \\                              apparmor=<profile>, label=type:<type>, label=disable
+        \\
+        \\    --privileged              Disable all security features (seccomp, AppArmor, SELinux)
+        \\
         \\    Seccomp Profiles:
         \\      default-container       Blocks dangerous syscalls (mount, ptrace, kexec, etc.)
         \\      minimal                 Only blocks critical syscalls (kexec, reboot, modules)
         \\      strict                  Allowlist mode - only basic syscalls permitted
         \\      disabled                No syscall filtering (less secure)
+        \\
+        \\    AppArmor Modes:
+        \\      enforce                 Block and log policy violations (default)
+        \\      complain                Log violations but don't block (for debugging)
+        \\      unconfined              No AppArmor restrictions
+        \\
+        \\    SELinux Types:
+        \\      container_t             Standard container process (restricted, default)
+        \\      spc_t                   Super-privileged container (less restricted)
+        \\      unconfined_t            No SELinux restrictions
         \\
         \\OPTIONS for 'ps':
         \\    -a, --all            Show all containers (default: only running)
@@ -908,6 +1082,11 @@ pub fn printHelp(writer: anytype) !void {
         \\    isolazi run -m 1g --cpu-weight 200 --io-weight 500 alpine /bin/sh
         \\    isolazi run --seccomp minimal alpine /bin/sh
         \\    isolazi run --no-seccomp alpine /bin/sh     # Less secure, for debugging
+        \\    isolazi run --apparmor isolazi-default alpine /bin/sh
+        \\    isolazi run --apparmor myprofile --apparmor-mode complain alpine /bin/sh
+        \\    isolazi run --selinux-type container_t --selinux-mcs 100,200 alpine /bin/sh
+        \\    isolazi run --security-opt apparmor=isolazi-default alpine /bin/sh
+        \\    isolazi run --privileged alpine /bin/sh     # Disables all security features
         \\    isolazi create --name myapp alpine
         \\    isolazi start myapp
         \\    isolazi ps -a
