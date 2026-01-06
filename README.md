@@ -652,6 +652,32 @@ isolazi run --rootless --uid-map 0:1000:1 --gid-map 0:1000:1 alpine id
 - Lima installed
 - Network access for pulling images
 
+## Benchmarking
+
+isolazi includes a comprehensive benchmark suite for measuring container performance:
+
+```bash
+# Build the benchmark tool
+zig build
+
+# Run all benchmarks
+./zig-out/bin/isolazi-bench all --rootfs /path/to/rootfs --layer /path/to/layer.tar.gz
+
+# Run specific benchmarks
+./zig-out/bin/isolazi-bench container-start --rootfs /path/to/rootfs
+./zig-out/bin/isolazi-bench layer --layer /path/to/layer.tar.gz
+
+# Export results to JSON
+./zig-out/bin/isolazi-bench all -o results.json
+```
+
+**Benchmark Types:**
+- **Cold Container Start** - Time from creation to first process instruction
+- **Memory & CPU Overhead** - Resource consumption of idle containers
+- **Layer Extraction** - OCI image layer decompression speed
+
+See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for detailed documentation.
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit issues and pull requests.
