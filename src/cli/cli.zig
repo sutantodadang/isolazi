@@ -833,6 +833,7 @@ pub fn printHelp(writer: anytype) !void {
         \\    pull <image>                     Pull an image from a registry
         \\    images                           List cached images
         \\    prune                            Remove all stopped containers and unused images
+        \\    update                           Update isolazi to the latest version
         \\    version                          Print version information
         \\    help                             Print this help message
         \\
