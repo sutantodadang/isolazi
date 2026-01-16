@@ -484,7 +484,10 @@ pub const ContainerManager = struct {
             }
             // Also call pkill in VM to be sure
             const macos = @import("../macos/virtualization.zig");
-            _ = macos.stopInLima(self.allocator, container_id) catch {};
+            macos.stopInLima(self.allocator, container_id) catch {};
+
+            // Refresh Lima port forwarding to release host port bindings
+            macos.refreshLimaPortForwarding(self.allocator);
         } else {
             // On Linux, use kill syscall
             if (info.pid) |pid| {

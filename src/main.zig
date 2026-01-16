@@ -129,6 +129,9 @@ const runOnWindows = if (builtin.os.tag == .windows) struct {
             if (std.mem.eql(u8, cmd, "logs")) {
                 return logsContainerWindows(allocator, args, stdout, stderr);
             }
+            if (std.mem.eql(u8, cmd, "update")) {
+                return updateIsolazi(allocator, stdout, stderr);
+            }
         }
 
         // Check if WSL is available (only needed for 'run' command)
@@ -2389,6 +2392,9 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
             if (std.mem.eql(u8, cmd, "vm")) {
                 return vmCommandMacOS(allocator, args, stdout, stderr);
             }
+            if (std.mem.eql(u8, cmd, "update")) {
+                return updateIsolazi(allocator, stdout, stderr);
+            }
         }
 
         // No command or unknown command - show help
@@ -3757,6 +3763,11 @@ const runOnLinux = if (builtin.os.tag == .linux) struct {
         stdout: anytype,
         stderr: anytype,
     ) !u8 {
+        // Handle update command specially (not part of CLI parser)
+        if (args.len >= 2 and std.mem.eql(u8, args[1], "update")) {
+            return updateIsolazi(allocator, stdout, stderr);
+        }
+
         // Parse CLI arguments
         const command = isolazi.cli.parse(args) catch |err| {
             try isolazi.cli.printError(stderr, err);
@@ -4319,6 +4330,70 @@ const runOnLinux = if (builtin.os.tag == .linux) struct {
         return 1;
     }
 }.call;
+
+/// Update isolazi to the latest version by running the install script
+fn updateIsolazi(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype) !u8 {
+    try stdout.writeAll("Updating isolazi to the latest version...\n");
+    try stdout.flush();
+
+    if (builtin.os.tag == .windows) {
+        // On Windows, use PowerShell to download and run install.ps1
+        try stdout.writeAll("Running PowerShell install script...\n");
+        try stdout.flush();
+
+        var child = std.process.Child.init(&[_][]const u8{
+            "powershell",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "& { iwr -useb https://raw.githubusercontent.com/sutantodadang/isolazi/main/install.ps1 | iex }",
+        }, allocator);
+
+        child.stdin_behavior = .Inherit;
+        child.stdout_behavior = .Inherit;
+        child.stderr_behavior = .Inherit;
+
+        try child.spawn();
+        const term = try child.wait();
+        return switch (term) {
+            .Exited => |code| code,
+            else => 1,
+        };
+    } else {
+        // On Unix (macOS/Linux), use curl to download and run install.sh
+        try stdout.writeAll("Downloading and running install script...\n");
+        try stdout.flush();
+
+        var child = std.process.Child.init(&[_][]const u8{
+            "bash",
+            "-c",
+            "curl -fsSL https://raw.githubusercontent.com/sutantodadang/isolazi/main/install.sh | bash",
+        }, allocator);
+
+        child.stdin_behavior = .Inherit;
+        child.stdout_behavior = .Inherit;
+        child.stderr_behavior = .Inherit;
+
+        try child.spawn();
+        const term = try child.wait();
+
+        const exit_code: u8 = switch (term) {
+            .Exited => |code| code,
+            .Signal => |sig| @truncate(128 +% sig),
+            else => 1,
+        };
+
+        if (exit_code == 0) {
+            try stdout.writeAll("\nUpdate complete! Please restart your terminal or run: source ~/.zshrc\n");
+            try stdout.flush();
+        } else {
+            try stderr.writeAll("Update failed. Please try again or install manually.\n");
+            try stderr.flush();
+        }
+
+        return exit_code;
+    }
+}
 
 test "main imports compile" {
     // Just verify that the imports compile correctly

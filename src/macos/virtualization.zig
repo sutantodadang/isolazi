@@ -864,6 +864,22 @@ pub fn stopInLima(allocator: std.mem.Allocator, container_id: []const u8) !void 
     }) catch {};
 }
 
+/// Refresh Lima port forwarding by signaling the host agent to re-scan ports.
+/// This is called after stopping a container to ensure port bindings are released.
+pub fn refreshLimaPortForwarding(allocator: std.mem.Allocator) void {
+    // Send SIGHUP to Lima's hostagent to trigger port forwarding refresh
+    _ = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &[_][]const u8{ "pkill", "-HUP", "-f", "limactl.*hostagent.*isolazi" },
+    }) catch {};
+
+    // Also try to signal the ssh tunnel process that handles port forwarding
+    _ = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &[_][]const u8{ "pkill", "-HUP", "-f", "ssh.*lima.*isolazi" },
+    }) catch {};
+}
+
 /// Check if a specific container is running inside the Lima VM
 pub fn isContainerAliveInLima(allocator: std.mem.Allocator, container_id: []const u8) !bool {
     const tag_match = try std.fmt.allocPrint(allocator, "ISOLAZI_ID=[{c}]{s}", .{ container_id[0], container_id[1..] });
