@@ -2797,6 +2797,12 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
 
         // For postgres, auto-set PGDATA if not provided
         var has_pgdata = false;
+        // Track dynamically allocated env values to free later
+        var dynamic_env_values: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (dynamic_env_values.items) |v| allocator.free(v);
+            dynamic_env_values.deinit(allocator);
+        }
         for (opts.env_vars) |e| {
             if (std.mem.eql(u8, e.key, "PGDATA")) has_pgdata = true;
             try env_pairs.append(allocator, .{ .key = e.key, .value = e.value });
@@ -2806,7 +2812,7 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
             for (opts.volumes) |vol| {
                 if (std.mem.startsWith(u8, vol.container_path, "/var/lib/postgresql")) {
                     const pgdata = try std.fmt.allocPrint(allocator, "{s}/data", .{vol.container_path});
-                    defer allocator.free(pgdata);
+                    try dynamic_env_values.append(allocator, pgdata); // Track for cleanup later
                     try env_pairs.append(allocator, .{ .key = "PGDATA", .value = pgdata });
                     has_pgdata = true;
                     break;
@@ -2817,11 +2823,32 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
             }
         }
 
-        // Convert volumes to virtualization format
+        // Convert volumes to virtualization format, expanding ~ to $HOME
         var vol_pairs: std.ArrayList(isolazi.macos.virtualization.VolumePair) = .empty;
         defer vol_pairs.deinit(allocator);
+        // Track allocations for expanded paths
+        var expanded_paths: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (expanded_paths.items) |p| allocator.free(p);
+            expanded_paths.deinit(allocator);
+        }
         for (opts.volumes) |v| {
-            try vol_pairs.append(allocator, .{ .host_path = v.host_path, .container_path = v.container_path });
+            const host_path = blk: {
+                if (std.mem.startsWith(u8, v.host_path, "~/")) {
+                    const home = std.posix.getenv("HOME") orelse "/tmp";
+                    const expanded = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, v.host_path[2..] });
+                    try expanded_paths.append(allocator, expanded);
+                    break :blk expanded;
+                } else if (std.mem.eql(u8, v.host_path, "~")) {
+                    const home = std.posix.getenv("HOME") orelse "/tmp";
+                    const expanded = try allocator.dupe(u8, home);
+                    try expanded_paths.append(allocator, expanded);
+                    break :blk expanded;
+                } else {
+                    break :blk v.host_path;
+                }
+            };
+            try vol_pairs.append(allocator, .{ .host_path = host_path, .container_path = v.container_path });
         }
 
         // Convert port mappings to virtualization format
