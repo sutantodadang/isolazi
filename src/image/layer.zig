@@ -150,10 +150,13 @@ fn processWhiteouts(allocator: std.mem.Allocator, target_dir: []const u8) !void 
             // Opaque whiteout: remove all files in this directory from previous layers
             // For now, just remove the marker
             if (builtin.os.tag == .windows) {
-                _ = std.process.Child.run(.{
+                if (std.process.Child.run(.{
                     .allocator = allocator,
                     .argv = &[_][]const u8{ "wsl", "-u", "root", "--", "rm", "-f", path },
-                }) catch {};
+                })) |res| {
+                    allocator.free(res.stdout);
+                    allocator.free(res.stderr);
+                } else |_| {}
             } else {
                 std.fs.deleteFileAbsolute(path) catch {};
             }
@@ -165,15 +168,21 @@ fn processWhiteouts(allocator: std.mem.Allocator, target_dir: []const u8) !void 
 
             // Recursively delete the masked file or directory
             if (builtin.os.tag == .windows) {
-                _ = std.process.Child.run(.{
+                if (std.process.Child.run(.{
                     .allocator = allocator,
                     .argv = &[_][]const u8{ "wsl", "-u", "root", "--", "rm", "-rf", masked_path },
-                }) catch {};
+                })) |res| {
+                    allocator.free(res.stdout);
+                    allocator.free(res.stderr);
+                } else |_| {}
                 // Also remove the whiteout marker itself via WSL
-                _ = std.process.Child.run(.{
+                if (std.process.Child.run(.{
                     .allocator = allocator,
                     .argv = &[_][]const u8{ "wsl", "-u", "root", "--", "rm", "-f", path },
-                }) catch {};
+                })) |res| {
+                    allocator.free(res.stdout);
+                    allocator.free(res.stderr);
+                } else |_| {}
             } else {
                 const result_rm = std.process.Child.run(.{
                     .allocator = allocator,

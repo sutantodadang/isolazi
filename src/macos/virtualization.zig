@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const config_mod = @import("../config/config.zig");
 
 pub const VirtualizationError = error{
     VirtualizationNotAvailable,
@@ -211,10 +212,11 @@ pub fn runWithLima(
     port_mappings: []const PortMapping,
     rootless: bool,
     detach: bool,
+    restart_policy: config_mod.Config.RestartPolicy,
     stdout_path: ?[]const u8,
     stderr_path: ?[]const u8,
 ) !RunResult {
-    return runWithLimaEx(allocator, "", rootfs_path, command, env_vars, volumes, port_mappings, rootless, detach, null, stdout_path, stderr_path);
+    return runWithLimaEx(allocator, "", rootfs_path, command, env_vars, volumes, port_mappings, rootless, detach, restart_policy, null, stdout_path, stderr_path);
 }
 
 /// Extended Lima runner with resource limits support
@@ -228,6 +230,7 @@ pub fn runWithLimaEx(
     port_mappings: []const PortMapping,
     rootless: bool,
     detach: bool,
+    restart_policy: config_mod.Config.RestartPolicy,
     resource_limits: ?*const ResourceLimitsConfig,
     stdout_path: ?[]const u8,
     stderr_path: ?[]const u8,
@@ -239,8 +242,9 @@ pub fn runWithLimaEx(
         .NotExists => {
             // Create and start the VM
             _ = try createLimaInstance(allocator);
-            return runWithLimaEx(allocator, "", rootfs_path, command, env_vars, volumes, port_mappings, rootless, detach, resource_limits, stdout_path, stderr_path);
+            return runWithLimaEx(allocator, "", rootfs_path, command, env_vars, volumes, port_mappings, rootless, detach, restart_policy, resource_limits, stdout_path, stderr_path);
         },
+
         .Stopped, .Unknown => {
             // VM exists but stopped (or unknown), try to start it
             const start_result = std.process.Child.run(.{
@@ -302,9 +306,12 @@ pub fn runWithLimaEx(
     }
 
     // Build a shell script to handle bind mounts for volumes and tagging
+    var script_content_str: []const u8 = "";
+
     if (volumes.len > 0) {
-        try lima_args.append(allocator, "sh");
-        try lima_args.append(allocator, "-c");
+
+        // We accumulate the script logic into a file now, so we don't need inline sh -c here.
+        // The script file will be executed later.
 
         // Build script that creates bind mounts then runs chroot
         var script: std.ArrayList(u8) = .empty;
@@ -416,14 +423,22 @@ pub fn runWithLimaEx(
 
         const script_str = try allocator.dupe(u8, script.items);
         try dynamic_allocs.append(allocator, script_str);
-        try lima_args.append(allocator, script_str);
+        script_content_str = script_str;
+
+        // Script content generated, but we will write it to a file instead of passing arg
     } else {
         // Use script approach for essential mounts even without volumes/ports
-        try lima_args.append(allocator, "sh");
-        try lima_args.append(allocator, "-c");
+        // try lima_args.append(allocator, "sh");
+        // try lima_args.append(allocator, "-c");
 
         var script: std.ArrayList(u8) = .empty;
+
         defer script.deinit(allocator);
+
+        // Put the tag at the very beginning as a shell comment so it's visible in ps output
+        try script.appendSlice(allocator, "# ISOLAZI_ID=");
+        try script.appendSlice(allocator, parent_dir);
+        try script.appendSlice(allocator, "\n");
 
         // Mount essential filesystems
         try script.appendSlice(allocator, "mkdir -p ");
@@ -516,7 +531,107 @@ pub fn runWithLimaEx(
 
         const script_str = try allocator.dupe(u8, script.items);
         try dynamic_allocs.append(allocator, script_str);
-        try lima_args.append(allocator, script_str);
+        script_content_str = script_str;
+        // Generated script content
+    }
+
+    // Determine container directory and run.sh path
+
+    // rootfs_path is .../<id>/rootfs, so parent is container dir
+    const container_dir = std.fs.path.dirname(rootfs_path) orelse return VirtualizationError.ConfigurationInvalid;
+    const run_script_path = try std.fmt.allocPrint(allocator, "{s}/run.sh", .{container_dir});
+    try dynamic_allocs.append(allocator, run_script_path);
+
+    // Get the script content that was just generated (it's the last added dynamic alloc)
+    // Note: We need to handle the case where "else" block above ran or "if" block ran.
+    // In both cases we appended script_str to dynamic_allocs.
+    // Actually, we modified the code above to NOT append to lima_args yet, just dynamic_allocs.
+    // But wait, the previous code structure had `script` variable scope limited to the blocks.
+    // I need to extract the script generation to a common variable or write it inside the blocks.
+
+    // RE-PLAN: The tool replacement above was a bit messy with scopes.
+    // Let's assume the previous `script_str` is accessible or handle it properly.
+    // The previous chunks show I commented out appending to `lima_args`.
+    // But `script` was deinitialized at end of block. `script_str` was duplicated.
+    // So `dynamic_allocs.items[dynamic_allocs.items.len - 1]` should be the script content.
+
+    // const script_content = dynamic_allocs.items[dynamic_allocs.items.len - 1];
+
+    // Write script to file
+    const run_file = try std.fs.cwd().createFile(run_script_path, .{ .mode = 0o755 });
+    defer run_file.close();
+    try run_file.writeAll(script_content_str);
+
+    // Now construct the execution command based on restart policy
+    if (restart_policy == .no) {
+        try lima_args.append(allocator, "sh");
+        try lima_args.append(allocator, run_script_path);
+    } else {
+        // Use systemd-run
+        try lima_args.append(allocator, "systemd-run");
+
+        // Unit name: isolazi-<id>
+        const unit_name = try std.fmt.allocPrint(allocator, "isolazi-{s}", .{parent_dir});
+        try dynamic_allocs.append(allocator, unit_name);
+        try lima_args.append(allocator, try std.fmt.allocPrint(allocator, "--unit={s}", .{unit_name}));
+        try dynamic_allocs.append(allocator, lima_args.items[lima_args.items.len - 1]);
+
+        try lima_args.append(allocator, "--service-type=simple");
+
+        // Restart policy
+        // systemd-run uses --property=Restart=... for transient units
+        // Mapping:
+        // no -> no
+        // always -> always
+        // on-failure -> on-failure
+        // unless-stopped -> always (systemd doesn't have unless-stopped, but strict always behaves similarly for units)
+        const policy_str = switch (restart_policy) {
+            .no => "no",
+            .always => "always",
+            .on_failure => "on-failure",
+            .unless_stopped => "always",
+        };
+        try lima_args.append(allocator, try std.fmt.allocPrint(allocator, "--property=Restart={s}", .{policy_str}));
+        try dynamic_allocs.append(allocator, lima_args.items[lima_args.items.len - 1]);
+
+        // Default TasksMax might be too low for some containers/distros
+        try lima_args.append(allocator, "--property=TasksMax=infinity");
+        try lima_args.append(allocator, "--property=Delegate=yes");
+        try lima_args.append(allocator, "--property=LimitNOFILE=infinity");
+        try lima_args.append(allocator, "--property=LimitNPROC=infinity");
+
+        // Working directory (rootfs? or container dir?)
+        // Let's use container dir so we can find things if needed
+        try lima_args.append(allocator, try std.fmt.allocPrint(allocator, "--working-directory={s}", .{container_dir}));
+        try dynamic_allocs.append(allocator, lima_args.items[lima_args.items.len - 1]);
+
+        // Logs: Use strict file path for output logging.
+        // systemd-run doesn't support -p StandardOutput=file:... easily with appending,
+        // but StandardOutput=append:/path works in recent systemd.
+        // Lima usually runs recent Ubuntu (24.04), so it should work.
+        // We need to ensure the path is correct. stdout_path passed here is relative or absolute on host.
+        // Lima mounts home, so if log path is in home, it works.
+        // However, stdout_path is optional.
+
+        if (stdout_path) |path| {
+            try lima_args.append(allocator, try std.fmt.allocPrint(allocator, "--property=StandardOutput=append:{s}", .{path}));
+            try dynamic_allocs.append(allocator, lima_args.items[lima_args.items.len - 1]);
+        }
+
+        if (stderr_path) |path| {
+            try lima_args.append(allocator, try std.fmt.allocPrint(allocator, "--property=StandardError=append:{s}", .{path}));
+            try dynamic_allocs.append(allocator, lima_args.items[lima_args.items.len - 1]);
+        }
+
+        // Collect logs/status
+        // Note: With StandardOutput=file, --collect might not be strict requirement for logs,
+        // but it helps keep the unit loaded for status check.
+        try lima_args.append(allocator, "--collect");
+
+        // The command to run
+        try lima_args.append(allocator, "--");
+        try lima_args.append(allocator, "sh");
+        try lima_args.append(allocator, run_script_path);
     }
 
     // Execute via Lima
@@ -603,7 +718,8 @@ fn createLimaInstance(allocator: std.mem.Allocator) !void {
         \\  system: false
         \\  user: false
         \\portForwards:
-        \\  - guestPortRange: [1, 65535]
+        \\  - guestIP: "0.0.0.0"
+        \\    guestPortRange: [1, 65535]
         \\    hostIP: "127.0.0.1"
     ;
 
@@ -653,42 +769,95 @@ fn createLimaInstance(allocator: std.mem.Allocator) !void {
     }
 }
 
-/// Stop a specific container running inside the Lima VM
 pub fn stopInLima(allocator: std.mem.Allocator, container_id: []const u8) !void {
-    const tag = try std.fmt.allocPrint(allocator, "ISOLAZI_ID={s}", .{container_id});
-    defer allocator.free(tag);
+    // 1. Try to stop systemd service first (if it exists)
+    // The unit name is isolazi-<id>
+    const systemctl_cmd = try std.fmt.allocPrint(allocator, "sudo systemctl stop isolazi-{s}", .{container_id});
+    defer allocator.free(systemctl_cmd);
 
-    // Try to SIGTERM first, then SIGKILL if needed
-    _ = std.process.Child.run(.{
+    const sc_res = std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &[_][]const u8{ "limactl", "shell", "isolazi", "sudo", "pkill", "-TERM", "-f", tag },
-    }) catch {};
+        .argv = &[_][]const u8{ "limactl", "shell", "isolazi", "sh", "-c", systemctl_cmd },
+    });
+    if (sc_res) |res| {
+        allocator.free(res.stdout);
+        allocator.free(res.stderr);
+    } else |_| {}
+
+    // 2. Fallback: Find PIDs via /proc/*/environ using find to avoid glob expansion issues
+    const find_cmd = try std.fmt.allocPrint(allocator, "sudo find /proc -maxdepth 2 -name environ -exec grep -l \"ISOLAZI_ID={s}\" {{}} + 2>/dev/null | cut -d/ -f3", .{container_id});
+    defer allocator.free(find_cmd);
+
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &[_][]const u8{ "limactl", "shell", "isolazi", "sh", "-c", find_cmd },
+    }) catch return;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    var it = std.mem.tokenizeAny(u8, result.stdout, " \t\r\n");
+    while (it.next()) |pid_str| {
+        const kill_res = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &[_][]const u8{ "limactl", "shell", "isolazi", "sudo", "kill", "-TERM", pid_str },
+        }) catch continue;
+        allocator.free(kill_res.stdout);
+        allocator.free(kill_res.stderr);
+    }
 }
 
 /// Refresh Lima port forwarding by signaling the host agent to re-scan ports.
 /// This is called after stopping a container to ensure port bindings are released.
 pub fn refreshLimaPortForwarding(allocator: std.mem.Allocator) void {
     // Send SIGHUP to Lima's hostagent to trigger port forwarding refresh
-    _ = std.process.Child.run(.{
+    if (std.process.Child.run(.{
         .allocator = allocator,
         .argv = &[_][]const u8{ "pkill", "-HUP", "-f", "limactl.*hostagent.*isolazi" },
-    }) catch {};
+    })) |res| {
+        allocator.free(res.stdout);
+        allocator.free(res.stderr);
+    } else |_| {}
 
     // Also try to signal the ssh tunnel process that handles port forwarding
-    _ = std.process.Child.run(.{
+    if (std.process.Child.run(.{
         .allocator = allocator,
         .argv = &[_][]const u8{ "pkill", "-HUP", "-f", "ssh.*lima.*isolazi" },
-    }) catch {};
+    })) |res| {
+        allocator.free(res.stdout);
+        allocator.free(res.stderr);
+    } else |_| {}
 }
 
-/// Check if a specific container is running inside the Lima VM
 pub fn isContainerAliveInLima(allocator: std.mem.Allocator, container_id: []const u8) !bool {
-    const tag_match = try std.fmt.allocPrint(allocator, "ISOLAZI_ID=[{c}]{s}", .{ container_id[0], container_id[1..] });
-    defer allocator.free(tag_match);
+    // First check if Lima is actually running
+    if (!isLimaRunning(allocator)) return false;
+
+    // 1. Check systemd status first
+    const systemctl_cmd = try std.fmt.allocPrint(allocator, "sudo systemctl is-active isolazi-{s}", .{container_id});
+    defer allocator.free(systemctl_cmd);
+
+    const sc_res = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &[_][]const u8{ "limactl", "shell", "isolazi", "sh", "-c", systemctl_cmd },
+    }) catch {
+        // Fallthrough on error
+        return false;
+    };
+    defer allocator.free(sc_res.stdout);
+    defer allocator.free(sc_res.stderr);
+
+    const status = std.mem.trim(u8, sc_res.stdout, " \t\r\n");
+    if (std.mem.eql(u8, status, "active") or std.mem.eql(u8, status, "activating")) {
+        return true;
+    }
+
+    // 2. Fallback: Search /proc/*/environ for the tag using find
+    const grep_cmd = try std.fmt.allocPrint(allocator, "sudo find /proc -maxdepth 2 -name environ -exec grep -q \"ISOLAZI_ID={s}\" {{}} + 2>/dev/null", .{container_id});
+    defer allocator.free(grep_cmd);
 
     const result = std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &[_][]const u8{ "limactl", "shell", "isolazi", "sudo", "pgrep", "-f", tag_match },
+        .argv = &[_][]const u8{ "limactl", "shell", "isolazi", "sh", "-c", grep_cmd },
     }) catch return false;
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
