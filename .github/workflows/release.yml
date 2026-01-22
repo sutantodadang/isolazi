@@ -24,10 +24,6 @@ jobs:
             platform: linux
             arch: aarch64
             zig_target: aarch64-linux
-          - os: macos-13
-            platform: macos
-            arch: x86_64
-            zig_target: x86_64-macos
           - os: macos-latest
             platform: macos
             arch: aarch64

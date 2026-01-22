@@ -1299,7 +1299,7 @@ fn runContainerWindows(
         cmd_str_len += copy_len;
     }
 
-    _ = manager.createContainerWithId(&container_id, image_name, cmd_str_buf[0..cmd_str_len], null) catch |err| {
+    _ = manager.createContainerWithId(&container_id, image_name, cmd_str_buf[0..cmd_str_len], null, .no) catch |err| {
         try stderr.print("Warning: Failed to register container: {}\n", .{err});
     };
 
@@ -1499,7 +1499,7 @@ fn createContainerWindows(
     };
     defer manager.deinit();
 
-    const container_id = manager.createContainer(image_name, command_buf[0..command_len], name) catch |err| {
+    const container_id = manager.createContainer(image_name, command_buf[0..command_len], name, .no) catch |err| {
         try stderr.print("Error: Failed to create container: {}\n", .{err});
         try stderr.flush();
         return 1;
@@ -4238,7 +4238,7 @@ const runOnLinux = if (builtin.os.tag == .linux) struct {
         @memcpy(cmd_display[0..cmd_len], run_cmd.command[0..cmd_len]);
 
         // Register container and update to running
-        _ = manager.createContainerWithId(&cid_buf, run_cmd.rootfs, cmd_display[0..cmd_len], null) catch {};
+        _ = manager.createContainerWithId(&cid_buf, run_cmd.rootfs, cmd_display[0..cmd_len], null, .no) catch {};
         manager.updateState(&cid_buf, .running, null, null) catch {};
 
         const result = isolazi.runtime.run(&cfg, allocator, &cid_buf_short) catch |err| {
