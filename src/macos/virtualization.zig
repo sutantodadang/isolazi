@@ -404,8 +404,7 @@ pub fn runWithLima(
     stdout_path: ?[]const u8,
     stderr_path: ?[]const u8,
 ) !RunResult {
-    return runWithLimaEx(allocator, "", rootfs_path, command, env_vars, volumes, port_mappings, rootless, detach, restart_policy, null, stdout_path, stderr_path);
-    return runWithLimaEx(allocator, "", rootfs_path, command, env_vars, volumes, port_mappings, rootless, detach, null, null, stdout_path, stderr_path);
+    return runWithLimaEx(allocator, "", rootfs_path, command, env_vars, volumes, port_mappings, rootless, detach, restart_policy, null, null, stdout_path, stderr_path);
 }
 
 /// Extended Lima runner with resource limits and LSM support
@@ -432,8 +431,7 @@ pub fn runWithLimaEx(
         .NotExists => {
             // Create and start the VM
             _ = try createLimaInstance(allocator);
-            return runWithLimaEx(allocator, "", rootfs_path, command, env_vars, volumes, port_mappings, rootless, detach, restart_policy, resource_limits, stdout_path, stderr_path);
-            return runWithLimaEx(allocator, "", rootfs_path, command, env_vars, volumes, port_mappings, rootless, detach, resource_limits, lsm_config, stdout_path, stderr_path);
+            return runWithLimaEx(allocator, "", rootfs_path, command, env_vars, volumes, port_mappings, rootless, detach, restart_policy, resource_limits, lsm_config, stdout_path, stderr_path);
         },
 
         .Stopped, .Unknown => {
@@ -496,272 +494,128 @@ pub fn runWithLimaEx(
         try lima_args.append(allocator, env_str);
     }
 
-    // Build a shell script to handle bind mounts for volumes and tagging
-    var script_content_str: []const u8 = "";
+    // Build a shell script that handles all setup and runs the container command
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(allocator);
 
-    if (volumes.len > 0) {
+    // Put the tag at the very beginning to be visible in ps output
+    try script.appendSlice(allocator, "# ISOLAZI_ID=");
+    try script.appendSlice(allocator, parent_dir);
+    try script.appendSlice(allocator, "\n");
 
-        // We accumulate the script logic into a file now, so we don't need inline sh -c here.
-        // The script file will be executed later.
+    // Mount essential filesystems
+    try script.appendSlice(allocator, "mkdir -p ");
+    try script.appendSlice(allocator, rootfs_path);
+    try script.appendSlice(allocator, "/proc ");
+    try script.appendSlice(allocator, rootfs_path);
+    try script.appendSlice(allocator, "/sys ");
+    try script.appendSlice(allocator, rootfs_path);
+    try script.appendSlice(allocator, "/dev && ");
 
-        // Build script that creates bind mounts then runs chroot
-        var script: std.ArrayList(u8) = .empty;
-        defer script.deinit(allocator);
+    try script.appendSlice(allocator, "mount -t proc proc ");
+    try script.appendSlice(allocator, rootfs_path);
+    try script.appendSlice(allocator, "/proc && ");
 
-        // Put the tag at the very beginning as a shell comment so it's visible in ps output
-        try script.appendSlice(allocator, "# ISOLAZI_ID=");
-        try script.appendSlice(allocator, parent_dir);
-        try script.appendSlice(allocator, "\n");
+    try script.appendSlice(allocator, "mount -t sysfs sysfs ");
+    try script.appendSlice(allocator, rootfs_path);
+    try script.appendSlice(allocator, "/sys && ");
 
-        // Create bind mounts for each volume and essential filesystems
+    try script.appendSlice(allocator, "mount --bind /dev ");
+    try script.appendSlice(allocator, rootfs_path);
+    try script.appendSlice(allocator, "/dev && ");
+
+    try script.appendSlice(allocator, "mkdir -p ");
+    try script.appendSlice(allocator, rootfs_path);
+    try script.appendSlice(allocator, "/run ");
+    try script.appendSlice(allocator, rootfs_path);
+    try script.appendSlice(allocator, "/tmp && ");
+
+    try script.appendSlice(allocator, "mount -t tmpfs tmpfs ");
+    try script.appendSlice(allocator, rootfs_path);
+    try script.appendSlice(allocator, "/run && ");
+
+    try script.appendSlice(allocator, "mount -t tmpfs tmpfs ");
+    try script.appendSlice(allocator, rootfs_path);
+    try script.appendSlice(allocator, "/tmp && ");
+
+    // Handle volume mounts
+    for (volumes) |vol| {
         try script.appendSlice(allocator, "mkdir -p ");
         try script.appendSlice(allocator, rootfs_path);
-        try script.appendSlice(allocator, "/proc ");
+        try script.appendSlice(allocator, vol.container_path);
+        try script.appendSlice(allocator, " && mount --bind ");
+        try script.appendSlice(allocator, vol.host_path);
+        try script.append(allocator, ' ');
         try script.appendSlice(allocator, rootfs_path);
-        try script.appendSlice(allocator, "/sys ");
-        try script.appendSlice(allocator, rootfs_path);
-        try script.appendSlice(allocator, "/dev && ");
+        try script.appendSlice(allocator, vol.container_path);
+        try script.appendSlice(allocator, " && ");
+    }
 
-        try script.appendSlice(allocator, "mount -t proc proc ");
-        try script.appendSlice(allocator, rootfs_path);
-        try script.appendSlice(allocator, "/proc && ");
+    // Set up port forwarding using iptables DNAT (for when host_port != container_port)
+    for (port_mappings) |port| {
+        if (port.host_port == port.container_port) continue;
+        const proto_str = if (port.protocol == .udp) "udp" else "tcp";
+        var host_port_buf: [8]u8 = undefined;
+        const host_port_str = std.fmt.bufPrint(&host_port_buf, "{d}", .{port.host_port}) catch "0";
+        var cont_port_buf: [8]u8 = undefined;
+        const cont_port_str = std.fmt.bufPrint(&cont_port_buf, "{d}", .{port.container_port}) catch "0";
 
-        try script.appendSlice(allocator, "mount -t sysfs sysfs ");
-        try script.appendSlice(allocator, rootfs_path);
-        try script.appendSlice(allocator, "/sys && ");
+        // PREROUTING rule for incoming traffic
+        try script.appendSlice(allocator, "iptables -t nat -A PREROUTING -p ");
+        try script.appendSlice(allocator, proto_str);
+        try script.appendSlice(allocator, " --dport ");
+        try script.appendSlice(allocator, host_port_str);
+        try script.appendSlice(allocator, " -j REDIRECT --to-port ");
+        try script.appendSlice(allocator, cont_port_str);
+        try script.appendSlice(allocator, " 2>/dev/null; ");
 
-        try script.appendSlice(allocator, "mount --bind /dev ");
-        try script.appendSlice(allocator, rootfs_path);
-        try script.appendSlice(allocator, "/dev && ");
+        // OUTPUT rule for localhost traffic
+        try script.appendSlice(allocator, "iptables -t nat -A OUTPUT -p ");
+        try script.appendSlice(allocator, proto_str);
+        try script.appendSlice(allocator, " --dport ");
+        try script.appendSlice(allocator, host_port_str);
+        try script.appendSlice(allocator, " -j REDIRECT --to-port ");
+        try script.appendSlice(allocator, cont_port_str);
+        try script.appendSlice(allocator, " 2>/dev/null; ");
+    }
 
-        try script.appendSlice(allocator, "mkdir -p ");
-        try script.appendSlice(allocator, rootfs_path);
-        try script.appendSlice(allocator, "/run ");
-        try script.appendSlice(allocator, rootfs_path);
-        try script.appendSlice(allocator, "/tmp && ");
+    // Add LSM configuration setup
+    if (lsm_config) |lsm| {
+        try lsm.toShellScript(&script, allocator);
+    }
 
-        try script.appendSlice(allocator, "mount -t tmpfs tmpfs ");
-        try script.appendSlice(allocator, rootfs_path);
-        try script.appendSlice(allocator, "/run && ");
+    // Add unshare and chroot command
+    try script.appendSlice(allocator, "unshare --mount --uts --ipc --pid --fork --mount-proc");
+    if (rootless) {
+        try script.appendSlice(allocator, " --user --map-root-user");
+    }
+    try script.appendSlice(allocator, " chroot ");
+    try script.appendSlice(allocator, rootfs_path);
+    try script.appendSlice(allocator, " /usr/bin/env PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/lib/postgresql/17/bin:/usr/lib/postgresql/16/bin:/usr/lib/postgresql/15/bin:/opt/rabbitmq/sbin:/usr/lib/rabbitmq/bin:/opt/erlang/bin ");
 
-        try script.appendSlice(allocator, "mount -t tmpfs tmpfs ");
-        try script.appendSlice(allocator, rootfs_path);
-        try script.appendSlice(allocator, "/tmp && ");
+    // Add env vars
+    for (env_vars) |env| {
+        try script.appendSlice(allocator, env.key);
+        try script.append(allocator, '=');
+        try script.appendSlice(allocator, env.value);
+        try script.append(allocator, ' ');
+    }
 
-        for (volumes) |vol| {
-            try script.appendSlice(allocator, "mkdir -p ");
-            try script.appendSlice(allocator, rootfs_path);
-            try script.appendSlice(allocator, vol.container_path);
-            try script.appendSlice(allocator, " && mount --bind ");
-            try script.appendSlice(allocator, vol.host_path);
-            try script.append(allocator, ' ');
-            try script.appendSlice(allocator, rootfs_path);
-            try script.appendSlice(allocator, vol.container_path);
-            try script.appendSlice(allocator, " && ");
-        }
-
-        // Set up port forwarding using iptables DNAT (for when host_port != container_port)
-        // Lima handles automatic port forwarding for same-port mappings
-        for (port_mappings) |port| {
-            if (port.host_port == port.container_port) continue;
-            const proto_str = if (port.protocol == .udp) "udp" else "tcp";
-            var host_port_buf: [8]u8 = undefined;
-            const host_port_str = std.fmt.bufPrint(&host_port_buf, "{d}", .{port.host_port}) catch "0";
-            var cont_port_buf: [8]u8 = undefined;
-            const cont_port_str = std.fmt.bufPrint(&cont_port_buf, "{d}", .{port.container_port}) catch "0";
-
-            // PREROUTING rule for incoming traffic
-            try script.appendSlice(allocator, "iptables -t nat -A PREROUTING -p ");
-            try script.appendSlice(allocator, proto_str);
-            try script.appendSlice(allocator, " --dport ");
-            try script.appendSlice(allocator, host_port_str);
-            try script.appendSlice(allocator, " -j REDIRECT --to-port ");
-            try script.appendSlice(allocator, cont_port_str);
-            try script.appendSlice(allocator, " 2>/dev/null; ");
-
-            // OUTPUT rule for localhost traffic (important for Lima port forwarding)
-            try script.appendSlice(allocator, "iptables -t nat -A OUTPUT -p ");
-            try script.appendSlice(allocator, proto_str);
-            try script.appendSlice(allocator, " --dport ");
-            try script.appendSlice(allocator, host_port_str);
-            try script.appendSlice(allocator, " -j REDIRECT --to-port ");
-            try script.appendSlice(allocator, cont_port_str);
-            try script.appendSlice(allocator, " 2>/dev/null; ");
-        }
-
-        // Add LSM configuration setup (AppArmor/SELinux shell prefixes)
-        if (lsm_config) |lsm| {
-            try lsm.toShellScript(&script, allocator);
-        }
-
-        // Add the unshare and chroot command with clean environment inside container
-        try script.appendSlice(allocator, "unshare --mount --uts --ipc --pid --fork --mount-proc");
-        if (rootless) {
-            try script.appendSlice(allocator, " --user --map-root-user");
-        }
-        try script.appendSlice(allocator, " chroot ");
-        try script.appendSlice(allocator, rootfs_path);
-        try script.appendSlice(allocator, " /usr/bin/env PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/lib/postgresql/17/bin:/usr/lib/postgresql/16/bin:/usr/lib/postgresql/15/bin:/opt/rabbitmq/sbin:/usr/lib/rabbitmq/bin:/opt/erlang/bin ");
-
-        // Add user env vars inside container
-        for (env_vars) |env| {
-            try script.appendSlice(allocator, env.key);
-            try script.append(allocator, '=');
-            try script.appendSlice(allocator, env.value);
-            try script.append(allocator, ' ');
-        }
-
-        // Add the command
-        for (command) |arg| {
-            try script.appendSlice(allocator, arg);
-            try script.append(allocator, ' ');
-        }
-
-        const script_str = try allocator.dupe(u8, script.items);
-        try dynamic_allocs.append(allocator, script_str);
-        script_content_str = script_str;
-
-        // Script content generated, but we will write it to a file instead of passing arg
-    } else {
-        // Use script approach for essential mounts even without volumes/ports
-        // try lima_args.append(allocator, "sh");
-        // try lima_args.append(allocator, "-c");
-
-        var script: std.ArrayList(u8) = .empty;
-
-        defer script.deinit(allocator);
-
-        // Put the tag at the very beginning as a shell comment so it's visible in ps output
-        try script.appendSlice(allocator, "# ISOLAZI_ID=");
-        try script.appendSlice(allocator, parent_dir);
-        try script.appendSlice(allocator, "\n");
-
-        // Mount essential filesystems
-        try script.appendSlice(allocator, "mkdir -p ");
-        try script.appendSlice(allocator, rootfs_path);
-        try script.appendSlice(allocator, "/proc ");
-        try script.appendSlice(allocator, rootfs_path);
-        try script.appendSlice(allocator, "/sys ");
-        try script.appendSlice(allocator, rootfs_path);
-        try script.appendSlice(allocator, "/dev && ");
-
-        try script.appendSlice(allocator, "mount -t proc proc ");
-        try script.appendSlice(allocator, rootfs_path);
-        try script.appendSlice(allocator, "/proc && ");
-
-        try script.appendSlice(allocator, "mount -t sysfs sysfs ");
-        try script.appendSlice(allocator, rootfs_path);
-        try script.appendSlice(allocator, "/sys && ");
-
-        try script.appendSlice(allocator, "mount --bind /dev ");
-        try script.appendSlice(allocator, rootfs_path);
-        try script.appendSlice(allocator, "/dev && ");
-
-        try script.appendSlice(allocator, "mkdir -p ");
-        try script.appendSlice(allocator, rootfs_path);
-        try script.appendSlice(allocator, "/run ");
-        try script.appendSlice(allocator, rootfs_path);
-        try script.appendSlice(allocator, "/tmp && ");
-
-        try script.appendSlice(allocator, "mount -t tmpfs tmpfs ");
-        try script.appendSlice(allocator, rootfs_path);
-        try script.appendSlice(allocator, "/run && ");
-
-        try script.appendSlice(allocator, "mount -t tmpfs tmpfs ");
-        try script.appendSlice(allocator, rootfs_path);
-        try script.appendSlice(allocator, "/tmp && ");
-
-        if (port_mappings.len > 0) {
-            // Set up port forwarding using iptables DNAT (for when host_port != container_port)
-            // Lima handles automatic port forwarding for same-port mappings
-            for (port_mappings) |port| {
-                if (port.host_port == port.container_port) continue;
-                const proto_str = if (port.protocol == .udp) "udp" else "tcp";
-                var host_port_buf: [8]u8 = undefined;
-                const host_port_str = std.fmt.bufPrint(&host_port_buf, "{d}", .{port.host_port}) catch "0";
-                var cont_port_buf: [8]u8 = undefined;
-                const cont_port_str = std.fmt.bufPrint(&cont_port_buf, "{d}", .{port.container_port}) catch "0";
-
-                // PREROUTING rule for incoming traffic
-                try script.appendSlice(allocator, "iptables -t nat -A PREROUTING -p ");
-                try script.appendSlice(allocator, proto_str);
-                try script.appendSlice(allocator, " --dport ");
-                try script.appendSlice(allocator, host_port_str);
-                try script.appendSlice(allocator, " -j REDIRECT --to-port ");
-                try script.appendSlice(allocator, cont_port_str);
-                try script.appendSlice(allocator, " 2>/dev/null; ");
-
-                // OUTPUT rule for localhost traffic (important for Lima port forwarding)
-                try script.appendSlice(allocator, "iptables -t nat -A OUTPUT -p ");
-                try script.appendSlice(allocator, proto_str);
-                try script.appendSlice(allocator, " --dport ");
-                try script.appendSlice(allocator, host_port_str);
-                try script.appendSlice(allocator, " -j REDIRECT --to-port ");
-                try script.appendSlice(allocator, cont_port_str);
-                try script.appendSlice(allocator, " 2>/dev/null; ");
-            }
-        }
-
-        // Add LSM configuration setup (AppArmor/SELinux shell prefixes)
-        if (lsm_config) |lsm| {
-            try lsm.toShellScript(&script, allocator);
-        }
-
-        // Add the unshare and chroot command with clean environment inside container
-        try script.appendSlice(allocator, "unshare --mount --uts --ipc --pid --fork --mount-proc");
-        if (rootless) {
-            try script.appendSlice(allocator, " --user --map-root-user");
-        }
-        try script.appendSlice(allocator, " chroot ");
-        try script.appendSlice(allocator, rootfs_path);
-        try script.appendSlice(allocator, " /usr/bin/env PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/lib/postgresql/17/bin:/usr/lib/postgresql/16/bin:/usr/lib/postgresql/15/bin:/opt/rabbitmq/sbin:/usr/lib/rabbitmq/bin:/opt/erlang/bin ");
-
-        // Add user env vars inside container
-        for (env_vars) |env| {
-            try script.appendSlice(allocator, env.key);
-            try script.append(allocator, '=');
-            try script.appendSlice(allocator, env.value);
-            try script.append(allocator, ' ');
-        }
-
-        // Add the command
-        for (command) |arg| {
-            try script.appendSlice(allocator, arg);
-            try script.append(allocator, ' ');
-        }
-
-        const script_str = try allocator.dupe(u8, script.items);
-        try dynamic_allocs.append(allocator, script_str);
-        script_content_str = script_str;
-        // Generated script content
+    // Add the command
+    for (command) |arg| {
+        try script.appendSlice(allocator, arg);
+        try script.append(allocator, ' ');
     }
 
     // Determine container directory and run.sh path
-
-    // rootfs_path is .../<id>/rootfs, so parent is container dir
     const container_dir = std.fs.path.dirname(rootfs_path) orelse return VirtualizationError.ConfigurationInvalid;
     const run_script_path = try std.fmt.allocPrint(allocator, "{s}/run.sh", .{container_dir});
     try dynamic_allocs.append(allocator, run_script_path);
 
-    // Get the script content that was just generated (it's the last added dynamic alloc)
-    // Note: We need to handle the case where "else" block above ran or "if" block ran.
-    // In both cases we appended script_str to dynamic_allocs.
-    // Actually, we modified the code above to NOT append to lima_args yet, just dynamic_allocs.
-    // But wait, the previous code structure had `script` variable scope limited to the blocks.
-    // I need to extract the script generation to a common variable or write it inside the blocks.
-
-    // RE-PLAN: The tool replacement above was a bit messy with scopes.
-    // Let's assume the previous `script_str` is accessible or handle it properly.
-    // The previous chunks show I commented out appending to `lima_args`.
-    // But `script` was deinitialized at end of block. `script_str` was duplicated.
-    // So `dynamic_allocs.items[dynamic_allocs.items.len - 1]` should be the script content.
-
-    // const script_content = dynamic_allocs.items[dynamic_allocs.items.len - 1];
-
     // Write script to file
     const run_file = try std.fs.cwd().createFile(run_script_path, .{ .mode = 0o755 });
     defer run_file.close();
-    try run_file.writeAll(script_content_str);
+    try run_file.writeAll(script.items);
 
     // Now construct the execution command based on restart policy
     if (restart_policy == .no) {
