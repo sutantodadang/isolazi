@@ -921,8 +921,36 @@ pub const Mount = struct {
 /// This struct contains all the information needed to create and run a container.
 /// It uses fixed-size buffers to avoid heap allocation.
 pub const Config = struct {
+    /// Restart policy for the container
+    pub const RestartPolicy = enum {
+        no,
+        always,
+        on_failure,
+        unless_stopped,
+
+        pub fn toString(self: RestartPolicy) []const u8 {
+            return switch (self) {
+                .no => "no",
+                .always => "always",
+                .on_failure => "on-failure",
+                .unless_stopped => "unless-stopped",
+            };
+        }
+
+        pub fn fromString(s: []const u8) ?RestartPolicy {
+            if (std.mem.eql(u8, s, "no")) return .no;
+            if (std.mem.eql(u8, s, "always")) return .always;
+            if (std.mem.eql(u8, s, "on-failure")) return .on_failure;
+            if (std.mem.eql(u8, s, "unless-stopped")) return .unless_stopped;
+            return null;
+        }
+    };
+
     /// Path to the root filesystem
     rootfs: [PATH_MAX:0]u8 = std.mem.zeroes([PATH_MAX:0]u8),
+
+    /// Restart policy
+    restart_policy: RestartPolicy = .no,
 
     /// Working directory inside the container
     cwd: [PATH_MAX:0]u8 = std.mem.zeroes([PATH_MAX:0]u8),

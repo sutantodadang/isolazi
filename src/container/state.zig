@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const config_mod = @import("../config/config.zig");
 
 /// Container state enum
 pub const ContainerState = enum {
@@ -43,6 +44,8 @@ pub const ContainerInfo = struct {
     pid: ?i32,
     exit_code: ?u8,
     name: ?[]const u8,
+
+    restart_policy: config_mod.Config.RestartPolicy = .no,
 
     allocator: std.mem.Allocator,
 
@@ -97,7 +100,9 @@ pub const ContainerManager = struct {
         image: []const u8,
         command: []const u8,
         name: ?[]const u8,
+        restart_policy: config_mod.Config.RestartPolicy,
     ) ![32]u8 {
+
         // Generate container ID
         var container_id: [32]u8 = undefined;
         var id_buf: [16]u8 = undefined;
@@ -132,7 +137,8 @@ pub const ContainerManager = struct {
             \\  "command": "{s}",
             \\  "state": "created",
             \\  "created_at": {d},
-            \\  "name": {s}
+            \\  "name": {s},
+            \\  "restart_policy": "{s}"
             \\}}
         , .{
             container_id,
@@ -140,6 +146,7 @@ pub const ContainerManager = struct {
             command,
             std.time.timestamp(),
             name_str,
+            restart_policy.toString(),
         });
 
         const file = try std.fs.cwd().createFile(state_path, .{});
@@ -156,7 +163,9 @@ pub const ContainerManager = struct {
         image: []const u8,
         command: []const u8,
         name: ?[]const u8,
+        restart_policy: config_mod.Config.RestartPolicy,
     ) !void {
+
         // Create container directory
         const container_dir = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.base_path, container_id });
         defer self.allocator.free(container_dir);
@@ -179,18 +188,18 @@ pub const ContainerManager = struct {
             \\  "id": "{s}",
             \\  "image": "{s}",
             \\  "command": "{s}",
-            \\  "state": "running",
+            \\  "state": "created",
             \\  "created_at": {d},
-            \\  "started_at": {d},
-            \\  "name": {s}
+            \\  "name": {s},
+            \\  "restart_policy": "{s}"
             \\}}
         , .{
             container_id,
             image,
             command,
             std.time.timestamp(),
-            std.time.timestamp(),
             name_str,
+            restart_policy.toString(),
         });
 
         const file = try std.fs.cwd().createFile(state_path, .{});
@@ -268,6 +277,8 @@ pub const ContainerManager = struct {
             }
         }
 
+        const restart_policy_str = if (root.get("restart_policy")) |rp| rp.string else "no";
+
         const json = try std.fmt.bufPrint(&json_buf,
             \\{{
             \\  "id": "{s}",
@@ -275,7 +286,8 @@ pub const ContainerManager = struct {
             \\  "command": "{s}",
             \\  "state": "{s}",
             \\  "created_at": {d},
-            \\  "name": {s}{s}{s}{s}
+            \\  "name": {s},
+            \\  "restart_policy": "{s}"{s}{s}{s}
             \\}}
         , .{
             id_str,
@@ -284,6 +296,7 @@ pub const ContainerManager = struct {
             state.toString(),
             created_at,
             name_str,
+            restart_policy_str,
             time_line,
             pid_line,
             exit_line,
@@ -322,35 +335,41 @@ pub const ContainerManager = struct {
         const image_val = root.get("image").?.string;
         const cmd_val = root.get("command").?.string;
         var container_state = ContainerState.fromString(root.get("state").?.string) orelse .created;
+        const restart_policy = if (root.get("restart_policy")) |rp| config_mod.Config.RestartPolicy.fromString(rp.string) orelse .no else .no;
         const pid_val = if (root.get("pid")) |v| if (v == .integer) @as(i32, @intCast(v.integer)) else null else null;
 
         // Liveness check for running containers
         if (container_state == .running) {
+            var alive = false;
+
+            // 1. Check host process if PID is available
             if (pid_val) |pid| {
-                var alive = true;
                 if (builtin.os.tag == .windows) {
                     // WSL check for Windows
-                    alive = self.isPidAliveWSL(pid) catch true;
+                    alive = self.isPidAliveWSL(pid) catch false;
                 } else {
                     // Unix check using kill(pid, 0)
                     std.posix.kill(pid, 0) catch |err| {
-                        if (err == error.ProcessNotFound) {
+                        if (err != error.PermissionDenied) {
                             alive = false;
+                        } else {
+                            alive = true;
                         }
                     };
                 }
+            }
 
-                if (!alive and builtin.os.tag == .macos) {
-                    // On macOS, try fallback to Lima check
+            // 2. Platform-specific backend check (fallback or primary)
+            if (!alive) {
+                if (builtin.os.tag == .macos) {
+                    // On macOS, containers run in Lima VM. Check if still alive there.
                     const macos = @import("../macos/virtualization.zig");
                     alive = macos.isContainerAliveInLima(self.allocator, id_str) catch false;
                 }
+            }
 
-                if (!alive) {
-                    container_state = .stopped;
-                    // We don't update persistence here to avoid side effects in a getter,
-                    // but ps will show it as stopped.
-                }
+            if (!alive) {
+                container_state = .stopped;
             }
         }
 
@@ -365,6 +384,7 @@ pub const ContainerManager = struct {
             .pid = pid_val,
             .exit_code = if (root.get("exit_code")) |v| if (v == .integer) @intCast(v.integer) else null else null,
             .name = if (root.get("name")) |v| if (v == .string) try self.allocator.dupe(u8, v.string) else null else null,
+            .restart_policy = restart_policy,
             .allocator = self.allocator,
         };
     }
@@ -463,19 +483,25 @@ pub const ContainerManager = struct {
                 const pid_str = std.fmt.allocPrint(self.allocator, "{d}", .{pid}) catch "0";
                 defer if (!std.mem.eql(u8, pid_str, "0")) self.allocator.free(pid_str);
                 // Try to kill the process via WSL
-                _ = std.process.Child.run(.{
+                if (std.process.Child.run(.{
                     .allocator = self.allocator,
                     .argv = &[_][]const u8{ "wsl", "-u", "root", "--", "kill", "-TERM", pid_str },
-                }) catch null;
+                })) |res| {
+                    self.allocator.free(res.stdout);
+                    self.allocator.free(res.stderr);
+                } else |_| {}
             }
             // Also call pkill in WSL using the tag
             const tag = std.fmt.allocPrint(self.allocator, "ISOLAZI_ID={s}", .{container_id}) catch "";
             defer if (tag.len > 0) self.allocator.free(tag);
             if (tag.len > 0) {
-                _ = std.process.Child.run(.{
+                if (std.process.Child.run(.{
                     .allocator = self.allocator,
                     .argv = &[_][]const u8{ "wsl", "-u", "root", "--", "pkill", "-f", tag },
-                }) catch null;
+                })) |res| {
+                    self.allocator.free(res.stdout);
+                    self.allocator.free(res.stderr);
+                } else |_| {}
             }
         } else if (builtin.os.tag == .macos) {
             // On macOS, kill the local proxy process AND the remote processes in VM
@@ -497,10 +523,13 @@ pub const ContainerManager = struct {
             const tag = std.fmt.allocPrint(self.allocator, "ISOLAZI_ID={s}", .{container_id}) catch "";
             defer if (tag.len > 0) self.allocator.free(tag);
             if (tag.len > 0) {
-                _ = std.process.Child.run(.{
+                if (std.process.Child.run(.{
                     .allocator = self.allocator,
                     .argv = &[_][]const u8{ "pkill", "-f", tag },
-                }) catch null;
+                })) |res| {
+                    self.allocator.free(res.stdout);
+                    self.allocator.free(res.stderr);
+                } else |_| {}
             }
         }
 

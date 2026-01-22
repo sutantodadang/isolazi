@@ -372,6 +372,7 @@ const RunOptions = struct {
     // Seccomp options
     seccomp_enabled: bool = true, // Default enabled
     seccomp_profile: SeccompProfileOption = .default_container,
+    restart_policy: isolazi.Config.RestartPolicy = .no,
 
     const EnvPair = struct {
         key: []const u8,
@@ -516,6 +517,15 @@ fn parseRunOptions(allocator: std.mem.Allocator, args: []const []const u8) !RunO
                     uid_map_buf[uid_map_count] = id_map;
                     uid_map_count += 1;
                 }
+            }
+        } else if (std.mem.eql(u8, arg, "--restart")) {
+            arg_idx += 1;
+            if (arg_idx >= args.len) return error.MissingValue;
+            const policy_str = args[arg_idx];
+            if (isolazi.Config.RestartPolicy.fromString(policy_str)) |policy| {
+                opts.restart_policy = policy;
+            } else {
+                return error.InvalidRestartPolicy;
             }
         } else if (std.mem.eql(u8, arg, "--gid-map") or std.mem.eql(u8, arg, "--gidmap")) {
             arg_idx += 1;
@@ -2781,7 +2791,7 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
         }
 
         // Register container state
-        _ = manager.createContainerWithId(&container_id, opts.image_name, cmd_display[0..cmd_display_len], null) catch {};
+        _ = manager.createContainerWithId(&container_id, opts.image_name, cmd_display[0..cmd_display_len], null, opts.restart_policy) catch {};
 
         if (opts.detach_mode) {
             try stdout.print("{s}\n", .{container_id});
@@ -2807,6 +2817,10 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
             if (std.mem.eql(u8, e.key, "PGDATA")) has_pgdata = true;
             try env_pairs.append(allocator, .{ .key = e.key, .value = e.value });
         }
+        // Always add the ISOLAZI_ID tag to environment for detection
+        try env_pairs.append(allocator, .{ .key = "ISOLAZI_ID", .value = try allocator.dupe(u8, container_id[0..]) });
+        try dynamic_env_values.append(allocator, env_pairs.items[env_pairs.items.len - 1].value);
+
         if (is_postgres and !has_pgdata) {
             // Find volume mount for /var/lib/postgresql
             for (opts.volumes) |vol| {
@@ -2848,6 +2862,14 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
                     break :blk v.host_path;
                 }
             };
+
+            // Validate that the host path exists
+            std.fs.cwd().access(host_path, .{}) catch |err| {
+                try stderr.print("Error: Host volume path '{s}' does not exist: {}\n", .{ host_path, err });
+                try stderr.flush();
+                return 1;
+            };
+
             try vol_pairs.append(allocator, .{ .host_path = host_path, .container_path = v.container_path });
         }
 
@@ -2875,9 +2897,6 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
         }
 
         // Run in VM using appropriate hypervisor
-        // Update state to running
-        manager.updateState(&container_id, .running, null, null) catch {};
-
         var exit_code: u8 = 0;
         try stdout.print("Running in Lima VM...\n", .{});
         try stdout.flush();
@@ -2896,7 +2915,7 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
         }
 
         // Use Lima
-        const result = isolazi.macos.virtualization.runWithLima(
+        const run_res = isolazi.macos.virtualization.runWithLima(
             allocator,
             "", // Lima manages its own kernel
             rootfs_path,
@@ -2906,23 +2925,53 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
             port_pairs.items,
             opts.rootless,
             opts.detach_mode,
+            opts.restart_policy,
             stdout_path,
             stderr_path,
         ) catch |err| {
-            manager.updateState(&container_id, .stopped, null, 1) catch {};
-            try stderr.print("Error: Failed to run with Lima: {}\n", .{err});
+            try stderr.print("Error: Failed to run container in Lima: {}\n", .{err});
             try stderr.flush();
+            manager.updateState(&container_id, .stopped, null, 1) catch {};
             return 1;
         };
 
-        exit_code = result.exit_code;
+        if (run_res.pid) |pid| {
+            manager.updateState(&container_id, .running, @intCast(pid), null) catch {};
+        }
+
+        // Detect early startup failures in detached mode
+        if (opts.detach_mode) {
+            // Wait a moment for the process to settle
+            std.Thread.sleep(1 * std.time.ns_per_s);
+
+            const alive = isolazi.macos.virtualization.isContainerAliveInLima(allocator, &container_id) catch false;
+            if (!alive) {
+                try stderr.print("\nError: Container '{s}' failed to start immediately.\n", .{container_id[0..12]});
+
+                // Read stderr log if available
+                if (stderr_path) |path| {
+                    try stderr.writeAll("Logs from stderr:\n-----------------\n");
+                    const log_file = std.fs.cwd().openFile(path, .{}) catch null;
+                    if (log_file) |f| {
+                        defer f.close();
+                        var buf: [4096]u8 = undefined;
+                        const read = f.readAll(&buf) catch 0;
+                        try stderr.writeAll(buf[0..read]);
+                    }
+                    try stderr.writeAll("-----------------\n");
+                }
+
+                try stderr.flush();
+                manager.updateState(&container_id, .stopped, null, 1) catch {};
+                return 1;
+            }
+        }
+
+        exit_code = run_res.exit_code;
 
         // Update state to stopped after container exits, unless detached
         if (!opts.detach_mode) {
             manager.updateState(&container_id, .stopped, null, exit_code) catch {};
-        } else if (result.pid) |pid| {
-            // If detached, update PID in state so we can track it
-            manager.updateState(&container_id, .running, @intCast(pid), null) catch {};
         }
         return exit_code;
     }
@@ -3036,7 +3085,7 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
         };
         defer manager.deinit();
 
-        const container_id = manager.createContainer(image_name, command, container_name) catch |err| {
+        const container_id = manager.createContainer(image_name, command, container_name, .no) catch |err| {
             try stderr.print("Error: Failed to create container: {}\n", .{err});
             try stderr.flush();
             return 1;
@@ -3098,8 +3147,38 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
         try stdout.print("{s}\n", .{info.shortId()});
         try stdout.flush();
 
-        // TODO: Actually start the container in VM
-        // For now, just update state
+        // Convert stored info back to what virtualization needs
+        // Note: For now we only have basic info. Full persistence of ports/vols would be better.
+        const rootfs_path = try std.fmt.allocPrint(allocator, "{s}/{s}/rootfs", .{ manager.base_path, container_id });
+        defer allocator.free(rootfs_path);
+
+        const cmd_split = try allocator.alloc([]const u8, 1);
+        defer allocator.free(cmd_split);
+        cmd_split[0] = info.command;
+
+        // Basic start (no saved ports/vols for now in this simple implementation)
+        const result = isolazi.macos.virtualization.runWithLima(
+            allocator,
+            "",
+            rootfs_path,
+            cmd_split,
+            &[_]isolazi.macos.virtualization.EnvPair{.{ .key = "ISOLAZI_ID", .value = container_id }},
+            &[_]isolazi.macos.virtualization.VolumePair{},
+            &[_]isolazi.macos.virtualization.PortMapping{},
+            false, // rootless
+            true, // detach (start usually implies background)
+            info.restart_policy,
+            null,
+            null,
+        ) catch |err| {
+            manager.updateState(container_id, .stopped, null, 1) catch {};
+            return err;
+        };
+
+        if (result.pid) |pid| {
+            manager.updateState(container_id, .running, @intCast(pid), null) catch {};
+        }
+
         return 0;
     }
 
