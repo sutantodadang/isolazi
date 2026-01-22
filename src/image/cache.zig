@@ -144,9 +144,9 @@ pub const ImageCache = struct {
         const blob_path = try self.getBlobPath(digest);
         defer self.allocator.free(blob_path);
 
-        const file = try std.fs.cwd().createFile(blob_path, .{});
+        const file = std.fs.cwd().createFile(blob_path, .{}) catch return CacheError.AccessDenied;
         defer file.close();
-        try file.writeAll(data);
+        file.writeAll(data) catch return CacheError.AccessDenied;
     }
 
     /// Store a blob from a file (for large blobs)
@@ -154,7 +154,7 @@ pub const ImageCache = struct {
         const blob_path = try self.getBlobPath(digest);
         defer self.allocator.free(blob_path);
 
-        try std.fs.cwd().copyFile(source_path, std.fs.cwd(), blob_path, .{});
+        std.fs.cwd().copyFile(source_path, std.fs.cwd(), blob_path, .{}) catch return CacheError.AccessDenied;
     }
 
     /// Read a blob from cache
@@ -201,9 +201,9 @@ pub const ImageCache = struct {
             std.fs.cwd().makePath(parent) catch {};
         }
 
-        const file = try std.fs.cwd().createFile(manifest_path, .{});
+        const file = std.fs.cwd().createFile(manifest_path, .{}) catch return CacheError.AccessDenied;
         defer file.close();
-        try file.writeAll(manifest_json);
+        file.writeAll(manifest_json) catch return CacheError.AccessDenied;
     }
 
     /// Read a cached manifest
@@ -316,9 +316,7 @@ pub const ImageCache = struct {
         const blobs_path = try std.fmt.allocPrint(self.allocator, "{s}/images/blobs/sha256", .{self.base_path});
         defer self.allocator.free(blobs_path);
 
-        var blobs_dir = std.fs.cwd().openDir(blobs_path, .{ .iterate = true }) catch {
-            return removed;
-        };
+        var blobs_dir = std.fs.cwd().openDir(blobs_path, .{ .iterate = true }) catch return removed;
         defer blobs_dir.close();
 
         var blob_iter = blobs_dir.iterate();
@@ -339,9 +337,7 @@ pub const ImageCache = struct {
         const containers_path = try std.fmt.allocPrint(self.allocator, "{s}/containers", .{self.base_path});
         defer self.allocator.free(containers_path);
 
-        var containers_dir = std.fs.cwd().openDir(containers_path, .{ .iterate = true }) catch {
-            return removed;
-        };
+        var containers_dir = std.fs.cwd().openDir(containers_path, .{ .iterate = true }) catch return removed;
         defer containers_dir.close();
 
         var iter = containers_dir.iterate();
@@ -370,9 +366,7 @@ pub const ImageCache = struct {
         const manifests_path = try std.fmt.allocPrint(allocator, "{s}/images/manifests", .{self.base_path});
         defer allocator.free(manifests_path);
 
-        var manifests_dir = std.fs.cwd().openDir(manifests_path, .{ .iterate = true }) catch {
-            return images.toOwnedSlice(allocator);
-        };
+        var manifests_dir = std.fs.cwd().openDir(manifests_path, .{ .iterate = true }) catch return images.toOwnedSlice(allocator);
         defer manifests_dir.close();
 
         // Iterate registries
@@ -441,9 +435,7 @@ pub const ImageCache = struct {
         const blobs_path = try std.fmt.allocPrint(self.allocator, "{s}/images/blobs/sha256", .{self.base_path});
         defer self.allocator.free(blobs_path);
 
-        var blobs_dir = std.fs.cwd().openDir(blobs_path, .{ .iterate = true }) catch {
-            return stats;
-        };
+        var blobs_dir = std.fs.cwd().openDir(blobs_path, .{ .iterate = true }) catch return stats;
         defer blobs_dir.close();
 
         var blob_iter = blobs_dir.iterate();

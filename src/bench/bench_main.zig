@@ -87,10 +87,10 @@ fn printUsage(writer: anytype) !void {
 }
 
 fn parseArgs(allocator: std.mem.Allocator) !Options {
-    _ = allocator;
     var opts = Options{};
 
-    var args = std.process.args();
+    var args = try std.process.argsWithAllocator(allocator);
+    defer args.deinit();
     _ = args.skip(); // Skip program name
 
     while (args.next()) |arg| {

@@ -238,6 +238,7 @@ fn pullImageWindows(
                 .authenticating => "Authenticating",
                 .fetching_manifest => "Fetching manifest",
                 .downloading_layer => "Downloading",
+                .downloading_progress => "Progress",
                 .layer_cached => "Layer cached",
                 .extracting => "Extracting",
                 .complete => "Complete",
@@ -246,7 +247,48 @@ fn pullImageWindows(
         }
     }.cb;
 
-    const ref = isolazi.image.pullImage(allocator, image_name, &cache, &progress_cb) catch |err| {
+    const download_progress_cb = struct {
+        fn cb(progress: isolazi.image.DownloadProgress) void {
+            var size_buf: [32]u8 = undefined;
+            var total_buf: [32]u8 = undefined;
+            var speed_buf: [32]u8 = undefined;
+
+            const downloaded_str = isolazi.image.DownloadProgress.formatBytes(progress.bytes_downloaded, &size_buf);
+            const total_str = if (progress.total_bytes > 0)
+                isolazi.image.DownloadProgress.formatBytes(progress.total_bytes, &total_buf)
+            else
+                "???";
+            const speed_str = isolazi.image.DownloadProgress.formatBytes(progress.bytes_per_second, &speed_buf);
+
+            const percent = progress.percentComplete();
+            const bar_width: usize = 30;
+            const filled = (percent * bar_width) / 100;
+
+            // Build progress bar
+            var bar: [32]u8 = undefined;
+            for (0..bar_width) |i| {
+                bar[i] = if (i < filled) '=' else ' ';
+            }
+
+            // Print with carriage return for in-place update
+            std.debug.print("\r  Layer {d}/{d}: [{s}] {d}% {s}/{s} @ {s}/s   ", .{
+                progress.layer_index,
+                progress.total_layers,
+                bar[0..bar_width],
+                percent,
+                downloaded_str,
+                total_str,
+                speed_str,
+            });
+
+            // Print newline when complete
+            if (percent == 100) {
+                std.debug.print("\n", .{});
+            }
+        }
+    }.cb;
+
+    const ref = isolazi.image.pullImage(allocator, image_name, &cache, &progress_cb, &download_progress_cb) catch |err| {
         try stderr.print("Error: Failed to pull image: {}\n", .{err});
         try stderr.flush();
         return 1;
@@ -714,6 +756,7 @@ fn runContainerWindows(
                     .authenticating => "Authenticating",
                     .fetching_manifest => "Fetching manifest",
                     .downloading_layer => "Pulling",
+                    .downloading_progress => "Progress",
                     .layer_cached => "Layer exists",
                     .extracting => "Extracting",
                     .complete => "Status",
@@ -722,7 +765,45 @@ fn runContainerWindows(
             }
         }.cb;
 
-        _ = isolazi.image.pullImage(allocator, image_name, &cache, &progress_cb) catch |err| {
+        const download_progress_cb = struct {
+            fn cb(progress: isolazi.image.DownloadProgress) void {
+                var size_buf: [32]u8 = undefined;
+                var total_buf: [32]u8 = undefined;
+                var speed_buf: [32]u8 = undefined;
+
+                const downloaded_str = isolazi.image.DownloadProgress.formatBytes(progress.bytes_downloaded, &size_buf);
+                const total_str = if (progress.total_bytes > 0)
+                    isolazi.image.DownloadProgress.formatBytes(progress.total_bytes, &total_buf)
+                else
+                    "???";
+                const speed_str = isolazi.image.DownloadProgress.formatBytes(progress.bytes_per_second, &speed_buf);
+
+                const percent = progress.percentComplete();
+                const bar_width: usize = 30;
+                const filled = (percent * bar_width) / 100;
+
+                var bar: [32]u8 = undefined;
+                for (0..bar_width) |i| {
+                    bar[i] = if (i < filled) '=' else ' ';
+                }
+
+                std.debug.print("\r  Layer {d}/{d}: [{s}] {d}% {s}/{s} @ {s}/s   ", .{
+                    progress.layer_index,
+                    progress.total_layers,
+                    bar[0..bar_width],
+                    percent,
+                    downloaded_str,
+                    total_str,
+                    speed_str,
+                });
+
+                if (percent == 100) {
+                    std.debug.print("\n", .{});
+                }
+            }
+        }.cb;
+
+        _ = isolazi.image.pullImage(allocator, image_name, &cache, &progress_cb, &download_progress_cb) catch |err| {
             try stderr.print("Error: Failed to pull image: {}\n", .{err});
             try stderr.flush();
             return 1;
@@ -924,6 +1005,38 @@ fn runContainerWindows(
     try script_buf.appendSlice(allocator, wsl_rootfs);
     try script_buf.appendSlice(allocator, "/dev/fd 2>/dev/null; ");
 
+    // Ensure /dev exists inside the rootfs and bind common device nodes from the host.
+    // This is necessary when the rootfs lives on /mnt/<drive> where creating device
+    // nodes is not supported; bind-mounting the host devices makes /dev/null etc
+    // available inside the chroot.
+    try script_buf.appendSlice(allocator, "mkdir -p ");
+    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, "/dev && ");
+    // Create placeholder files then bind host device nodes onto them
+    try script_buf.appendSlice(allocator, "touch ");
+    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, "/dev/null && mount --bind /dev/null ");
+    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, "/dev/null 2>/dev/null; ");
+
+    try script_buf.appendSlice(allocator, "touch ");
+    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, "/dev/tty && mount --bind /dev/tty ");
+    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, "/dev/tty 2>/dev/null; ");
+
+    try script_buf.appendSlice(allocator, "touch ");
+    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, "/dev/random && mount --bind /dev/random ");
+    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, "/dev/random 2>/dev/null; ");
+
+    try script_buf.appendSlice(allocator, "touch ");
+    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, "/dev/urandom && mount --bind /dev/urandom ");
+    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, "/dev/urandom 2>/dev/null; ");
+
     // For postgres images, set up required directories on tmpfs (Windows FS doesn't support chmod)
     const is_postgres = std.mem.indexOf(u8, image_name, "postgres") != null;
     if (is_postgres) {
@@ -946,6 +1059,33 @@ fn runContainerWindows(
         try script_buf.appendSlice(allocator, "/var/lib/postgresql/data && chown 70:70 ");
         try script_buf.appendSlice(allocator, wsl_rootfs);
         try script_buf.appendSlice(allocator, "/var/lib/postgresql/data && ");
+    }
+
+    // For rabbitmq images, set up required directories on tmpfs (Windows FS doesn't support chmod)
+    // RabbitMQ requires .erlang.cookie to be owned by user with mode 600
+    const is_rabbitmq = std.mem.indexOf(u8, image_name, "rabbitmq") != null;
+    if (is_rabbitmq) {
+        // Mount tmpfs for /var/lib/rabbitmq so .erlang.cookie can have correct permissions
+        try script_buf.appendSlice(allocator, "mkdir -p ");
+        try script_buf.appendSlice(allocator, wsl_rootfs);
+        try script_buf.appendSlice(allocator, "/var/lib/rabbitmq && mount -t tmpfs tmpfs ");
+        try script_buf.appendSlice(allocator, wsl_rootfs);
+        try script_buf.appendSlice(allocator, "/var/lib/rabbitmq && chown 999:999 ");
+        try script_buf.appendSlice(allocator, wsl_rootfs);
+        try script_buf.appendSlice(allocator, "/var/lib/rabbitmq && chmod 700 ");
+        try script_buf.appendSlice(allocator, wsl_rootfs);
+        try script_buf.appendSlice(allocator, "/var/lib/rabbitmq && ");
+
+        // Mount tmpfs for /var/log/rabbitmq
+        try script_buf.appendSlice(allocator, "mkdir -p ");
+        try script_buf.appendSlice(allocator, wsl_rootfs);
+        try script_buf.appendSlice(allocator, "/var/log/rabbitmq && mount -t tmpfs tmpfs ");
+        try script_buf.appendSlice(allocator, wsl_rootfs);
+        try script_buf.appendSlice(allocator, "/var/log/rabbitmq && chown 999:999 ");
+        try script_buf.appendSlice(allocator, wsl_rootfs);
+        try script_buf.appendSlice(allocator, "/var/log/rabbitmq && chmod 755 ");
+        try script_buf.appendSlice(allocator, wsl_rootfs);
+        try script_buf.appendSlice(allocator, "/var/log/rabbitmq && ");
     }
 
     // Mount each volume
@@ -1344,7 +1484,7 @@ fn createContainerWindows(
         try stdout.print("Unable to find image '{s}' locally, pulling...\n", .{image_name});
         try stdout.flush();
 
-        _ = isolazi.image.pullImage(allocator, image_name, &cache, null) catch |err| {
+        _ = isolazi.image.pullImage(allocator, image_name, &cache, null, null) catch |err| {
             try stderr.print("Error: Failed to pull image: {}\n", .{err});
             try stderr.flush();
             return 1;
@@ -2307,6 +2447,7 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
                     .authenticating => "Authenticating",
                     .fetching_manifest => "Fetching manifest",
                     .downloading_layer => "Downloading",
+                    .downloading_progress => "Progress",
                     .layer_cached => "Layer cached",
                     .extracting => "Extracting",
                     .complete => "Complete",
@@ -2315,7 +2456,45 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
             }
         }.cb;
 
-        const ref = isolazi.image.pullImage(allocator, image_name, &cache, &progress_cb) catch |err| {
+        const download_progress_cb = struct {
+            fn cb(progress: isolazi.image.DownloadProgress) void {
+                var size_buf: [32]u8 = undefined;
+                var total_buf: [32]u8 = undefined;
+                var speed_buf: [32]u8 = undefined;
+
+                const downloaded_str = isolazi.image.DownloadProgress.formatBytes(progress.bytes_downloaded, &size_buf);
+                const total_str = if (progress.total_bytes > 0)
+                    isolazi.image.DownloadProgress.formatBytes(progress.total_bytes, &total_buf)
+                else
+                    "???";
+                const speed_str = isolazi.image.DownloadProgress.formatBytes(progress.bytes_per_second, &speed_buf);
+
+                const percent = progress.percentComplete();
+                const bar_width: usize = 30;
+                const filled = (percent * bar_width) / 100;
+
+                var bar: [32]u8 = undefined;
+                for (0..bar_width) |i| {
+                    bar[i] = if (i < filled) '=' else ' ';
+                }
+
+                std.debug.print("\r  Layer {d}/{d}: [{s}] {d}% {s}/{s} @ {s}/s   ", .{
+                    progress.layer_index,
+                    progress.total_layers,
+                    bar[0..bar_width],
+                    percent,
+                    downloaded_str,
+                    total_str,
+                    speed_str,
+                });
+
+                if (percent == 100) {
+                    std.debug.print("\n", .{});
+                }
+            }
+        }.cb;
+
+        const ref = isolazi.image.pullImage(allocator, image_name, &cache, &progress_cb, &download_progress_cb) catch |err| {
             try stderr.print("Error: Failed to pull image: {}\n", .{err});
             try stderr.flush();
             return 1;
@@ -2449,6 +2628,7 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
                         .authenticating => "Authenticating",
                         .fetching_manifest => "Fetching manifest",
                         .downloading_layer => "Pulling",
+                        .downloading_progress => "Progress",
                         .layer_cached => "Layer exists",
                         .extracting => "Extracting",
                         .complete => "Status",
@@ -2457,7 +2637,45 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
                 }
             }.cb;
 
-            _ = isolazi.image.pullImage(allocator, opts.image_name, &cache, &progress_cb) catch |err| {
+            const download_progress_cb = struct {
+                fn cb(progress: isolazi.image.DownloadProgress) void {
+                    var size_buf: [32]u8 = undefined;
+                    var total_buf: [32]u8 = undefined;
+                    var speed_buf: [32]u8 = undefined;
+
+                    const downloaded_str = isolazi.image.DownloadProgress.formatBytes(progress.bytes_downloaded, &size_buf);
+                    const total_str = if (progress.total_bytes > 0)
+                        isolazi.image.DownloadProgress.formatBytes(progress.total_bytes, &total_buf)
+                    else
+                        "???";
+                    const speed_str = isolazi.image.DownloadProgress.formatBytes(progress.bytes_per_second, &speed_buf);
+
+                    const percent = progress.percentComplete();
+                    const bar_width: usize = 30;
+                    const filled = (percent * bar_width) / 100;
+
+                    var bar: [32]u8 = undefined;
+                    for (0..bar_width) |i| {
+                        bar[i] = if (i < filled) '=' else ' ';
+                    }
+
+                    std.debug.print("\r  Layer {d}/{d}: [{s}] {d}% {s}/{s} @ {s}/s   ", .{
+                        progress.layer_index,
+                        progress.total_layers,
+                        bar[0..bar_width],
+                        percent,
+                        downloaded_str,
+                        total_str,
+                        speed_str,
+                    });
+
+                    if (percent == 100) {
+                        std.debug.print("\n", .{});
+                    }
+                }
+            }.cb;
+
+            _ = isolazi.image.pullImage(allocator, opts.image_name, &cache, &progress_cb, &download_progress_cb) catch |err| {
                 try stderr.print("Error: Failed to pull image: {}\n", .{err});
                 try stderr.flush();
                 return 1;
@@ -3718,6 +3936,7 @@ const runOnLinux = if (builtin.os.tag == .linux) struct {
                     .authenticating => "Authenticating",
                     .fetching_manifest => "Fetching manifest",
                     .downloading_layer => "Downloading",
+                    .downloading_progress => "Progress",
                     .layer_cached => "Layer cached",
                     .extracting => "Extracting",
                     .complete => "Complete",
@@ -3726,7 +3945,45 @@ const runOnLinux = if (builtin.os.tag == .linux) struct {
             }
         }.cb;
 
-        _ = isolazi.image.pullImage(allocator, pull_cmd.image, &cache, &progress_cb) catch |err| {
+        const download_progress_cb = struct {
+            fn cb(progress: isolazi.image.DownloadProgress) void {
+                var size_buf: [32]u8 = undefined;
+                var total_buf: [32]u8 = undefined;
+                var speed_buf: [32]u8 = undefined;
+
+                const downloaded_str = isolazi.image.DownloadProgress.formatBytes(progress.bytes_downloaded, &size_buf);
+                const total_str = if (progress.total_bytes > 0)
+                    isolazi.image.DownloadProgress.formatBytes(progress.total_bytes, &total_buf)
+                else
+                    "???";
+                const speed_str = isolazi.image.DownloadProgress.formatBytes(progress.bytes_per_second, &speed_buf);
+
+                const percent = progress.percentComplete();
+                const bar_width: usize = 30;
+                const filled = (percent * bar_width) / 100;
+
+                var bar: [32]u8 = undefined;
+                for (0..bar_width) |i| {
+                    bar[i] = if (i < filled) '=' else ' ';
+                }
+
+                std.debug.print("\r  Layer {d}/{d}: [{s}] {d}% {s}/{s} @ {s}/s   ", .{
+                    progress.layer_index,
+                    progress.total_layers,
+                    bar[0..bar_width],
+                    percent,
+                    downloaded_str,
+                    total_str,
+                    speed_str,
+                });
+
+                if (percent == 100) {
+                    std.debug.print("\n", .{});
+                }
+            }
+        }.cb;
+
+        _ = isolazi.image.pullImage(allocator, pull_cmd.image, &cache, &progress_cb, &download_progress_cb) catch |err| {
             try stderr.print("Error: Failed to pull image: {}\n", .{err});
             try stderr.flush();
             return 1;
@@ -3838,7 +4095,7 @@ const runOnLinux = if (builtin.os.tag == .linux) struct {
             cache_opt = cache;
 
             // Pull image if needed
-            const ref = isolazi.image.pullImage(allocator, run_cmd.rootfs, &cache, null) catch |err| {
+            const ref = isolazi.image.pullImage(allocator, run_cmd.rootfs, &cache, null, null) catch |err| {
                 try stderr.print("Error: Failed to pull image '{s}': {}\n", .{ run_cmd.rootfs, err });
                 try stderr.flush();
                 return 1;

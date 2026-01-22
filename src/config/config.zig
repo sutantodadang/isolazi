@@ -312,6 +312,417 @@ pub const SeccompConfig = struct {
     }
 };
 
+// =============================================================================
+// Linux Security Module (LSM) Configuration - AppArmor
+// =============================================================================
+
+/// Maximum length for AppArmor profile names
+pub const MAX_APPARMOR_PROFILE_NAME = 256;
+
+/// AppArmor enforcement mode
+pub const AppArmorMode = enum(u8) {
+    /// Profile is disabled (unconfined)
+    unconfined = 0,
+    /// Violations are logged but allowed (for debugging/testing)
+    complain = 1,
+    /// Violations are blocked and logged (production mode)
+    enforce = 2,
+
+    /// Parse mode from string
+    pub fn fromString(s: []const u8) ?AppArmorMode {
+        if (std.mem.eql(u8, s, "unconfined") or std.mem.eql(u8, s, "disabled")) {
+            return .unconfined;
+        } else if (std.mem.eql(u8, s, "complain") or std.mem.eql(u8, s, "permissive")) {
+            return .complain;
+        } else if (std.mem.eql(u8, s, "enforce") or std.mem.eql(u8, s, "enforcing")) {
+            return .enforce;
+        }
+        return null;
+    }
+
+    /// Convert to string for display
+    pub fn toString(self: AppArmorMode) []const u8 {
+        return switch (self) {
+            .unconfined => "unconfined",
+            .complain => "complain",
+            .enforce => "enforce",
+        };
+    }
+};
+
+/// AppArmor configuration for container security
+pub const AppArmorConfig = struct {
+    /// Is AppArmor enforcement enabled for this container?
+    enabled: bool = false,
+
+    /// Enforcement mode
+    mode: AppArmorMode = .enforce,
+
+    /// Profile name to use (empty = use default container profile "isolazi-default")
+    profile_name: [MAX_APPARMOR_PROFILE_NAME]u8 = std.mem.zeroes([MAX_APPARMOR_PROFILE_NAME]u8),
+    profile_name_len: usize = 0,
+
+    /// Create default AppArmor configuration (disabled)
+    pub fn default_config() AppArmorConfig {
+        return AppArmorConfig{};
+    }
+
+    /// Create enabled AppArmor configuration with default profile
+    pub fn withDefaultProfile() AppArmorConfig {
+        var config = AppArmorConfig{
+            .enabled = true,
+            .mode = .enforce,
+        };
+        const default_name = "isolazi-default";
+        @memcpy(config.profile_name[0..default_name.len], default_name);
+        config.profile_name_len = default_name.len;
+        return config;
+    }
+
+    /// Create AppArmor configuration with a specific profile name
+    pub fn withProfile(name: []const u8) AppArmorConfig {
+        var config = AppArmorConfig{
+            .enabled = true,
+            .mode = .enforce,
+        };
+        const len = @min(name.len, MAX_APPARMOR_PROFILE_NAME - 1);
+        @memcpy(config.profile_name[0..len], name[0..len]);
+        config.profile_name_len = len;
+        return config;
+    }
+
+    /// Create AppArmor configuration in complain (permissive) mode
+    pub fn complainMode(name: []const u8) AppArmorConfig {
+        var config = AppArmorConfig{
+            .enabled = true,
+            .mode = .complain,
+        };
+        const len = @min(name.len, MAX_APPARMOR_PROFILE_NAME - 1);
+        @memcpy(config.profile_name[0..len], name[0..len]);
+        config.profile_name_len = len;
+        return config;
+    }
+
+    /// Create disabled/unconfined AppArmor configuration
+    pub fn unconfined() AppArmorConfig {
+        return AppArmorConfig{
+            .enabled = false,
+            .mode = .unconfined,
+        };
+    }
+
+    /// Get profile name as slice
+    pub fn getProfileName(self: *const AppArmorConfig) []const u8 {
+        if (self.profile_name_len > 0) {
+            return self.profile_name[0..self.profile_name_len];
+        }
+        return "isolazi-default";
+    }
+
+    /// Set the profile name
+    pub fn setProfileName(self: *AppArmorConfig, name: []const u8) void {
+        const len = @min(name.len, MAX_APPARMOR_PROFILE_NAME - 1);
+        @memset(&self.profile_name, 0);
+        @memcpy(self.profile_name[0..len], name[0..len]);
+        self.profile_name_len = len;
+    }
+
+    /// Check if AppArmor is effectively enabled
+    pub fn isEnabled(self: *const AppArmorConfig) bool {
+        return self.enabled and self.mode != .unconfined;
+    }
+};
+
+// =============================================================================
+// Linux Security Module (LSM) Configuration - SELinux
+// =============================================================================
+
+/// Maximum length for SELinux context strings
+pub const MAX_SELINUX_CONTEXT_LEN = 1024;
+
+/// Maximum number of MCS categories
+pub const MAX_MCS_CATEGORIES: u16 = 1024;
+
+/// SELinux enforcement mode
+pub const SELinuxMode = enum(u8) {
+    /// SELinux is disabled
+    disabled = 0,
+    /// Permissive mode: violations are logged but not enforced
+    permissive = 1,
+    /// Enforcing mode: violations are blocked and logged
+    enforcing = 2,
+
+    /// Parse mode from string
+    pub fn fromString(s: []const u8) ?SELinuxMode {
+        if (std.mem.eql(u8, s, "disabled") or std.mem.eql(u8, s, "Disabled")) {
+            return .disabled;
+        } else if (std.mem.eql(u8, s, "permissive") or std.mem.eql(u8, s, "Permissive")) {
+            return .permissive;
+        } else if (std.mem.eql(u8, s, "enforcing") or std.mem.eql(u8, s, "Enforcing")) {
+            return .enforcing;
+        }
+        return null;
+    }
+
+    /// Convert to string for display
+    pub fn toString(self: SELinuxMode) []const u8 {
+        return switch (self) {
+            .disabled => "Disabled",
+            .permissive => "Permissive",
+            .enforcing => "Enforcing",
+        };
+    }
+};
+
+/// SELinux process type (domain)
+pub const SELinuxType = enum(u8) {
+    /// Standard container process (container_t) - restricted
+    container_t = 0,
+    /// Super-privileged container (spc_t) - less restricted
+    spc_t = 1,
+    /// Unconfined (unconfined_t) - no SELinux restrictions
+    unconfined_t = 2,
+    /// Custom type specified in context string
+    custom = 3,
+
+    /// Get the type string
+    pub fn toString(self: SELinuxType) []const u8 {
+        return switch (self) {
+            .container_t => "container_t",
+            .spc_t => "spc_t",
+            .unconfined_t => "unconfined_t",
+            .custom => "custom",
+        };
+    }
+
+    /// Parse from string
+    pub fn fromString(s: []const u8) ?SELinuxType {
+        if (std.mem.eql(u8, s, "container_t") or std.mem.eql(u8, s, "container")) {
+            return .container_t;
+        } else if (std.mem.eql(u8, s, "spc_t") or std.mem.eql(u8, s, "super-privileged")) {
+            return .spc_t;
+        } else if (std.mem.eql(u8, s, "unconfined_t") or std.mem.eql(u8, s, "unconfined")) {
+            return .unconfined_t;
+        }
+        return .custom;
+    }
+};
+
+/// SELinux configuration for container security
+pub const SELinuxConfig = struct {
+    /// Is SELinux enforcement enabled for this container?
+    enabled: bool = false,
+
+    /// SELinux type (domain) for the container process
+    selinux_type: SELinuxType = .container_t,
+
+    /// Use MCS (Multi-Category Security) for container isolation
+    use_mcs: bool = true,
+
+    /// MCS category 1 (0-1023)
+    mcs_category1: u16 = 0,
+
+    /// MCS category 2 (0-1023)
+    mcs_category2: u16 = 0,
+
+    /// Custom security context (overrides type and MCS if set)
+    /// Format: user:role:type:level (e.g., "system_u:system_r:container_t:s0:c1,c2")
+    custom_context: [MAX_SELINUX_CONTEXT_LEN]u8 = std.mem.zeroes([MAX_SELINUX_CONTEXT_LEN]u8),
+    custom_context_len: usize = 0,
+
+    /// Mount label for container filesystem
+    mount_label: [MAX_SELINUX_CONTEXT_LEN]u8 = std.mem.zeroes([MAX_SELINUX_CONTEXT_LEN]u8),
+    mount_label_len: usize = 0,
+
+    /// Create default SELinux configuration (disabled)
+    pub fn default_config() SELinuxConfig {
+        return SELinuxConfig{};
+    }
+
+    /// Create SELinux configuration with default container context
+    pub fn withDefaultContext() SELinuxConfig {
+        return SELinuxConfig{
+            .enabled = true,
+            .selinux_type = .container_t,
+            .use_mcs = true,
+        };
+    }
+
+    /// Create SELinux configuration with specific MCS categories
+    pub fn withMCS(category1: u16, category2: u16) SELinuxConfig {
+        return SELinuxConfig{
+            .enabled = true,
+            .selinux_type = .container_t,
+            .use_mcs = true,
+            .mcs_category1 = @min(category1, MAX_MCS_CATEGORIES - 1),
+            .mcs_category2 = @min(category2, MAX_MCS_CATEGORIES - 1),
+        };
+    }
+
+    /// Create SELinux configuration with custom context
+    pub fn withContext(context: []const u8) SELinuxConfig {
+        var config = SELinuxConfig{
+            .enabled = true,
+            .selinux_type = .custom,
+        };
+        const len = @min(context.len, MAX_SELINUX_CONTEXT_LEN - 1);
+        @memcpy(config.custom_context[0..len], context[0..len]);
+        config.custom_context_len = len;
+        return config;
+    }
+
+    /// Create unconfined SELinux configuration (no restrictions)
+    pub fn unconfined() SELinuxConfig {
+        return SELinuxConfig{
+            .enabled = true,
+            .selinux_type = .unconfined_t,
+            .use_mcs = false,
+        };
+    }
+
+    /// Create super-privileged container SELinux configuration
+    pub fn superPrivileged() SELinuxConfig {
+        return SELinuxConfig{
+            .enabled = true,
+            .selinux_type = .spc_t,
+            .use_mcs = false,
+        };
+    }
+
+    /// Get the effective security context string
+    /// Returns the context in format: user:role:type:level
+    pub fn getContextString(self: *const SELinuxConfig, buf: []u8) []const u8 {
+        if (self.custom_context_len > 0) {
+            const len = @min(self.custom_context_len, buf.len);
+            @memcpy(buf[0..len], self.custom_context[0..len]);
+            return buf[0..len];
+        }
+
+        const type_str = self.selinux_type.toString();
+
+        if (self.use_mcs) {
+            const result = std.fmt.bufPrint(buf, "system_u:system_r:{s}:s0:c{d},c{d}", .{
+                type_str,
+                @min(self.mcs_category1, self.mcs_category2),
+                @max(self.mcs_category1, self.mcs_category2),
+            }) catch return "";
+            return result;
+        } else {
+            const result = std.fmt.bufPrint(buf, "system_u:system_r:{s}:s0", .{type_str}) catch return "";
+            return result;
+        }
+    }
+
+    /// Set custom security context
+    pub fn setContext(self: *SELinuxConfig, context: []const u8) void {
+        const len = @min(context.len, MAX_SELINUX_CONTEXT_LEN - 1);
+        @memset(&self.custom_context, 0);
+        @memcpy(self.custom_context[0..len], context[0..len]);
+        self.custom_context_len = len;
+        self.selinux_type = .custom;
+    }
+
+    /// Set mount label
+    pub fn setMountLabel(self: *SELinuxConfig, label: []const u8) void {
+        const len = @min(label.len, MAX_SELINUX_CONTEXT_LEN - 1);
+        @memset(&self.mount_label, 0);
+        @memcpy(self.mount_label[0..len], label[0..len]);
+        self.mount_label_len = len;
+    }
+
+    /// Get mount label as slice
+    pub fn getMountLabel(self: *const SELinuxConfig) []const u8 {
+        if (self.mount_label_len > 0) {
+            return self.mount_label[0..self.mount_label_len];
+        }
+        return "";
+    }
+
+    /// Generate random MCS categories for container isolation
+    pub fn generateMCSCategories(self: *SELinuxConfig) void {
+        // Use current time as seed for randomness
+        var prng = std.Random.DefaultPrng.init(@bitCast(std.time.milliTimestamp()));
+        const random = prng.random();
+
+        self.mcs_category1 = random.intRangeAtMost(u16, 0, MAX_MCS_CATEGORIES - 1);
+        self.mcs_category2 = random.intRangeAtMost(u16, 0, MAX_MCS_CATEGORIES - 1);
+
+        // Ensure categories are different
+        while (self.mcs_category2 == self.mcs_category1) {
+            self.mcs_category2 = random.intRangeAtMost(u16, 0, MAX_MCS_CATEGORIES - 1);
+        }
+
+        self.use_mcs = true;
+    }
+
+    /// Check if SELinux is effectively enabled
+    pub fn isEnabled(self: *const SELinuxConfig) bool {
+        return self.enabled and self.selinux_type != .unconfined_t;
+    }
+};
+
+// =============================================================================
+// Combined LSM Configuration
+// =============================================================================
+
+/// Linux Security Module (LSM) configuration combining AppArmor and SELinux
+/// Only one LSM should be enabled at a time (they are mutually exclusive on most systems)
+pub const LSMConfig = struct {
+    /// AppArmor configuration
+    apparmor: AppArmorConfig = AppArmorConfig.default_config(),
+
+    /// SELinux configuration
+    selinux: SELinuxConfig = SELinuxConfig.default_config(),
+
+    /// Create default LSM configuration (both disabled)
+    pub fn default_config() LSMConfig {
+        return LSMConfig{};
+    }
+
+    /// Create LSM configuration with AppArmor enabled
+    pub fn withAppArmor(profile_name: []const u8) LSMConfig {
+        return LSMConfig{
+            .apparmor = AppArmorConfig.withProfile(profile_name),
+        };
+    }
+
+    /// Create LSM configuration with default AppArmor profile
+    pub fn withDefaultAppArmor() LSMConfig {
+        return LSMConfig{
+            .apparmor = AppArmorConfig.withDefaultProfile(),
+        };
+    }
+
+    /// Create LSM configuration with SELinux enabled
+    pub fn withSELinux(category1: u16, category2: u16) LSMConfig {
+        return LSMConfig{
+            .selinux = SELinuxConfig.withMCS(category1, category2),
+        };
+    }
+
+    /// Create LSM configuration with default SELinux context
+    pub fn withDefaultSELinux() LSMConfig {
+        return LSMConfig{
+            .selinux = SELinuxConfig.withDefaultContext(),
+        };
+    }
+
+    /// Check if any LSM is enabled
+    pub fn isEnabled(self: *const LSMConfig) bool {
+        return self.apparmor.isEnabled() or self.selinux.isEnabled();
+    }
+
+    /// Check if AppArmor is the active LSM
+    pub fn isAppArmorActive(self: *const LSMConfig) bool {
+        return self.apparmor.isEnabled();
+    }
+
+    /// Check if SELinux is the active LSM
+    pub fn isSELinuxActive(self: *const LSMConfig) bool {
+        return self.selinux.isEnabled();
+    }
+};
+
 /// A UID/GID mapping entry for user namespaces
 /// Maps a range of IDs from parent namespace to child namespace
 pub const IdMapping = struct {
@@ -590,6 +1001,9 @@ pub const Config = struct {
 
     /// Seccomp syscall filtering configuration
     seccomp: SeccompConfig = SeccompConfig.default_config(),
+
+    /// Linux Security Module (LSM) configuration (AppArmor/SELinux)
+    lsm: LSMConfig = LSMConfig.default_config(),
 
     /// Initialize a new configuration with the given rootfs path.
     pub fn init(rootfs: []const u8) !Config {
@@ -888,6 +1302,68 @@ pub const Config = struct {
     /// Check if seccomp is enabled and has effective filtering
     pub fn hasSeccompFilter(self: *const Config) bool {
         return self.seccomp.hasFilter();
+    }
+
+    // =========================================================================
+    // Linux Security Module (LSM) Configuration Methods
+    // =========================================================================
+
+    /// Enable AppArmor with default container profile
+    pub fn enableAppArmor(self: *Config) void {
+        self.lsm.apparmor = AppArmorConfig.withDefaultProfile();
+    }
+
+    /// Enable AppArmor with a specific profile name
+    pub fn setAppArmorProfile(self: *Config, profile_name: []const u8) void {
+        self.lsm.apparmor = AppArmorConfig.withProfile(profile_name);
+    }
+
+    /// Enable AppArmor in complain (permissive) mode
+    pub fn setAppArmorComplainMode(self: *Config, profile_name: []const u8) void {
+        self.lsm.apparmor = AppArmorConfig.complainMode(profile_name);
+    }
+
+    /// Disable AppArmor
+    pub fn disableAppArmor(self: *Config) void {
+        self.lsm.apparmor = AppArmorConfig.unconfined();
+    }
+
+    /// Enable SELinux with default container context
+    pub fn enableSELinux(self: *Config) void {
+        self.lsm.selinux = SELinuxConfig.withDefaultContext();
+        // Generate random MCS categories for container isolation
+        self.lsm.selinux.generateMCSCategories();
+    }
+
+    /// Enable SELinux with specific MCS categories
+    pub fn setSELinuxMCS(self: *Config, category1: u16, category2: u16) void {
+        self.lsm.selinux = SELinuxConfig.withMCS(category1, category2);
+    }
+
+    /// Enable SELinux with custom context string
+    pub fn setSELinuxContext(self: *Config, context: []const u8) void {
+        self.lsm.selinux = SELinuxConfig.withContext(context);
+    }
+
+    /// Set SELinux type (container_t, spc_t, unconfined_t)
+    pub fn setSELinuxType(self: *Config, selinux_type: SELinuxType) void {
+        self.lsm.selinux.enabled = true;
+        self.lsm.selinux.selinux_type = selinux_type;
+    }
+
+    /// Disable SELinux (set to unconfined)
+    pub fn disableSELinux(self: *Config) void {
+        self.lsm.selinux = SELinuxConfig.unconfined();
+    }
+
+    /// Enable super-privileged container mode (SELinux spc_t)
+    pub fn enableSuperPrivileged(self: *Config) void {
+        self.lsm.selinux = SELinuxConfig.superPrivileged();
+    }
+
+    /// Check if any LSM is enabled
+    pub fn hasLSMEnabled(self: *const Config) bool {
+        return self.lsm.isEnabled();
     }
 
     /// Get active UID mappings.

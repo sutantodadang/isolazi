@@ -40,6 +40,8 @@ pub const RegistryClient = registry.RegistryClient;
 pub const ImageCache = cache.ImageCache;
 pub const CachedImage = cache.CachedImage;
 pub const CacheStats = cache.CacheStats;
+pub const DownloadProgress = registry.DownloadProgress;
+pub const DownloadProgressCallback = registry.ProgressCallback;
 
 // Re-export key functions
 pub const extractLayer = layer.extractLayer;
@@ -53,6 +55,7 @@ pub fn pullImage(
     image_str: []const u8,
     img_cache: *ImageCache,
     progress_callback: ?*const fn (stage: PullStage, detail: []const u8) void,
+    download_progress_callback: ?DownloadProgressCallback,
 ) !ImageReference {
     // Parse the image reference
     const ref = reference.parse(image_str) catch return error.InvalidReference;
@@ -74,20 +77,25 @@ pub fn pullImage(
         cb(.authenticating, ref.registry);
     }
 
-    // For Docker Hub, authenticate first
+    const effective_tag = ref.tag orelse "latest";
+    var manifest_data: []u8 = undefined;
+
+    // For Docker Hub, use optimized combined auth+manifest fetch
     if (std.mem.eql(u8, ref.registry, "docker.io") or
         std.mem.eql(u8, ref.registry, "registry-1.docker.io"))
     {
-        try client.authenticateDockerHub(ref.repository);
+        // Combined auth + manifest fetch for speed
+        if (progress_callback) |cb| {
+            cb(.fetching_manifest, ref.repository);
+        }
+        manifest_data = try client.authenticateAndGetManifest(ref.repository, effective_tag);
+    } else {
+        // Non-Docker Hub: just fetch manifest
+        if (progress_callback) |cb| {
+            cb(.fetching_manifest, ref.repository);
+        }
+        manifest_data = try client.getManifest(ref.repository, effective_tag);
     }
-
-    // Fetch manifest
-    if (progress_callback) |cb| {
-        cb(.fetching_manifest, ref.repository);
-    }
-
-    const effective_tag = ref.tag orelse "latest";
-    var manifest_data = try client.getManifest(ref.repository, effective_tag);
     defer allocator.free(manifest_data);
 
     // Parse manifest
@@ -195,7 +203,7 @@ pub fn pullImage(
     }
 
     if (to_download.items.len > 0) {
-        // Parallel download logic
+        // Parallel download logic - using WSL ext4 filesystem for better I/O
         const ThreadData = struct {
             client: *RegistryClient,
             img_cache: *ImageCache,
@@ -204,6 +212,7 @@ pub fn pullImage(
             index: usize,
             total: usize,
             progress_callback: ?*const fn (stage: PullStage, detail: []const u8) void,
+            download_progress_callback: ?DownloadProgressCallback,
             mutex: *std.Thread.Mutex,
             err: *?anyerror,
         };
@@ -231,7 +240,14 @@ pub fn pullImage(
                     data.mutex.unlock();
                 }
 
-                data.client.downloadBlobToFile(data.repository, data.digest, tmp_path) catch |e| {
+                data.client.downloadBlobToFileWithProgress(
+                    data.repository,
+                    data.digest,
+                    tmp_path,
+                    data.download_progress_callback,
+                    data.index + 1,
+                    data.total,
+                ) catch |e| {
                     data.mutex.lock();
                     data.err.* = e;
                     data.mutex.unlock();
@@ -270,6 +286,7 @@ pub fn pullImage(
                 .index = item.index,
                 .total = layers.array.items.len,
                 .progress_callback = progress_callback,
+                .download_progress_callback = download_progress_callback,
                 .mutex = &download_mutex,
                 .err = &download_err,
             }});
@@ -296,6 +313,7 @@ pub const PullStage = enum {
     authenticating,
     fetching_manifest,
     downloading_layer,
+    downloading_progress,
     layer_cached,
     extracting,
     complete,

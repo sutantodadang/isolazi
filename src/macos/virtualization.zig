@@ -110,6 +110,194 @@ pub const ResourceLimitsConfig = struct {
     }
 };
 
+/// AppArmor enforcement mode for macOS VM passthrough
+pub const AppArmorMode = enum {
+    /// No AppArmor restrictions
+    unconfined,
+    /// Log violations but don't enforce
+    complain,
+    /// Full enforcement (default)
+    enforce,
+
+    /// Convert to CLI argument string
+    pub fn toCmdString(self: AppArmorMode) []const u8 {
+        return switch (self) {
+            .unconfined => "unconfined",
+            .complain => "complain",
+            .enforce => "enforce",
+        };
+    }
+};
+
+/// SELinux type for container processes in VM
+pub const SELinuxType = enum {
+    /// Standard container type
+    container_t,
+    /// Container with network access
+    container_net_t,
+    /// Container with file access
+    container_file_t,
+    /// Privileged container (use with caution)
+    spc_t,
+    /// Custom type (use selinux_context instead)
+    custom,
+
+    /// Convert to CLI argument string
+    pub fn toCmdString(self: SELinuxType) []const u8 {
+        return switch (self) {
+            .container_t => "container_t",
+            .container_net_t => "container_net_t",
+            .container_file_t => "container_file_t",
+            .spc_t => "spc_t",
+            .custom => "custom",
+        };
+    }
+};
+
+/// Linux Security Module (LSM) configuration for macOS VM passthrough.
+/// These settings are passed through to the Linux isolazi binary running
+/// inside the Lima or vfkit virtual machine.
+pub const LSMConfig = struct {
+    // AppArmor settings
+    /// Enable AppArmor confinement
+    apparmor_enabled: bool = false,
+    /// AppArmor profile name (null = use default "isolazi-default")
+    apparmor_profile: ?[]const u8 = null,
+    /// AppArmor enforcement mode
+    apparmor_mode: AppArmorMode = .enforce,
+
+    // SELinux settings
+    /// Enable SELinux labeling
+    selinux_enabled: bool = false,
+    /// Custom SELinux context string (format: user:role:type:level)
+    selinux_context: ?[]const u8 = null,
+    /// SELinux type for container process
+    selinux_type: SELinuxType = .container_t,
+    /// MCS category 1 for container isolation (null = auto-assign)
+    selinux_mcs_category1: ?u16 = null,
+    /// MCS category 2 for container isolation (null = auto-assign)
+    selinux_mcs_category2: ?u16 = null,
+
+    /// Check if any LSM is enabled
+    pub fn hasLSMEnabled(self: *const LSMConfig) bool {
+        return self.apparmor_enabled or self.selinux_enabled;
+    }
+
+    /// Build command line arguments for isolazi inside the VM.
+    /// Caller is responsible for freeing all allocated strings and the ArrayList.
+    pub fn toCmdArgs(self: *const LSMConfig, allocator: std.mem.Allocator) !std.ArrayList([]const u8) {
+        var args: std.ArrayList([]const u8) = .empty;
+        errdefer args.deinit(allocator);
+
+        // AppArmor arguments
+        if (self.apparmor_enabled) {
+            try args.append(allocator, "--apparmor");
+            if (self.apparmor_profile) |profile| {
+                try args.append(allocator, profile);
+            }
+
+            try args.append(allocator, "--apparmor-mode");
+            try args.append(allocator, self.apparmor_mode.toCmdString());
+        }
+
+        // SELinux arguments
+        if (self.selinux_enabled) {
+            try args.append(allocator, "--selinux");
+
+            if (self.selinux_context) |context| {
+                // Use custom context if provided
+                try args.append(allocator, context);
+            } else {
+                // Build context from type and MCS categories
+                try args.append(allocator, "--selinux-type");
+                try args.append(allocator, self.selinux_type.toCmdString());
+
+                // Add MCS categories if specified
+                if (self.selinux_mcs_category1) |cat1| {
+                    try args.append(allocator, "--selinux-mcs");
+                    if (self.selinux_mcs_category2) |cat2| {
+                        const mcs_str = try std.fmt.allocPrint(allocator, "c{d},c{d}", .{ cat1, cat2 });
+                        try args.append(allocator, mcs_str);
+                    } else {
+                        const mcs_str = try std.fmt.allocPrint(allocator, "c{d}", .{cat1});
+                        try args.append(allocator, mcs_str);
+                    }
+                }
+            }
+        }
+
+        return args;
+    }
+
+    /// Build shell script snippet for applying LSM configuration.
+    /// This generates the necessary commands for the Lima shell script.
+    pub fn toShellScript(self: *const LSMConfig, script: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+        // Note: In Lima, we use direct unshare/chroot rather than calling isolazi binary,
+        // so we need to apply LSM using shell commands if available.
+        // This uses aa-exec for AppArmor and runcon for SELinux.
+
+        if (self.apparmor_enabled) {
+            // Use aa-exec to run under an AppArmor profile
+            try script.appendSlice(allocator, "if command -v aa-exec >/dev/null 2>&1 && [ -f /sys/module/apparmor/parameters/enabled ]; then ");
+            try script.appendSlice(allocator, "AA_EXEC_ARGS=\"");
+
+            // Add profile argument
+            if (self.apparmor_profile) |profile| {
+                try script.appendSlice(allocator, "-p ");
+                try script.appendSlice(allocator, profile);
+            } else {
+                try script.appendSlice(allocator, "-p isolazi-default");
+            }
+
+            // Add mode-specific arguments
+            switch (self.apparmor_mode) {
+                .complain => try script.appendSlice(allocator, " --complain"),
+                .unconfined => {
+                    // For unconfined mode, don't use aa-exec
+                    try script.appendSlice(allocator, "\"; AA_EXEC_PREFIX=\"\"; ");
+                    try script.appendSlice(allocator, "else AA_EXEC_PREFIX=\"\"; fi; ");
+                    return;
+                },
+                .enforce => {}, // Default behavior
+            }
+
+            try script.appendSlice(allocator, "\"; AA_EXEC_PREFIX=\"aa-exec $AA_EXEC_ARGS -- \"; ");
+            try script.appendSlice(allocator, "else AA_EXEC_PREFIX=\"\"; fi; ");
+        }
+
+        if (self.selinux_enabled) {
+            // Use runcon to run with SELinux context
+            try script.appendSlice(allocator, "if command -v runcon >/dev/null 2>&1 && [ -d /sys/fs/selinux ]; then ");
+            try script.appendSlice(allocator, "SELINUX_CONTEXT=\"");
+
+            if (self.selinux_context) |context| {
+                try script.appendSlice(allocator, context);
+            } else {
+                // Build context from type and MCS
+                try script.appendSlice(allocator, "system_u:system_r:");
+                try script.appendSlice(allocator, self.selinux_type.toCmdString());
+                try script.appendSlice(allocator, ":s0");
+
+                // Add MCS categories if specified
+                if (self.selinux_mcs_category1) |cat1| {
+                    var cat1_buf: [16]u8 = undefined;
+                    const cat1_str = std.fmt.bufPrint(&cat1_buf, ":c{d}", .{cat1}) catch "";
+                    try script.appendSlice(allocator, cat1_str);
+
+                    if (self.selinux_mcs_category2) |cat2| {
+                        var cat2_buf: [16]u8 = undefined;
+                        const cat2_str = std.fmt.bufPrint(&cat2_buf, ",c{d}", .{cat2}) catch "";
+                        try script.appendSlice(allocator, cat2_str);
+                    }
+                }
+            }
+
+            try script.appendSlice(allocator, "\"; RUNCON_PREFIX=\"runcon $SELINUX_CONTEXT \"; ");
+            try script.appendSlice(allocator, "else RUNCON_PREFIX=\"\"; fi; ");
+        }
+    }
+};
+
 /// Check if Apple Virtualization is available on this system.
 /// Returns true on macOS 12.0+ with virtualization entitlement.
 pub fn isVirtualizationAvailable(allocator: std.mem.Allocator) bool {
@@ -217,9 +405,10 @@ pub fn runWithLima(
     stderr_path: ?[]const u8,
 ) !RunResult {
     return runWithLimaEx(allocator, "", rootfs_path, command, env_vars, volumes, port_mappings, rootless, detach, restart_policy, null, stdout_path, stderr_path);
+    return runWithLimaEx(allocator, "", rootfs_path, command, env_vars, volumes, port_mappings, rootless, detach, null, null, stdout_path, stderr_path);
 }
 
-/// Extended Lima runner with resource limits support
+/// Extended Lima runner with resource limits and LSM support
 pub fn runWithLimaEx(
     allocator: std.mem.Allocator,
     _: []const u8, // kernel_path - Lima manages its own kernel
@@ -232,6 +421,7 @@ pub fn runWithLimaEx(
     detach: bool,
     restart_policy: config_mod.Config.RestartPolicy,
     resource_limits: ?*const ResourceLimitsConfig,
+    lsm_config: ?*const LSMConfig,
     stdout_path: ?[]const u8,
     stderr_path: ?[]const u8,
 ) !RunResult {
@@ -243,6 +433,7 @@ pub fn runWithLimaEx(
             // Create and start the VM
             _ = try createLimaInstance(allocator);
             return runWithLimaEx(allocator, "", rootfs_path, command, env_vars, volumes, port_mappings, rootless, detach, restart_policy, resource_limits, stdout_path, stderr_path);
+            return runWithLimaEx(allocator, "", rootfs_path, command, env_vars, volumes, port_mappings, rootless, detach, resource_limits, lsm_config, stdout_path, stderr_path);
         },
 
         .Stopped, .Unknown => {
@@ -398,6 +589,11 @@ pub fn runWithLimaEx(
             try script.appendSlice(allocator, " 2>/dev/null; ");
         }
 
+        // Add LSM configuration setup (AppArmor/SELinux shell prefixes)
+        if (lsm_config) |lsm| {
+            try lsm.toShellScript(&script, allocator);
+        }
+
         // Add the unshare and chroot command with clean environment inside container
         try script.appendSlice(allocator, "unshare --mount --uts --ipc --pid --fork --mount-proc");
         if (rootless) {
@@ -504,6 +700,11 @@ pub fn runWithLimaEx(
                 try script.appendSlice(allocator, cont_port_str);
                 try script.appendSlice(allocator, " 2>/dev/null; ");
             }
+        }
+
+        // Add LSM configuration setup (AppArmor/SELinux shell prefixes)
+        if (lsm_config) |lsm| {
+            try lsm.toShellScript(&script, allocator);
         }
 
         // Add the unshare and chroot command with clean environment inside container
