@@ -18,6 +18,17 @@ A minimal container runtime written in Zig, inspired by Docker, Podman, and OCI 
 - 🍎 **macOS Support** - Run containers via Apple Virtualization framework
 - ⚡ **Fast & Lightweight** - Written in Zig with minimal dependencies
 
+## Current Status (January 26, 2026)
+
+- ✅ **Core commands**: `run`, `pull`, `images`, `ps`, `create`, `start`, `stop`, `rm`, `exec`, `logs`, `prune`, `update`
+- ✅ **Prune behavior**: `prune` removes stopped containers and unused images; `prune -f/--force` removes all containers
+- ✅ **Rootless mode**: `--rootless` with optional `--uid-map`/`--gid-map`
+- ✅ **Networking**: bridge + veth, NAT, port publishing (`-p`)
+- ✅ **Security**: seccomp filtering, AppArmor/SELinux toggles, user namespaces
+- ✅ **Resource limits**: cgroup v2 memory/CPU/I/O/OOM controls
+- ✅ **Platforms**: Linux (native), Windows (WSL2), macOS (Linux VM via Lima/vfkit)
+- ✅ **Cross-builds**: targets validated for `x86_64-windows`, `x86_64-linux`, `x86_64-macos`, `aarch64-macos`
+
 ## Installation
 
 ### Quick Install (Recommended)
@@ -211,6 +222,9 @@ isolazi inspect myapp
 
 # Clean up stopped containers and unused images
 isolazi prune
+
+# Force remove all containers and unused images
+isolazi prune -f
 ```
 
 ### Update Isolazi
@@ -295,7 +309,7 @@ COMMANDS:
     inspect <container>              Display container details
     pull <image>                     Pull an image from a registry
     images                           List cached images
-    prune                            Remove stopped containers and unused images
+    prune [-f]                       Remove stopped containers and unused images
     update                           Update isolazi to the latest version
     version                          Print version information
     help                             Print this help message
@@ -355,6 +369,9 @@ OPTIONS for 'ps':
 
 OPTIONS for 'rm':
     -f, --force          Force remove running container
+
+OPTIONS for 'prune':
+    -f, --force          Remove all containers (including running)
 ```
 
 ## Image References
@@ -658,7 +675,8 @@ isolazi stores data in `~/.isolazi/`:
 - ✅ Network namespace isolation - **Implemented**
 - ✅ Cgroup v2 resource limits - **Implemented**
 - ✅ Seccomp syscall filtering - **Implemented**
-- AppArmor/SELinux profiles (not yet implemented)
+- ✅ AppArmor profiles - **Implemented**
+- ✅ SELinux labeling - **Implemented**
 
 ### Resource Limits (cgroup v2)
 
