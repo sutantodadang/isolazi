@@ -1096,6 +1096,10 @@ fn runContainerWindows(
             allocated_paths[alloc_count] = wsl_host;
             alloc_count += 1;
         }
+        // Ensure host path exists (creates directory if missing)
+        try script_buf.appendSlice(allocator, "mkdir -p ");
+        try script_buf.appendSlice(allocator, wsl_host);
+        try script_buf.appendSlice(allocator, " && ");
         try script_buf.appendSlice(allocator, "mkdir -p ");
         try script_buf.appendSlice(allocator, wsl_rootfs);
         try script_buf.appendSlice(allocator, vol.container_path);
@@ -2882,12 +2886,21 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
                 }
             };
 
-            // Validate that the host path exists
-            std.fs.cwd().access(host_path, .{}) catch |err| {
-                try stderr.print("Error: Host volume path '{s}' does not exist: {}\n", .{ host_path, err });
-                try stderr.flush();
-                return 1;
-            };
+            // Ensure host path exists (create directory if missing)
+            if (std.fs.cwd().access(host_path, .{})) |_| {} else |err| switch (err) {
+                error.FileNotFound => {
+                    std.fs.cwd().makePath(host_path) catch |mk_err| {
+                        try stderr.print("Error: Failed to create host volume path '{s}': {}\n", .{ host_path, mk_err });
+                        try stderr.flush();
+                        return 1;
+                    };
+                },
+                else => {
+                    try stderr.print("Error: Host volume path '{s}' is not accessible: {}\n", .{ host_path, err });
+                    try stderr.flush();
+                    return 1;
+                },
+            }
 
             try vol_pairs.append(allocator, .{ .host_path = host_path, .container_path = v.container_path });
         }
