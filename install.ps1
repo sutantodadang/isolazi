@@ -56,11 +56,16 @@ function Show-Help {
 }
 
 function Get-Platform {
-    $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+    $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+    if ([string]::IsNullOrWhiteSpace($arch)) {
+        $arch = $env:PROCESSOR_ARCHITECTURE
+    }
+    $arch = $arch.ToUpperInvariant()
     
     switch ($arch) {
         "X64" { return "windows-x86_64" }
-        "Arm64" { return "windows-aarch64" }
+        "AMD64" { return "windows-x86_64" }
+        "ARM64" { return "windows-aarch64" }
         default { Write-Err "Unsupported architecture: $arch" }
     }
 }
