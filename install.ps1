@@ -56,15 +56,30 @@ function Show-Help {
 }
 
 function Get-Platform {
-    $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+    $arch = $null
+    try { $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() } catch {}
+
+    if ([string]::IsNullOrWhiteSpace($arch)) { $arch = $env:PROCESSOR_ARCHITECTURE }
+    if ([string]::IsNullOrWhiteSpace($arch)) { $arch = $env:PROCESSOR_ARCHITEW6432 }
+
     if ([string]::IsNullOrWhiteSpace($arch)) {
-        $arch = $env:PROCESSOR_ARCHITECTURE
+        try {
+            $osArch = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).OSArchitecture
+            if ($osArch -match "64") { $arch = "X64" }
+            elseif ($osArch -match "32") { $arch = "X86" }
+        } catch {}
     }
-    $arch = $arch.ToUpperInvariant()
-    
+
+    if ([string]::IsNullOrWhiteSpace($arch)) {
+        if ([Environment]::Is64BitOperatingSystem) { $arch = "X64" }
+    }
+
+    $arch = $arch.ToString().ToUpperInvariant()
+
     switch ($arch) {
         "X64" { return "windows-x86_64" }
         "AMD64" { return "windows-x86_64" }
+        "X86_64" { return "windows-x86_64" }
         "ARM64" { return "windows-aarch64" }
         default { Write-Err "Unsupported architecture: $arch" }
     }
