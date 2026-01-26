@@ -90,6 +90,7 @@ pub const Command = union(enum) {
     pull: PullCommand,
     exec: ExecCommand,
     logs: LogsCommand,
+    prune: PruneCommand,
     images: void,
     version: void,
     help: void,
@@ -190,6 +191,12 @@ pub const LogsCommand = struct {
     stderr_only: bool = false, // --stderr: show only stderr
 };
 
+/// Arguments for the 'prune' command
+/// Remove unused resources (containers/images)
+pub const PruneCommand = struct {
+    force: bool = false, // -f, --force: remove all containers (including running)
+};
+
 /// Parse command-line arguments.
 ///
 /// Expected format:
@@ -237,6 +244,10 @@ pub fn parse(args: []const []const u8) CliError!Command {
 
     if (std.mem.eql(u8, cmd, "logs")) {
         return parseLogsCommand(args[2..]);
+    }
+
+    if (std.mem.eql(u8, cmd, "prune")) {
+        return parsePruneCommand(args[2..]);
     }
 
     return CliError.UnknownCommand;
@@ -763,6 +774,23 @@ fn parseLogsCommand(args: []const []const u8) CliError!Command {
     return Command{ .logs = logs_cmd };
 }
 
+/// Parse the 'prune' subcommand arguments.
+fn parsePruneCommand(args: []const []const u8) CliError!Command {
+    var prune_cmd = PruneCommand{};
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--force")) {
+            prune_cmd.force = true;
+        } else {
+            return CliError.InvalidArgument;
+        }
+    }
+
+    return Command{ .prune = prune_cmd };
+}
+
 /// Parse an environment variable string "KEY=VALUE"
 fn parseEnvVar(s: []const u8) ?EnvVar {
     const eq_pos = std.mem.indexOf(u8, s, "=") orelse return null;
@@ -982,7 +1010,7 @@ pub fn printHelp(writer: anytype) !void {
         \\    inspect <container>              Display container details
         \\    pull <image>                     Pull an image from a registry
         \\    images                           List cached images
-        \\    prune                            Remove all stopped containers and unused images
+        \\    prune [-f]                       Remove stopped containers and unused images
         \\    update                           Update isolazi to the latest version
         \\    version                          Print version information
         \\    help                             Print this help message
@@ -1012,6 +1040,8 @@ pub fn printHelp(writer: anytype) !void {
         \\    -t, --timestamps          Show timestamps with each line
         \\    --stdout                  Show only stdout logs
         \\    --stderr                  Show only stderr logs
+        \\OPTIONS for 'prune':
+        \\    -f, --force               Remove all containers (including running)
         \\
         \\RESOURCE LIMITS:
         \\    -m, --memory <limit>      Memory limit (e.g., 512m, 1g, 2048k)
@@ -1093,6 +1123,7 @@ pub fn printHelp(writer: anytype) !void {
         \\    isolazi ps -a
         \\    isolazi stop myapp
         \\    isolazi prune
+        \\    isolazi prune -f
         \\    isolazi rm myapp
         \\    isolazi exec mycontainer /bin/sh
         \\    isolazi exec -it mycontainer /bin/bash

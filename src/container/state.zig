@@ -536,8 +536,10 @@ pub const ContainerManager = struct {
         try self.updateState(container_id, .stopped, null, null);
     }
 
-    /// Prune all non-running containers
-    pub fn pruneContainers(self: *Self) !u64 {
+    /// Prune containers.
+    /// - When force is false: remove only non-running containers.
+    /// - When force is true: remove all containers (running will be stopped first).
+    pub fn pruneContainers(self: *Self, force: bool) !u64 {
         var removed: u64 = 0;
 
         var dir = std.fs.cwd().openDir(self.base_path, .{ .iterate = true }) catch {
@@ -565,15 +567,15 @@ pub const ContainerManager = struct {
                 info_mut.deinit();
             }
 
-            // Only prune non-running containers
-            if (info.state != .running) {
+            // Only prune non-running containers unless forced
+            if (force or info.state != .running) {
                 try to_remove.append(self.allocator, try self.allocator.dupe(u8, entry.name));
             }
         }
 
         // Now remove them
         for (to_remove.items) |container_id| {
-            self.removeContainer(container_id, true) catch continue;
+            self.removeContainer(container_id, force) catch continue;
             removed += 1;
         }
 
