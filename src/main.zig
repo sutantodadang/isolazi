@@ -124,7 +124,7 @@ const runOnWindows = if (builtin.os.tag == .windows) struct {
                 return inspectContainerWindows(allocator, args, stdout, stderr);
             }
             if (std.mem.eql(u8, cmd, "prune")) {
-                return pruneWindows(allocator, stdout, stderr);
+                return pruneWindows(allocator, args, stdout, stderr);
             }
             if (std.mem.eql(u8, cmd, "logs")) {
                 return logsContainerWindows(allocator, args, stdout, stderr);
@@ -1854,6 +1854,7 @@ fn pruneImagesOnly(
     allocator: std.mem.Allocator,
     stdout: anytype,
     stderr: anytype,
+    force: bool,
 ) !u8 {
     var cache = isolazi.image.ImageCache.init(allocator) catch |err| {
         try stderr.print("Warning: Failed to initialize image cache: {}\n", .{err});
@@ -1862,7 +1863,7 @@ fn pruneImagesOnly(
     };
     defer cache.deinit();
 
-    const rootfs_removed = cache.removeAllContainers() catch 0;
+    const rootfs_removed: u64 = if (force) cache.removeAllContainers() catch 0 else 0;
     const images_removed = cache.removeAllImages() catch 0;
 
     try stdout.print("Deleted {d} container rootfs\n", .{rootfs_removed});
@@ -1875,23 +1876,44 @@ fn pruneImagesOnly(
 /// Prune all stopped containers and unused images
 fn pruneWindows(
     allocator: std.mem.Allocator,
+    args: []const []const u8,
     stdout: anytype,
     stderr: anytype,
 ) !u8 {
-    try stdout.writeAll("Pruning stopped containers and unused images...\n");
+    var force = false;
+    var arg_idx: usize = 2; // Skip program name and command
+    while (arg_idx < args.len) : (arg_idx += 1) {
+        const arg = args[arg_idx];
+        if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--force")) {
+            force = true;
+        } else {
+            try stderr.print("Error: Unknown option '{s}'\n", .{arg});
+            try stderr.writeAll("Usage: isolazi prune [-f|--force]\n");
+            try stderr.flush();
+            return 1;
+        }
+    }
+
+    if (force) {
+        try stdout.writeAll("Pruning ALL containers (force) and unused images...\n");
+    } else {
+        try stdout.writeAll("Pruning stopped containers and unused images...\n");
+    }
     try stdout.flush();
 
     var containers_removed: u64 = 0;
     var images_removed: u64 = 0;
+    var rootfs_removed: u64 = 0;
 
     // Prune containers via ContainerManager
     var manager = isolazi.container.ContainerManager.init(allocator) catch |err| {
         try stderr.print("Warning: Failed to initialize container manager: {}\n", .{err});
         try stderr.flush();
-        return pruneImagesOnly(allocator, stdout, stderr);
+        return pruneImagesOnly(allocator, stdout, stderr, force);
     };
     defer manager.deinit();
-    containers_removed = manager.pruneContainers() catch 0;
+    containers_removed = manager.pruneContainers(force) catch 0;
+    rootfs_removed = containers_removed;
 
     // Prune images via ImageCache
     var cache = isolazi.image.ImageCache.init(allocator) catch |err| {
@@ -1902,9 +1924,6 @@ fn pruneWindows(
         return 0;
     };
     defer cache.deinit();
-
-    // Remove all container rootfs from cache
-    const rootfs_removed = cache.removeAllContainers() catch 0;
 
     // Remove all images
     images_removed = cache.removeAllImages() catch 0;
@@ -2391,7 +2410,7 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
                 return inspectContainerMacOS(allocator, args, stdout, stderr);
             }
             if (std.mem.eql(u8, cmd, "prune")) {
-                return pruneMacOS(allocator, stdout, stderr);
+                return pruneMacOS(allocator, args, stdout, stderr);
             }
             if (std.mem.eql(u8, cmd, "exec")) {
                 return execContainerMacOS(allocator, args, stdout, stderr);
@@ -3370,6 +3389,7 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
         allocator: std.mem.Allocator,
         stdout: anytype,
         stderr: anytype,
+        force: bool,
     ) !u8 {
         var cache = isolazi.image.ImageCache.init(allocator) catch |err| {
             try stderr.print("Warning: Failed to initialize image cache: {}\n", .{err});
@@ -3378,7 +3398,7 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
         };
         defer cache.deinit();
 
-        const rootfs_removed = cache.removeAllContainers() catch 0;
+        const rootfs_removed: u64 = if (force) cache.removeAllContainers() catch 0 else 0;
         const images_removed = cache.removeAllImages() catch 0;
 
         try stdout.print("Deleted {d} container rootfs\n", .{rootfs_removed});
@@ -3391,23 +3411,44 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
     /// Prune all stopped containers and unused images
     fn pruneMacOS(
         allocator: std.mem.Allocator,
+        args: []const []const u8,
         stdout: anytype,
         stderr: anytype,
     ) !u8 {
-        try stdout.writeAll("Pruning stopped containers and unused images...\n");
+        var force = false;
+        var arg_idx: usize = 2; // Skip program name and command
+        while (arg_idx < args.len) : (arg_idx += 1) {
+            const arg = args[arg_idx];
+            if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--force")) {
+                force = true;
+            } else {
+                try stderr.print("Error: Unknown option '{s}'\n", .{arg});
+                try stderr.writeAll("Usage: isolazi prune [-f|--force]\n");
+                try stderr.flush();
+                return 1;
+            }
+        }
+
+        if (force) {
+            try stdout.writeAll("Pruning ALL containers (force) and unused images...\n");
+        } else {
+            try stdout.writeAll("Pruning stopped containers and unused images...\n");
+        }
         try stdout.flush();
 
         var containers_removed: u64 = 0;
         var images_removed: u64 = 0;
+        var rootfs_removed: u64 = 0;
 
         // Prune containers via ContainerManager
         var manager = isolazi.container.ContainerManager.init(allocator) catch |err| {
             try stderr.print("Warning: Failed to initialize container manager: {}\n", .{err});
             try stderr.flush();
-            return pruneMacOSImagesOnly(allocator, stdout, stderr);
+            return pruneMacOSImagesOnly(allocator, stdout, stderr, force);
         };
         defer manager.deinit();
-        containers_removed = manager.pruneContainers() catch 0;
+        containers_removed = manager.pruneContainers(force) catch 0;
+        rootfs_removed = containers_removed;
 
         // Prune images via ImageCache
         var cache = isolazi.image.ImageCache.init(allocator) catch |err| {
@@ -3418,9 +3459,6 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
             return 0;
         };
         defer cache.deinit();
-
-        // Remove all container rootfs from cache
-        const rootfs_removed = cache.removeAllContainers() catch 0;
 
         // Remove all images
         images_removed = cache.removeAllImages() catch 0;
@@ -3908,6 +3946,9 @@ const runOnLinux = if (builtin.os.tag == .linux) struct {
             .logs => |logs_cmd| {
                 return logsContainerLinuxImpl(allocator, logs_cmd, stdout, stderr);
             },
+            .prune => |prune_cmd| {
+                return pruneLinuxImpl(allocator, prune_cmd, stdout, stderr);
+            },
         }
     }
 
@@ -4047,6 +4088,54 @@ const runOnLinux = if (builtin.os.tag == .linux) struct {
         });
 
         try stdout.flush();
+        return 0;
+    }
+
+    fn pruneLinuxImpl(
+        allocator: std.mem.Allocator,
+        prune_cmd: isolazi.cli.PruneCommand,
+        stdout: anytype,
+        stderr: anytype,
+    ) !u8 {
+        if (prune_cmd.force) {
+            try stdout.writeAll("Pruning ALL containers (force) and unused images...\n");
+        } else {
+            try stdout.writeAll("Pruning stopped containers and unused images...\n");
+        }
+        try stdout.flush();
+
+        var containers_removed: u64 = 0;
+        var images_removed: u64 = 0;
+        var rootfs_removed: u64 = 0;
+
+        // Prune containers via ContainerManager
+        var manager = isolazi.container.ContainerManager.init(allocator) catch |err| {
+            try stderr.print("Warning: Failed to initialize container manager: {}\n", .{err});
+            try stderr.flush();
+            return pruneImagesOnly(allocator, stdout, stderr, prune_cmd.force);
+        };
+        defer manager.deinit();
+        containers_removed = manager.pruneContainers(prune_cmd.force) catch 0;
+        rootfs_removed = containers_removed;
+
+        // Prune images via ImageCache
+        var cache = isolazi.image.ImageCache.init(allocator) catch |err| {
+            try stderr.print("Warning: Failed to initialize image cache: {}\n", .{err});
+            try stderr.flush();
+            try stdout.print("Deleted {d} containers\n", .{containers_removed});
+            try stdout.flush();
+            return 0;
+        };
+        defer cache.deinit();
+
+        images_removed = cache.removeAllImages() catch 0;
+
+        try stdout.print("Deleted {d} containers\n", .{containers_removed});
+        try stdout.print("Deleted {d} container rootfs\n", .{rootfs_removed});
+        try stdout.print("Deleted {d} image blobs\n", .{images_removed});
+        try stdout.writeAll("Prune complete.\n");
+        try stdout.flush();
+
         return 0;
     }
 
