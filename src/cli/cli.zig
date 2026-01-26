@@ -20,7 +20,7 @@ const runtime_mod = @import("../runtime/mod.zig");
 const Config = config_mod.Config;
 
 /// CLI version string
-pub const VERSION = "0.1.17";
+pub const VERSION = "0.1.18";
 
 /// CLI error types
 pub const CliError = error{
@@ -918,6 +918,11 @@ pub fn buildConfig(run_cmd: *const RunCommand) !Config {
 
     // Copy volume mounts
     for (run_cmd.volumes) |vol| {
+        // Ensure host path exists (create directory if missing)
+        if (std.fs.cwd().access(vol.host_path, .{})) |_| {} else |err| switch (err) {
+            error.FileNotFound => std.fs.cwd().makePath(vol.host_path) catch return err,
+            else => return err,
+        }
         try cfg.addMount(vol.host_path, vol.container_path, vol.read_only);
     }
 

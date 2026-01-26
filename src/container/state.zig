@@ -361,7 +361,10 @@ pub const ContainerManager = struct {
 
             // 2. Platform-specific backend check (fallback or primary)
             if (!alive) {
-                if (builtin.os.tag == .macos) {
+                if (builtin.os.tag == .windows) {
+                    // On Windows, check WSL by container tag
+                    alive = self.isContainerAliveWSLByTag(id_str) catch false;
+                } else if (builtin.os.tag == .macos) {
                     // On macOS, containers run in Lima VM. Check if still alive there.
                     const macos = @import("../macos/virtualization.zig");
                     alive = macos.isContainerAliveInLima(self.allocator, id_str) catch false;
@@ -403,6 +406,21 @@ pub const ContainerManager = struct {
         defer self.allocator.free(result.stderr);
 
         return result.term.Exited == 0;
+    }
+
+    /// Helper to check if a container is alive in WSL2 by tag
+    fn isContainerAliveWSLByTag(self: *Self, container_id: []const u8) !bool {
+        const tag = try std.fmt.allocPrint(self.allocator, "ISOLAZI_ID={s}", .{container_id});
+        defer self.allocator.free(tag);
+
+        const result = std.process.Child.run(.{
+            .allocator = self.allocator,
+            .argv = &[_][]const u8{ "wsl", "-u", "root", "--", "pgrep", "-f", tag },
+        }) catch return false;
+        defer self.allocator.free(result.stdout);
+        defer self.allocator.free(result.stderr);
+
+        return result.term.Exited == 0 and result.stdout.len > 0;
     }
 
     /// List all containers
