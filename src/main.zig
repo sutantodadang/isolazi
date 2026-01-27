@@ -1303,7 +1303,7 @@ fn runContainerWindows(
         cmd_str_len += copy_len;
     }
 
-    _ = manager.createContainerWithId(&container_id, image_name, cmd_str_buf[0..cmd_str_len], null, .no) catch |err| {
+    _ = manager.createContainerWithId(&container_id, image_name, cmd_str_buf[0..cmd_str_len], null, .no, &[_]isolazi.container.state.PortMapping{}, &[_]isolazi.container.state.VolumeMount{}, &[_]isolazi.container.state.EnvVar{}) catch |err| {
         try stderr.print("Warning: Failed to register container: {}\n", .{err});
     };
 
@@ -1623,10 +1623,39 @@ fn startContainerWindows(
     var wsl_cmd: std.ArrayList([]const u8) = .empty;
     defer wsl_cmd.deinit(allocator);
 
+    // Track dynamically allocated strings to free later
+    var dynamic_allocs: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (dynamic_allocs.items) |s| allocator.free(s);
+        dynamic_allocs.deinit(allocator);
+    }
+
     try wsl_cmd.append(allocator, "wsl");
     try wsl_cmd.append(allocator, "-u");
     try wsl_cmd.append(allocator, "root");
     try wsl_cmd.append(allocator, "--");
+
+    // Add environment variables using env command
+    try wsl_cmd.append(allocator, "env");
+    try wsl_cmd.append(allocator, "-i");
+    try wsl_cmd.append(allocator, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    try wsl_cmd.append(allocator, "HOME=/root");
+    try wsl_cmd.append(allocator, "TERM=xterm");
+
+    // Add ISOLAZI_ID
+    const isolazi_id = try std.fmt.allocPrint(allocator, "ISOLAZI_ID={s}", .{container_id});
+    try dynamic_allocs.append(allocator, isolazi_id);
+    try wsl_cmd.append(allocator, isolazi_id);
+
+    // Add stored environment variables
+    for (info.env_vars) |e| {
+        if (!std.mem.eql(u8, e.key, "ISOLAZI_ID")) {
+            const env_str = try std.fmt.allocPrint(allocator, "{s}={s}", .{ e.key, e.value });
+            try dynamic_allocs.append(allocator, env_str);
+            try wsl_cmd.append(allocator, env_str);
+        }
+    }
+
     try wsl_cmd.append(allocator, "unshare");
     try wsl_cmd.append(allocator, "--mount");
     try wsl_cmd.append(allocator, "--uts");
@@ -2813,9 +2842,6 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
             cmd_display_len = sh.len;
         }
 
-        // Register container state
-        _ = manager.createContainerWithId(&container_id, opts.image_name, cmd_display[0..cmd_display_len], null, opts.restart_policy) catch {};
-
         if (opts.detach_mode) {
             try stdout.print("{s}\n", .{container_id});
             try stdout.flush();
@@ -2926,6 +2952,49 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
         }
         if (opts.ports.len > 0) {
             try stdout.flush();
+        }
+
+        // Register container state with persisted ports/volumes/env for restart support
+        {
+            // Convert to state.zig format for persistence
+            var persist_ports: std.ArrayList(isolazi.container.state.PortMapping) = .empty;
+            defer persist_ports.deinit(allocator);
+            for (opts.ports) |p| {
+                try persist_ports.append(allocator, .{
+                    .host_port = p.host_port,
+                    .container_port = p.container_port,
+                    .protocol = if (p.protocol == .udp) .udp else .tcp,
+                });
+            }
+
+            var persist_vols: std.ArrayList(isolazi.container.state.VolumeMount) = .empty;
+            defer persist_vols.deinit(allocator);
+            for (vol_pairs.items) |v| {
+                try persist_vols.append(allocator, .{
+                    .host_path = v.host_path,
+                    .container_path = v.container_path,
+                });
+            }
+
+            var persist_envs: std.ArrayList(isolazi.container.state.EnvVar) = .empty;
+            defer persist_envs.deinit(allocator);
+            for (env_pairs.items) |e| {
+                try persist_envs.append(allocator, .{
+                    .key = e.key,
+                    .value = e.value,
+                });
+            }
+
+            _ = manager.createContainerWithId(
+                &container_id,
+                opts.image_name,
+                cmd_display[0..cmd_display_len],
+                null,
+                opts.restart_policy,
+                persist_ports.items,
+                persist_vols.items,
+                persist_envs.items,
+            ) catch {};
         }
 
         // Run in VM using appropriate hypervisor
@@ -3188,15 +3257,47 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
         defer allocator.free(cmd_split);
         cmd_split[0] = info.command;
 
-        // Basic start (no saved ports/vols for now in this simple implementation)
+        // Convert stored ports to virtualization format
+        var port_pairs: std.ArrayList(isolazi.macos.virtualization.PortMapping) = .empty;
+        defer port_pairs.deinit(allocator);
+        for (info.ports) |p| {
+            try port_pairs.append(allocator, .{
+                .host_port = p.host_port,
+                .container_port = p.container_port,
+                .protocol = if (p.protocol == .udp) .udp else .tcp,
+            });
+        }
+
+        // Convert stored volumes to virtualization format
+        var vol_pairs: std.ArrayList(isolazi.macos.virtualization.VolumePair) = .empty;
+        defer vol_pairs.deinit(allocator);
+        for (info.volumes) |v| {
+            try vol_pairs.append(allocator, .{
+                .host_path = v.host_path,
+                .container_path = v.container_path,
+            });
+        }
+
+        // Convert stored env vars to virtualization format, always include ISOLAZI_ID
+        var env_pairs: std.ArrayList(isolazi.macos.virtualization.EnvPair) = .empty;
+        defer env_pairs.deinit(allocator);
+        try env_pairs.append(allocator, .{ .key = "ISOLAZI_ID", .value = container_id });
+        for (info.env_vars) |e| {
+            // Skip ISOLAZI_ID if already present in stored env (avoid duplicates)
+            if (!std.mem.eql(u8, e.key, "ISOLAZI_ID")) {
+                try env_pairs.append(allocator, .{ .key = e.key, .value = e.value });
+            }
+        }
+
+        // Start with restored ports, volumes, and env vars
         const result = isolazi.macos.virtualization.runWithLima(
             allocator,
             "",
             rootfs_path,
             cmd_split,
-            &[_]isolazi.macos.virtualization.EnvPair{.{ .key = "ISOLAZI_ID", .value = container_id }},
-            &[_]isolazi.macos.virtualization.VolumePair{},
-            &[_]isolazi.macos.virtualization.PortMapping{},
+            env_pairs.items,
+            vol_pairs.items,
+            port_pairs.items,
             false, // rootless
             true, // detach (start usually implies background)
             info.restart_policy,
@@ -4340,7 +4441,7 @@ const runOnLinux = if (builtin.os.tag == .linux) struct {
         @memcpy(cmd_display[0..cmd_len], run_cmd.command[0..cmd_len]);
 
         // Register container and update to running
-        _ = manager.createContainerWithId(&cid_buf, run_cmd.rootfs, cmd_display[0..cmd_len], null, .no) catch {};
+        _ = manager.createContainerWithId(&cid_buf, run_cmd.rootfs, cmd_display[0..cmd_len], null, .no, &[_]isolazi.container.state.PortMapping{}, &[_]isolazi.container.state.VolumeMount{}, &[_]isolazi.container.state.EnvVar{}) catch {};
         manager.updateState(&cid_buf, .running, null, null) catch {};
 
         const result = isolazi.runtime.run(&cfg, allocator, &cid_buf_short) catch |err| {
