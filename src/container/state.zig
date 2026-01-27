@@ -32,6 +32,42 @@ pub const ContainerState = enum {
     }
 };
 
+/// Port mapping for container networking (persistent version for state.json)
+pub const PortMapping = struct {
+    host_port: u16,
+    container_port: u16,
+    protocol: Protocol = .tcp,
+
+    pub const Protocol = enum {
+        tcp,
+        udp,
+
+        pub fn toString(self: Protocol) []const u8 {
+            return switch (self) {
+                .tcp => "tcp",
+                .udp => "udp",
+            };
+        }
+
+        pub fn fromString(s: []const u8) Protocol {
+            if (std.mem.eql(u8, s, "udp")) return .udp;
+            return .tcp;
+        }
+    };
+};
+
+/// Volume mount for container (persistent version)
+pub const VolumeMount = struct {
+    host_path: []const u8,
+    container_path: []const u8,
+};
+
+/// Environment variable pair (persistent version)
+pub const EnvVar = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
 /// Container metadata stored on disk
 pub const ContainerInfo = struct {
     id: [32]u8,
@@ -47,12 +83,33 @@ pub const ContainerInfo = struct {
 
     restart_policy: config_mod.Config.RestartPolicy = .no,
 
+    /// Persisted port mappings for container restart
+    ports: []PortMapping = &[_]PortMapping{},
+    /// Persisted volume mounts for container restart
+    volumes: []VolumeMount = &[_]VolumeMount{},
+    /// Persisted environment variables for container restart
+    env_vars: []EnvVar = &[_]EnvVar{},
+
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *ContainerInfo) void {
         self.allocator.free(self.image);
         self.allocator.free(self.command);
         if (self.name) |n| self.allocator.free(n);
+        // Free port mappings
+        self.allocator.free(self.ports);
+        // Free volume mounts (strings are slices into parsed JSON, freed with parse result)
+        for (self.volumes) |v| {
+            self.allocator.free(v.host_path);
+            self.allocator.free(v.container_path);
+        }
+        self.allocator.free(self.volumes);
+        // Free env vars
+        for (self.env_vars) |e| {
+            self.allocator.free(e.key);
+            self.allocator.free(e.value);
+        }
+        self.allocator.free(self.env_vars);
     }
 
     pub fn shortId(self: *const ContainerInfo) []const u8 {
@@ -157,6 +214,7 @@ pub const ContainerManager = struct {
     }
 
     /// Create a new container with a pre-generated ID (does not start it)
+    /// Now also persists ports, volumes, and env_vars for restart support
     pub fn createContainerWithId(
         self: *Self,
         container_id: *const [32]u8,
@@ -164,6 +222,9 @@ pub const ContainerManager = struct {
         command: []const u8,
         name: ?[]const u8,
         restart_policy: config_mod.Config.RestartPolicy,
+        ports: []const PortMapping,
+        volumes: []const VolumeMount,
+        env_vars: []const EnvVar,
     ) !void {
 
         // Create container directory
@@ -175,36 +236,84 @@ pub const ContainerManager = struct {
         const state_path = try std.fmt.allocPrint(self.allocator, "{s}/state.json", .{container_dir});
         defer self.allocator.free(state_path);
 
-        // Build name string
-        var name_buf: [256]u8 = undefined;
-        const name_str: []const u8 = if (name) |n|
-            std.fmt.bufPrint(&name_buf, "\"{s}\"", .{n}) catch "null"
-        else
-            "null";
+        // Build JSON dynamically using ArrayList
+        var json: std.ArrayList(u8) = .empty;
+        defer json.deinit(self.allocator);
 
-        var json_buf: [4096]u8 = undefined;
-        const json = try std.fmt.bufPrint(&json_buf,
-            \\{{
-            \\  "id": "{s}",
-            \\  "image": "{s}",
-            \\  "command": "{s}",
-            \\  "state": "created",
-            \\  "created_at": {d},
-            \\  "name": {s},
-            \\  "restart_policy": "{s}"
-            \\}}
-        , .{
-            container_id,
-            image,
-            command,
-            std.time.timestamp(),
-            name_str,
-            restart_policy.toString(),
-        });
+        try json.appendSlice(self.allocator, "{\n");
+        try json.appendSlice(self.allocator, "  \"id\": \"");
+        try json.appendSlice(self.allocator, container_id);
+        try json.appendSlice(self.allocator, "\",\n");
+        try json.appendSlice(self.allocator, "  \"image\": \"");
+        try json.appendSlice(self.allocator, image);
+        try json.appendSlice(self.allocator, "\",\n");
+        try json.appendSlice(self.allocator, "  \"command\": \"");
+        try json.appendSlice(self.allocator, command);
+        try json.appendSlice(self.allocator, "\",\n");
+        try json.appendSlice(self.allocator, "  \"state\": \"created\",\n");
+
+        // created_at
+        var time_buf: [32]u8 = undefined;
+        const time_str = try std.fmt.bufPrint(&time_buf, "{d}", .{std.time.timestamp()});
+        try json.appendSlice(self.allocator, "  \"created_at\": ");
+        try json.appendSlice(self.allocator, time_str);
+        try json.appendSlice(self.allocator, ",\n");
+
+        // name
+        try json.appendSlice(self.allocator, "  \"name\": ");
+        if (name) |n| {
+            try json.append(self.allocator, '"');
+            try json.appendSlice(self.allocator, n);
+            try json.append(self.allocator, '"');
+        } else {
+            try json.appendSlice(self.allocator, "null");
+        }
+        try json.appendSlice(self.allocator, ",\n");
+
+        // restart_policy
+        try json.appendSlice(self.allocator, "  \"restart_policy\": \"");
+        try json.appendSlice(self.allocator, restart_policy.toString());
+        try json.appendSlice(self.allocator, "\",\n");
+
+        // ports array
+        try json.appendSlice(self.allocator, "  \"ports\": [");
+        for (ports, 0..) |p, i| {
+            if (i > 0) try json.append(self.allocator, ',');
+            var port_buf: [128]u8 = undefined;
+            const port_str = try std.fmt.bufPrint(&port_buf, "{{\"host_port\":{d},\"container_port\":{d},\"protocol\":\"{s}\"}}", .{ p.host_port, p.container_port, p.protocol.toString() });
+            try json.appendSlice(self.allocator, port_str);
+        }
+        try json.appendSlice(self.allocator, "],\n");
+
+        // volumes array
+        try json.appendSlice(self.allocator, "  \"volumes\": [");
+        for (volumes, 0..) |v, i| {
+            if (i > 0) try json.append(self.allocator, ',');
+            try json.appendSlice(self.allocator, "{\"host_path\":\"");
+            try json.appendSlice(self.allocator, v.host_path);
+            try json.appendSlice(self.allocator, "\",\"container_path\":\"");
+            try json.appendSlice(self.allocator, v.container_path);
+            try json.appendSlice(self.allocator, "\"}");
+        }
+        try json.appendSlice(self.allocator, "],\n");
+
+        // env_vars array
+        try json.appendSlice(self.allocator, "  \"env_vars\": [");
+        for (env_vars, 0..) |e, i| {
+            if (i > 0) try json.append(self.allocator, ',');
+            try json.appendSlice(self.allocator, "{\"key\":\"");
+            try json.appendSlice(self.allocator, e.key);
+            try json.appendSlice(self.allocator, "\",\"value\":\"");
+            try json.appendSlice(self.allocator, e.value);
+            try json.appendSlice(self.allocator, "\"}");
+        }
+        try json.appendSlice(self.allocator, "]\n");
+
+        try json.appendSlice(self.allocator, "}");
 
         const file = try std.fs.cwd().createFile(state_path, .{});
         defer file.close();
-        try file.writeAll(json);
+        try file.writeAll(json.items);
     }
 
     /// Update container state
@@ -376,6 +485,84 @@ pub const ContainerManager = struct {
             }
         }
 
+        // Parse ports array
+        var ports: std.ArrayList(PortMapping) = .empty;
+        errdefer ports.deinit(self.allocator);
+        if (root.get("ports")) |ports_val| {
+            if (ports_val == .array) {
+                for (ports_val.array.items) |item| {
+                    const obj = item.object;
+                    const host_port: u16 = @intCast(obj.get("host_port").?.integer);
+                    const container_port: u16 = @intCast(obj.get("container_port").?.integer);
+                    const proto_str = if (obj.get("protocol")) |p| p.string else "tcp";
+                    try ports.append(self.allocator, .{
+                        .host_port = host_port,
+                        .container_port = container_port,
+                        .protocol = PortMapping.Protocol.fromString(proto_str),
+                    });
+                }
+            }
+        }
+        const ports_slice = try ports.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(ports_slice);
+
+        // Parse volumes array
+        var vols: std.ArrayList(VolumeMount) = .empty;
+        errdefer {
+            for (vols.items) |v| {
+                self.allocator.free(v.host_path);
+                self.allocator.free(v.container_path);
+            }
+            vols.deinit(self.allocator);
+        }
+        if (root.get("volumes")) |vols_val| {
+            if (vols_val == .array) {
+                for (vols_val.array.items) |item| {
+                    const obj = item.object;
+                    const hp = try self.allocator.dupe(u8, obj.get("host_path").?.string);
+                    errdefer self.allocator.free(hp);
+                    const cp = try self.allocator.dupe(u8, obj.get("container_path").?.string);
+                    try vols.append(self.allocator, .{
+                        .host_path = hp,
+                        .container_path = cp,
+                    });
+                }
+            }
+        }
+        const vols_slice = try vols.toOwnedSlice(self.allocator);
+        errdefer {
+            for (vols_slice) |v| {
+                self.allocator.free(v.host_path);
+                self.allocator.free(v.container_path);
+            }
+            self.allocator.free(vols_slice);
+        }
+
+        // Parse env_vars array
+        var envs: std.ArrayList(EnvVar) = .empty;
+        errdefer {
+            for (envs.items) |e| {
+                self.allocator.free(e.key);
+                self.allocator.free(e.value);
+            }
+            envs.deinit(self.allocator);
+        }
+        if (root.get("env_vars")) |envs_val| {
+            if (envs_val == .array) {
+                for (envs_val.array.items) |item| {
+                    const obj = item.object;
+                    const key = try self.allocator.dupe(u8, obj.get("key").?.string);
+                    errdefer self.allocator.free(key);
+                    const value = try self.allocator.dupe(u8, obj.get("value").?.string);
+                    try envs.append(self.allocator, .{
+                        .key = key,
+                        .value = value,
+                    });
+                }
+            }
+        }
+        const envs_slice = try envs.toOwnedSlice(self.allocator);
+
         return ContainerInfo{
             .id = id,
             .image = try self.allocator.dupe(u8, image_val),
@@ -388,6 +575,9 @@ pub const ContainerManager = struct {
             .exit_code = if (root.get("exit_code")) |v| if (v == .integer) @intCast(v.integer) else null else null,
             .name = if (root.get("name")) |v| if (v == .string) try self.allocator.dupe(u8, v.string) else null else null,
             .restart_policy = restart_policy,
+            .ports = ports_slice,
+            .volumes = vols_slice,
+            .env_vars = envs_slice,
             .allocator = self.allocator,
         };
     }
