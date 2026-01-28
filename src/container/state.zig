@@ -599,18 +599,20 @@ pub const ContainerManager = struct {
     }
 
     /// Helper to check if a container is alive in WSL2 by tag
+    /// Uses exact matching to prevent matching containers with overlapping ID prefixes
     fn isContainerAliveWSLByTag(self: *Self, container_id: []const u8) !bool {
-        const tag = try std.fmt.allocPrint(self.allocator, "ISOLAZI_ID={s}", .{container_id});
-        defer self.allocator.free(tag);
+        // Use exact match via /proc/*/environ to prevent substring matching issues
+        const cmd = try std.fmt.allocPrint(self.allocator, "for f in /proc/[0-9]*/environ; do if [ -r \"$f\" ] && tr '\\0' '\\n' < \"$f\" 2>/dev/null | grep -qx 'ISOLAZI_ID={s}'; then exit 0; fi; done; exit 1", .{container_id});
+        defer self.allocator.free(cmd);
 
         const result = std.process.Child.run(.{
             .allocator = self.allocator,
-            .argv = &[_][]const u8{ "wsl", "-u", "root", "--", "pgrep", "-f", tag },
+            .argv = &[_][]const u8{ "wsl", "-u", "root", "--", "sh", "-c", cmd },
         }) catch return false;
         defer self.allocator.free(result.stdout);
         defer self.allocator.free(result.stderr);
 
-        return result.term.Exited == 0 and result.stdout.len > 0;
+        return result.term.Exited == 0;
     }
 
     /// List all containers
@@ -699,17 +701,30 @@ pub const ContainerManager = struct {
                     self.allocator.free(res.stderr);
                 } else |_| {}
             }
-            // Also call pkill in WSL using the tag
-            const tag = std.fmt.allocPrint(self.allocator, "ISOLAZI_ID={s}", .{container_id}) catch "";
-            defer if (tag.len > 0) self.allocator.free(tag);
-            if (tag.len > 0) {
-                if (std.process.Child.run(.{
+            // Find and kill processes with exact ISOLAZI_ID match via /proc/*/environ
+            // Use exact line matching to prevent stopping containers with overlapping ID prefixes
+            const find_cmd = std.fmt.allocPrint(self.allocator, "for f in /proc/[0-9]*/environ; do if [ -r \"$f\" ] && tr '\\0' '\\n' < \"$f\" 2>/dev/null | grep -qx 'ISOLAZI_ID={s}'; then echo \"$f\" | cut -d/ -f3; fi; done", .{container_id}) catch "";
+            defer if (find_cmd.len > 0) self.allocator.free(find_cmd);
+            if (find_cmd.len > 0) {
+                const result = std.process.Child.run(.{
                     .allocator = self.allocator,
-                    .argv = &[_][]const u8{ "wsl", "-u", "root", "--", "pkill", "-f", tag },
-                })) |res| {
-                    self.allocator.free(res.stdout);
-                    self.allocator.free(res.stderr);
-                } else |_| {}
+                    .argv = &[_][]const u8{ "wsl", "-u", "root", "--", "sh", "-c", find_cmd },
+                }) catch null;
+                if (result) |res| {
+                    defer self.allocator.free(res.stdout);
+                    defer self.allocator.free(res.stderr);
+                    // Kill each PID found
+                    var it = std.mem.tokenizeAny(u8, res.stdout, " \t\r\n");
+                    while (it.next()) |pid_str| {
+                        if (std.process.Child.run(.{
+                            .allocator = self.allocator,
+                            .argv = &[_][]const u8{ "wsl", "-u", "root", "--", "kill", "-TERM", pid_str },
+                        })) |kill_res| {
+                            self.allocator.free(kill_res.stdout);
+                            self.allocator.free(kill_res.stderr);
+                        } else |_| {}
+                    }
+                }
             }
         } else if (builtin.os.tag == .macos) {
             // On macOS, kill the local proxy process AND the remote processes in VM
@@ -727,17 +742,25 @@ pub const ContainerManager = struct {
             if (info.pid) |pid| {
                 _ = std.posix.kill(pid, std.posix.SIG.TERM) catch {};
             }
-            // Also call pkill using the tag for any orphaned processes in the same namespace group
-            const tag = std.fmt.allocPrint(self.allocator, "ISOLAZI_ID={s}", .{container_id}) catch "";
-            defer if (tag.len > 0) self.allocator.free(tag);
-            if (tag.len > 0) {
-                if (std.process.Child.run(.{
+            // Find and kill processes with exact ISOLAZI_ID match via /proc/*/environ
+            // Use exact line matching to prevent stopping containers with overlapping ID prefixes
+            const find_cmd = std.fmt.allocPrint(self.allocator, "for f in /proc/[0-9]*/environ; do if [ -r \"$f\" ] && tr '\\0' '\\n' < \"$f\" 2>/dev/null | grep -qx 'ISOLAZI_ID={s}'; then echo \"$f\" | cut -d/ -f3; fi; done", .{container_id}) catch "";
+            defer if (find_cmd.len > 0) self.allocator.free(find_cmd);
+            if (find_cmd.len > 0) {
+                const result = std.process.Child.run(.{
                     .allocator = self.allocator,
-                    .argv = &[_][]const u8{ "pkill", "-f", tag },
-                })) |res| {
-                    self.allocator.free(res.stdout);
-                    self.allocator.free(res.stderr);
-                } else |_| {}
+                    .argv = &[_][]const u8{ "sh", "-c", find_cmd },
+                }) catch null;
+                if (result) |res| {
+                    defer self.allocator.free(res.stdout);
+                    defer self.allocator.free(res.stderr);
+                    // Kill each PID found
+                    var it = std.mem.tokenizeAny(u8, res.stdout, " \t\r\n");
+                    while (it.next()) |pid_str| {
+                        const pid = std.fmt.parseInt(i32, pid_str, 10) catch continue;
+                        _ = std.posix.kill(pid, std.posix.SIG.TERM) catch {};
+                    }
+                }
             }
         }
 

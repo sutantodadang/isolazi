@@ -839,8 +839,10 @@ pub fn stopInLima(allocator: std.mem.Allocator, container_id: []const u8) !void 
         allocator.free(res.stderr);
     } else |_| {}
 
-    // 2. Fallback: Find PIDs via /proc/*/environ using find to avoid glob expansion issues
-    const find_cmd = try std.fmt.allocPrint(allocator, "sudo find /proc -maxdepth 2 -name environ -exec grep -l \"ISOLAZI_ID={s}\" {{}} + 2>/dev/null | cut -d/ -f3", .{container_id});
+    // 2. Fallback: Find PIDs via /proc/*/environ using exact match
+    // Use tr to convert null-separated environ to newlines, then grep -x for exact line match
+    // This prevents matching containers where one ID is a prefix of another
+    const find_cmd = try std.fmt.allocPrint(allocator, "for f in /proc/[0-9]*/environ; do if [ -r \"$f\" ] && tr '\\0' '\\n' < \"$f\" 2>/dev/null | grep -qx 'ISOLAZI_ID={s}'; then echo \"$f\" | cut -d/ -f3; fi; done", .{container_id});
     defer allocator.free(find_cmd);
 
     const result = std.process.Child.run(.{
@@ -906,8 +908,10 @@ pub fn isContainerAliveInLima(allocator: std.mem.Allocator, container_id: []cons
         return true;
     }
 
-    // 2. Fallback: Search /proc/*/environ for the tag using find
-    const grep_cmd = try std.fmt.allocPrint(allocator, "sudo find /proc -maxdepth 2 -name environ -exec grep -q \"ISOLAZI_ID={s}\" {{}} + 2>/dev/null", .{container_id});
+    // 2. Fallback: Search /proc/*/environ for the tag using exact match
+    // Use tr to convert null-separated environ to newlines, then grep -x for exact line match
+    // This prevents matching containers where one ID is a prefix of another
+    const grep_cmd = try std.fmt.allocPrint(allocator, "for f in /proc/[0-9]*/environ; do if [ -r \"$f\" ] && tr '\\0' '\\n' < \"$f\" 2>/dev/null | grep -qx 'ISOLAZI_ID={s}'; then exit 0; fi; done; exit 1", .{container_id});
     defer allocator.free(grep_cmd);
 
     const result = std.process.Child.run(.{
