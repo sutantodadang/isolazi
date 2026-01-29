@@ -92,7 +92,7 @@ function Get-LatestVersion {
             $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -UseBasicParsing
             $script:Version = $release.tag_name
         } catch {
-            Write-Err "Failed to fetch latest version. Please specify a version with -Version v0.1.11"
+            Write-Warn "Could not resolve 'latest' tag via API. Will attempt direct download."
         }
     }
     Write-Info "Installing version: $Version"
@@ -105,13 +105,21 @@ function Install-Binary {
     Write-Info "Detected platform: $Platform"
     
     # Try different download URL patterns
-    $urls = @(
-        "https://github.com/$Repo/releases/download/$Version/isolazi-$Platform.zip",
-        "https://github.com/$Repo/releases/download/$Version/isolazi-windows-x86_64.zip",
-        "https://github.com/$Repo/releases/download/$Version/isolazi_$Platform.zip",
-        "https://github.com/$Repo/releases/download/$Version/isolazi-$Platform.tar.gz",
-        "https://github.com/$Repo/releases/download/$Version/isolazi-windows-x86_64.tar.gz"
-    )
+    $urls = @()
+    if ($Version -eq "latest") {
+        $urls += "https://github.com/$Repo/releases/latest/download/isolazi-$Platform.zip"
+        $urls += "https://github.com/$Repo/releases/latest/download/isolazi-windows-x86_64.zip"
+        $urls += "https://github.com/$Repo/releases/latest/download/isolazi_$Platform.zip"
+        # Fallback to tar.gz
+        $urls += "https://github.com/$Repo/releases/latest/download/isolazi-$Platform.tar.gz"
+        $urls += "https://github.com/$Repo/releases/latest/download/isolazi-windows-x86_64.tar.gz"
+    } else {
+        $urls += "https://github.com/$Repo/releases/download/$Version/isolazi-$Platform.zip"
+        $urls += "https://github.com/$Repo/releases/download/$Version/isolazi-windows-x86_64.zip"
+        $urls += "https://github.com/$Repo/releases/download/$Version/isolazi_$Platform.zip"
+        $urls += "https://github.com/$Repo/releases/download/$Version/isolazi-$Platform.tar.gz"
+        $urls += "https://github.com/$Repo/releases/download/$Version/isolazi-windows-x86_64.tar.gz"
+    }
     
     $tmpDir = Join-Path $env:TEMP "isolazi-install-$(Get-Random)"
     New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
