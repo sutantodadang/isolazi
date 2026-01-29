@@ -68,9 +68,14 @@ pub fn isMacOS() bool {
     return builtin.os.tag == .macos;
 }
 
+// Errors module (cross-platform)
+pub const errors = @import("errors.zig");
+
 // Re-export commonly used types
 pub const Config = config.Config;
 pub const Namespaces = config.Namespaces;
+pub const ErrorCode = errors.ErrorCode;
+pub const AppError = errors.AppError;
 
 // Re-export Linux-only types when on Linux
 pub const Runtime = if (builtin.os.tag == .linux) runtime.Runtime else void;

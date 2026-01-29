@@ -249,11 +249,15 @@ pub fn fork() SyscallError!linux.pid_t {
 /// Tuple of (pid, status)
 pub fn waitpid(pid: linux.pid_t, options: u32) SyscallError!struct { pid: linux.pid_t, status: u32 } {
     var status: u32 = 0;
-    const result = linux.waitpid(pid, &status, options);
-    if (result < 0) {
-        return errnoToError(linux.E.init(@intCast(-result)));
+    while (true) {
+        const result = linux.waitpid(pid, &status, options);
+        if (result < 0) {
+            const errno = linux.E.init(@intCast(-result));
+            if (errno == .INTR) continue;
+            return errnoToError(errno);
+        }
+        return .{ .pid = @intCast(result), .status = status };
     }
-    return .{ .pid = @intCast(result), .status = status };
 }
 
 /// Change current working directory.

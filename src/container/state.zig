@@ -599,10 +599,11 @@ pub const ContainerManager = struct {
     }
 
     /// Helper to check if a container is alive in WSL2 by tag
-    /// Uses exact matching to prevent matching containers with overlapping ID prefixes
+    /// Uses grep to search directly in process environments
     fn isContainerAliveWSLByTag(self: *Self, container_id: []const u8) !bool {
-        // Use exact match via /proc/*/environ to prevent substring matching issues
-        const cmd = try std.fmt.allocPrint(self.allocator, "for f in /proc/[0-9]*/environ; do if [ -r \"$f\" ] && tr '\\0' '\\n' < \"$f\" 2>/dev/null | grep -qx 'ISOLAZI_ID={s}'; then exit 0; fi; done; exit 1", .{container_id});
+        // Use grep -a -q to search in binary files directly and exit on first match
+        // This is much faster and more reliable than the shell loop
+        const cmd = try std.fmt.allocPrint(self.allocator, "grep -a -q 'ISOLAZI_ID={s}' /proc/[0-9]*/environ", .{container_id});
         defer self.allocator.free(cmd);
 
         const result = std.process.Child.run(.{
@@ -612,6 +613,7 @@ pub const ContainerManager = struct {
         defer self.allocator.free(result.stdout);
         defer self.allocator.free(result.stderr);
 
+        // grep exits with 0 if match found
         return result.term.Exited == 0;
     }
 
@@ -702,8 +704,8 @@ pub const ContainerManager = struct {
                 } else |_| {}
             }
             // Find and kill processes with exact ISOLAZI_ID match via /proc/*/environ
-            // Use exact line matching to prevent stopping containers with overlapping ID prefixes
-            const find_cmd = std.fmt.allocPrint(self.allocator, "for f in /proc/[0-9]*/environ; do if [ -r \"$f\" ] && tr '\\0' '\\n' < \"$f\" 2>/dev/null | grep -qx 'ISOLAZI_ID={s}'; then echo \"$f\" | cut -d/ -f3; fi; done", .{container_id}) catch "";
+            // Use grep -a -l to find files containing the ID, then extract PID
+            const find_cmd = std.fmt.allocPrint(self.allocator, "grep -l -a 'ISOLAZI_ID={s}' /proc/[0-9]*/environ 2>/dev/null | cut -d/ -f3", .{container_id}) catch "";
             defer if (find_cmd.len > 0) self.allocator.free(find_cmd);
             if (find_cmd.len > 0) {
                 const result = std.process.Child.run(.{
@@ -743,8 +745,8 @@ pub const ContainerManager = struct {
                 _ = std.posix.kill(pid, std.posix.SIG.TERM) catch {};
             }
             // Find and kill processes with exact ISOLAZI_ID match via /proc/*/environ
-            // Use exact line matching to prevent stopping containers with overlapping ID prefixes
-            const find_cmd = std.fmt.allocPrint(self.allocator, "for f in /proc/[0-9]*/environ; do if [ -r \"$f\" ] && tr '\\0' '\\n' < \"$f\" 2>/dev/null | grep -qx 'ISOLAZI_ID={s}'; then echo \"$f\" | cut -d/ -f3; fi; done", .{container_id}) catch "";
+            // Use grep -a -l to find files containing the ID, then extract PID
+            const find_cmd = std.fmt.allocPrint(self.allocator, "grep -l -a 'ISOLAZI_ID={s}' /proc/[0-9]*/environ 2>/dev/null | cut -d/ -f3", .{container_id}) catch "";
             defer if (find_cmd.len > 0) self.allocator.free(find_cmd);
             if (find_cmd.len > 0) {
                 const result = std.process.Child.run(.{

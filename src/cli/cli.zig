@@ -20,7 +20,7 @@ const runtime_mod = @import("../runtime/mod.zig");
 const Config = config_mod.Config;
 
 /// CLI version string
-pub const VERSION = "0.1.19";
+pub const VERSION = "0.2.0";
 
 /// CLI error types
 pub const CliError = error{
@@ -91,6 +91,12 @@ pub const Command = union(enum) {
     exec: ExecCommand,
     logs: LogsCommand,
     prune: PruneCommand,
+    ps: PsCommand,
+    start: StartCommand,
+    stop: StopCommand,
+    rm: RmCommand,
+    inspect: InspectCommand,
+    create: CreateCommand,
     images: void,
     version: void,
     help: void,
@@ -197,6 +203,40 @@ pub const PruneCommand = struct {
     force: bool = false, // -f, --force: remove all containers (including running)
 };
 
+/// Arguments for the 'ps' command
+pub const PsCommand = struct {
+    all: bool = false, // -a, --all: show all containers
+};
+
+/// Arguments for the 'start' command
+pub const StartCommand = struct {
+    container_id: []const u8,
+};
+
+/// Arguments for the 'stop' command
+pub const StopCommand = struct {
+    container_id: []const u8,
+};
+
+/// Arguments for the 'rm' command
+pub const RmCommand = struct {
+    container_id: []const u8,
+    force: bool = false, // -f, --force: force removal
+};
+
+/// Arguments for the 'inspect' command
+pub const InspectCommand = struct {
+    container_id: []const u8,
+};
+
+/// Arguments for the 'create' command (placeholder for now)
+pub const CreateCommand = struct {
+    image: []const u8,
+    command: []const u8,
+    args: []const []const u8,
+    // Add other fields from RunCommand as needed
+};
+
 /// Parse command-line arguments.
 ///
 /// Expected format:
@@ -248,6 +288,30 @@ pub fn parse(args: []const []const u8) CliError!Command {
 
     if (std.mem.eql(u8, cmd, "prune")) {
         return parsePruneCommand(args[2..]);
+    }
+
+    if (std.mem.eql(u8, cmd, "ps")) {
+        return parsePsCommand(args[2..]);
+    }
+
+    if (std.mem.eql(u8, cmd, "start")) {
+        return parseStartCommand(args[2..]);
+    }
+
+    if (std.mem.eql(u8, cmd, "stop")) {
+        return parseStopCommand(args[2..]);
+    }
+
+    if (std.mem.eql(u8, cmd, "rm")) {
+        return parseRmCommand(args[2..]);
+    }
+
+    if (std.mem.eql(u8, cmd, "inspect")) {
+        return parseInspectCommand(args[2..]);
+    }
+
+    if (std.mem.eql(u8, cmd, "create")) {
+        return parseCreateCommand(args[2..]);
     }
 
     return CliError.UnknownCommand;
@@ -789,6 +853,58 @@ fn parsePruneCommand(args: []const []const u8) CliError!Command {
     }
 
     return Command{ .prune = prune_cmd };
+}
+
+fn parsePsCommand(args: []const []const u8) CliError!Command {
+    var cmd = PsCommand{};
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "-a") or std.mem.eql(u8, arg, "--all")) {
+            cmd.all = true;
+        }
+    }
+    return Command{ .ps = cmd };
+}
+
+fn parseStartCommand(args: []const []const u8) CliError!Command {
+    if (args.len < 1) return CliError.MissingContainerId;
+    return Command{ .start = .{ .container_id = args[0] } };
+}
+
+fn parseStopCommand(args: []const []const u8) CliError!Command {
+    if (args.len < 1) return CliError.MissingContainerId;
+    return Command{ .stop = .{ .container_id = args[0] } };
+}
+
+fn parseRmCommand(args: []const []const u8) CliError!Command {
+    if (args.len < 1) return CliError.MissingContainerId;
+    var cmd = RmCommand{ .container_id = undefined };
+    var found_id = false;
+
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--force")) {
+            cmd.force = true;
+        } else if (!found_id) {
+            cmd.container_id = arg;
+            found_id = true;
+        }
+    }
+    if (!found_id) return CliError.MissingContainerId;
+    return Command{ .rm = cmd };
+}
+
+fn parseInspectCommand(args: []const []const u8) CliError!Command {
+    if (args.len < 1) return CliError.MissingContainerId;
+    return Command{ .inspect = .{ .container_id = args[0] } };
+}
+
+fn parseCreateCommand(args: []const []const u8) CliError!Command {
+    // Basic implementation for now
+    if (args.len < 2) return CliError.MissingImage;
+    return Command{ .create = .{
+        .image = args[0],
+        .command = args[1],
+        .args = if (args.len > 2) args[2..] else &[_][]const u8{},
+    } };
 }
 
 /// Parse an environment variable string "KEY=VALUE"
