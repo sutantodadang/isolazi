@@ -839,10 +839,9 @@ pub fn stopInLima(allocator: std.mem.Allocator, container_id: []const u8) !void 
         allocator.free(res.stderr);
     } else |_| {}
 
-    // 2. Fallback: Find PIDs via /proc/*/environ using exact match
-    // Use tr to convert null-separated environ to newlines, then grep -x for exact line match
-    // This prevents matching containers where one ID is a prefix of another
-    const find_cmd = try std.fmt.allocPrint(allocator, "for f in /proc/[0-9]*/environ; do if [ -r \"$f\" ] && tr '\\0' '\\n' < \"$f\" 2>/dev/null | grep -qx 'ISOLAZI_ID={s}'; then echo \"$f\" | cut -d/ -f3; fi; done", .{container_id});
+    // 2. Fallback: Find PIDs via /proc/*/environ using grep
+    // Use grep -a -l to find files containing the ID, then extract PID
+    const find_cmd = try std.fmt.allocPrint(allocator, "grep -l -a 'ISOLAZI_ID={s}' /proc/[0-9]*/environ 2>/dev/null | cut -d/ -f3", .{container_id});
     defer allocator.free(find_cmd);
 
     const result = std.process.Child.run(.{
@@ -908,10 +907,9 @@ pub fn isContainerAliveInLima(allocator: std.mem.Allocator, container_id: []cons
         return true;
     }
 
-    // 2. Fallback: Search /proc/*/environ for the tag using exact match
-    // Use tr to convert null-separated environ to newlines, then grep -x for exact line match
-    // This prevents matching containers where one ID is a prefix of another
-    const grep_cmd = try std.fmt.allocPrint(allocator, "for f in /proc/[0-9]*/environ; do if [ -r \"$f\" ] && tr '\\0' '\\n' < \"$f\" 2>/dev/null | grep -qx 'ISOLAZI_ID={s}'; then exit 0; fi; done; exit 1", .{container_id});
+    // 2. Fallback: Search /proc/*/environ for the tag using grep
+    // Use grep -a -q to search in binary files directly and exit on first match
+    const grep_cmd = try std.fmt.allocPrint(allocator, "grep -a -q 'ISOLAZI_ID={s}' /proc/[0-9]*/environ", .{container_id});
     defer allocator.free(grep_cmd);
 
     const result = std.process.Child.run(.{
@@ -940,14 +938,40 @@ pub fn isLimaRunning(allocator: std.mem.Allocator) bool {
     return checkLimaStatus(allocator) == .Running;
 }
 
-const LimaStatus = enum {
+/// Ensure the Lima VM is created and running
+pub fn ensureVMRunning(allocator: std.mem.Allocator) !void {
+    const status = checkLimaStatus(allocator);
+    switch (status) {
+        .Running => return,
+        .NotExists => {
+            // Create and start the VM
+            try createLimaInstance(allocator);
+        },
+        .Stopped, .Unknown => {
+            // VM exists but stopped (or unknown), try to start it
+            const start_result = std.process.Child.run(.{
+                .allocator = allocator,
+                .argv = &[_][]const u8{ "limactl", "start", "isolazi" },
+            }) catch return VirtualizationError.VMStartFailed;
+
+            defer allocator.free(start_result.stdout);
+            defer allocator.free(start_result.stderr);
+
+            if (start_result.term.Exited != 0) {
+                return VirtualizationError.VMStartFailed;
+            }
+        },
+    }
+}
+
+pub const LimaStatus = enum {
     Running,
     Stopped,
     NotExists,
     Unknown,
 };
 
-fn checkLimaStatus(allocator: std.mem.Allocator) LimaStatus {
+pub fn checkLimaStatus(allocator: std.mem.Allocator) LimaStatus {
     const result = std.process.Child.run(.{
         .allocator = allocator,
         .argv = &[_][]const u8{ "limactl", "list", "--format={{.Status}}", "isolazi" },

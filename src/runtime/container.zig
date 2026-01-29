@@ -49,6 +49,7 @@ const std = @import("std");
 const linux = @import("../linux/mod.zig");
 const config_mod = @import("../config/mod.zig");
 const fs_mod = @import("../fs/mod.zig");
+const container_mod = @import("../container/mod.zig");
 
 const Config = config_mod.Config;
 
@@ -153,6 +154,24 @@ pub const Runtime = struct {
                 // Close unused pipe ends
                 std.posix.close(child_ready_pipe[1]); // Close write end
                 std.posix.close(parent_done_pipe[0]); // Close read end
+            }
+
+            // Update container state with PID immediately after fork
+            // This allows 'inspect' to show the running container's PID
+            if (self.container_id.len > 0) {
+                var manager = container_mod.ContainerManager.init(self.allocator) catch |err| {
+                    std.debug.print("Warning: Failed to init container manager for PID tracking: {}\n", .{err});
+                    // Continue anyway - PID tracking is not critical for execution
+                    return self.parentProcess(
+                        pid,
+                        if (needs_sync) child_ready_pipe[0] else null,
+                        if (needs_sync) parent_done_pipe[1] else null,
+                    );
+                };
+                defer manager.deinit();
+                manager.updateState(self.container_id, .running, pid, null) catch |err| {
+                    std.debug.print("Warning: Failed to update state with PID: {}\n", .{err});
+                };
             }
 
             // Set up user namespace mappings, cgroup, network and wait for the container to finish
