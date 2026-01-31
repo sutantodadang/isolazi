@@ -31,6 +31,7 @@ pub const CacheError = error{
     DiskFull,
     AccessDenied,
     OutOfMemory,
+    IoError,
 };
 
 /// Info about a cached image (for listing)
@@ -38,11 +39,14 @@ pub const CachedImageInfo = struct {
     registry: []const u8,
     repository: []const u8,
     tag: []const u8,
+    size: u64,
+    image_id: []const u8,
 
     pub fn deinit(self: *CachedImageInfo, allocator: std.mem.Allocator) void {
         allocator.free(self.registry);
         allocator.free(self.repository);
         allocator.free(self.tag);
+        allocator.free(self.image_id);
     }
 };
 
@@ -99,12 +103,13 @@ pub const ImageCache = struct {
             "/images/blobs/sha256",
             "/images/manifests",
             "/containers",
+            "/build-cache",
         };
 
         for (dirs) |dir| {
-            const full_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ base_path, dir });
-            defer allocator.free(full_path);
-            std.fs.cwd().makePath(full_path) catch |e| switch (e) {
+            const dir_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ base_path, dir });
+            defer allocator.free(dir_path);
+            std.fs.cwd().makePath(dir_path) catch |e| switch (e) {
                 error.PathAlreadyExists => {},
                 else => return CacheError.AccessDenied,
             };
@@ -118,6 +123,32 @@ pub const ImageCache = struct {
 
     pub fn deinit(self: *Self) void {
         self.allocator.free(self.base_path);
+    }
+
+    /// Get a cached layer digest for a given build key
+    pub fn getBuildCache(self: *Self, key: []const u8) CacheError!?[]const u8 {
+        const cache_path = std.fmt.allocPrint(self.allocator, "{s}/build-cache/{s}", .{ self.base_path, key }) catch return CacheError.OutOfMemory;
+        defer self.allocator.free(cache_path);
+
+        const file = std.fs.cwd().openFile(cache_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return CacheError.AccessDenied,
+        };
+        defer file.close();
+
+        const digest = file.readToEndAlloc(self.allocator, 1024) catch return CacheError.IoError;
+        return digest;
+    }
+
+    /// Store a layer digest in the build cache
+    pub fn putBuildCache(self: *Self, key: []const u8, digest: []const u8) CacheError!void {
+        const cache_path = std.fmt.allocPrint(self.allocator, "{s}/build-cache/{s}", .{ self.base_path, key }) catch return CacheError.OutOfMemory;
+        defer self.allocator.free(cache_path);
+
+        const file = std.fs.cwd().createFile(cache_path, .{}) catch return CacheError.IoError;
+        defer file.close();
+
+        file.writeAll(digest) catch return CacheError.IoError;
     }
 
     /// Get the path for a blob by its digest
@@ -409,11 +440,67 @@ pub const ImageCache = struct {
                         if (repo_len >= repo_name.len) break;
                     }
 
+                    // Open manifest to get size and ID
+                    const tag_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ repo_path, tag_entry.name });
+                    defer allocator.free(tag_path);
+
+                    var size: u64 = 0;
+                    var image_id: []const u8 = try allocator.dupe(u8, "unknown");
+
+                    if (std.fs.cwd().openFile(tag_path, .{})) |manifest_file| {
+                        defer manifest_file.close();
+                        if (manifest_file.readToEndAlloc(allocator, 10 * 1024 * 1024)) |content| {
+                            defer allocator.free(content);
+
+                            if (std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch null) |parsed| {
+                                defer parsed.deinit();
+                                const root = parsed.value;
+
+                                if (root == .object) {
+                                    // Get config size and ID
+                                    if (root.object.get("config")) |config| {
+                                        if (config == .object) {
+                                            if (config.object.get("size")) |s| {
+                                                if (s == .integer) size += @intCast(s.integer);
+                                            }
+                                            if (config.object.get("digest")) |d| {
+                                                if (d == .string) {
+                                                    allocator.free(image_id); // free "unknown"
+                                                    if (d.string.len > 19) {
+                                                        // Shorten ID (sha256:123456789012) -> 123456789012
+                                                        image_id = try allocator.dupe(u8, d.string[7..19]);
+                                                    } else {
+                                                        image_id = try allocator.dupe(u8, d.string);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Get layers size
+                                    if (root.object.get("layers")) |layers| {
+                                        if (layers == .array) {
+                                            for (layers.array.items) |layer_item| {
+                                                if (layer_item == .object) {
+                                                    if (layer_item.object.get("size")) |s| {
+                                                        if (s == .integer) size += @intCast(s.integer);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else |_| {}
+                    } else |_| {}
+
                     // Create owned strings for the image info
                     const info = CachedImageInfo{
                         .registry = try allocator.dupe(u8, registry_entry.name),
                         .repository = try allocator.dupe(u8, repo_name[0..repo_len]),
                         .tag = try allocator.dupe(u8, tag_name),
+                        .size = size,
+                        .image_id = image_id,
                     };
                     try images.append(allocator, info);
                 }

@@ -33,6 +33,9 @@ pub const reference = @import("reference.zig");
 pub const registry = @import("registry.zig");
 pub const layer = @import("layer.zig");
 pub const cache = @import("cache.zig");
+pub const isolazifile = @import("isolazifile.zig");
+pub const builder = @import("builder.zig");
+pub const executor = @import("executor.zig");
 
 // Re-export main types for convenience
 pub const ImageReference = reference.ImageReference;

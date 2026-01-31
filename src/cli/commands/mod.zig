@@ -15,3 +15,4 @@ pub const update = @import("update.zig");
 pub const container = @import("container.zig");
 pub const create = @import("create.zig");
 pub const vm = @import("vm.zig");
+pub const build = @import("build.zig");
