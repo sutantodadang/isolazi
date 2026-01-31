@@ -20,7 +20,8 @@ A minimal container runtime written in Zig, inspired by Docker, Podman, and OCI 
 
 ## Current Status (January 26, 2026)
 
-- ✅ **Core commands**: `run`, `pull`, `images`, `ps`, `create`, `start`, `stop`, `rm`, `exec`, `logs`, `prune`, `update`
+- ✅ **Core commands**: `run`, `build`, `pull`, `images`, `ps`, `create`, `start`, `stop`, `rm`, `exec`, `logs`, `prune`, `update`
+- ✅ **Image Builder**: Build images from Isolazifile/Dockerfile (`FROM`, `RUN`, `COPY`, `ADD`, `ENV`, `WORKDIR`, `ARG`, `CMD`, `ENTRYPOINT`)
 - ✅ **Prune behavior**: `prune` removes stopped containers and unused images; `prune -f/--force` removes all containers
 - ✅ **Rootless mode**: `--rootless` with optional `--uid-map`/`--gid-map`
 - ✅ **Networking**: bridge + veth, NAT, port publishing (`-p`)
@@ -117,6 +118,27 @@ echo 'set -gx PATH $PATH $HOME/.isolazi/bin' >> ~/.config/fish/config.fish
 ```bash
 isolazi pull alpine:latest
 ```
+
+### Build an Image
+
+Create an `Isolazifile` (or `Dockerfile`):
+```dockerfile
+FROM alpine:latest
+RUN echo "Hello from Isolazi Build" > /message.txt
+CMD cat /message.txt
+```
+
+Build the image:
+```bash
+isolazi build -t my-image:v1 .
+```
+
+The image will be available locally:
+```bash
+isolazi images
+```
+
+See [docs/BUILD.md](docs/BUILD.md) for full documentation on supported instructions and options.
 
 ### Run a Container
 
@@ -299,6 +321,7 @@ isolazi <COMMAND> [OPTIONS]
 
 COMMANDS:
     run [-d] <image> [command]       Run a command in a new container
+    build [OPTIONS] <path>           Build an image from an Isolazifile
     exec [OPTIONS] <container> <cmd> Execute a command in a running container
     logs [-f] <container>            Display container logs
     create [--name NAME] <image>     Create a container without starting
@@ -313,6 +336,13 @@ COMMANDS:
     update                           Update isolazi to the latest version
     version                          Print version information
     help                             Print this help message
+
+OPTIONS for 'build':
+    -f, --file <path>         Name of the Isolazifile (default: 'Isolazifile')
+    -t, --tag <name>          Name and optionally a tag in the 'name:tag' format
+    --build-arg <arg>         Set build-time variables
+    --no-cache                Do not use cache when building the image
+    -q, --quiet               Suppress the build output and print image ID on success
 
 OPTIONS for 'run':
     -d, --detach              Run container in background

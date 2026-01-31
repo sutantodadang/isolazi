@@ -37,19 +37,23 @@ pub fn listImages(
     }
 
     // Print header
-    stdout.writeAll("REPOSITORY                          TAG       \n") catch {};
-    stdout.writeAll("--------------------------------------------\n") catch {};
+    stdout.writeAll("REPOSITORY                          TAG                 IMAGE ID       SIZE\n") catch {};
+    stdout.writeAll("--------------------------------------------------------------------------------\n") catch {};
 
     // Print images
     if (images.len == 0) {
         stdout.writeAll("(no images)\n") catch {};
     } else {
         for (images) |img| {
-            stdout.print("{s}/{s}                  {s}\n", .{
+            stdout.print("{s}/{s: <27} {s: <19} {s: <12} {d:.2}MB\n", .{
                 img.registry,
                 img.repository,
                 img.tag,
-            }) catch {};
+                img.image_id,
+                @as(f64, @floatFromInt(img.size)) / 1024.0 / 1024.0,
+            }) catch |err| {
+                stderr.print("Error printing image: {}\n", .{err}) catch {};
+            };
         }
     }
 

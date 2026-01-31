@@ -114,6 +114,7 @@ const runOnWindows = if (builtin.os.tag == .windows) struct {
             .inspect => |cmd| return commands.inspect.inspectContainer(allocator, cmd, stdout, stderr),
             .logs => |cmd| return commands.logs.showLogs(allocator, cmd, stdout, stderr),
             .prune => |cmd| return commands.prune.prune(allocator, cmd, stdout, stderr),
+            .build => |cmd| return commands.build.buildImage(allocator, cmd, stdout, stderr),
         }
 
         // Check if WSL is available (only needed for 'run' command)
@@ -264,6 +265,7 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
             .inspect => |inspect_cmd| return commands.inspect.inspectContainer(allocator, inspect_cmd, stdout, stderr),
             .logs => |logs_cmd| return commands.logs.showLogs(allocator, logs_cmd, stdout, stderr),
             .prune => |prune_cmd| return commands.prune.prune(allocator, prune_cmd, stdout, stderr),
+            .build => |build_cmd| return commands.build.buildImage(allocator, build_cmd, stdout, stderr),
         }
     }
 
@@ -336,6 +338,7 @@ const runOnLinux = if (builtin.os.tag == .linux) struct {
             .rm => |cmd| return commands.container.removeContainer(allocator, cmd, stdout, stderr),
             .inspect => |cmd| return commands.inspect.inspectContainer(allocator, cmd, stdout, stderr),
             .create => |_| return commands.create.createContainer(allocator, args, stdout, stderr),
+            .build => |build_cmd| return commands.build.buildImage(allocator, build_cmd, stdout, stderr),
         }
     }
 

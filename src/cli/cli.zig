@@ -97,6 +97,7 @@ pub const Command = union(enum) {
     rm: RmCommand,
     inspect: InspectCommand,
     create: CreateCommand,
+    build: BuildCommand,
     images: void,
     version: void,
     help: void,
@@ -237,6 +238,21 @@ pub const CreateCommand = struct {
     // Add other fields from RunCommand as needed
 };
 
+/// Arguments for the 'build' command
+pub const BuildCommand = struct {
+    context_path: []const u8,
+    file: ?[]const u8 = null,
+    tag: ?[]const u8 = null,
+    build_args: []const BuildArg = &[_]BuildArg{},
+    no_cache: bool = false,
+    quiet: bool = false,
+
+    pub const BuildArg = struct {
+        name: []const u8,
+        value: []const u8,
+    };
+};
+
 /// Parse command-line arguments.
 ///
 /// Expected format:
@@ -312,6 +328,10 @@ pub fn parse(args: []const []const u8) CliError!Command {
 
     if (std.mem.eql(u8, cmd, "create")) {
         return parseCreateCommand(args[2..]);
+    }
+
+    if (std.mem.eql(u8, cmd, "build")) {
+        return parseBuildCommand(args[2..]);
     }
 
     return CliError.UnknownCommand;
@@ -1287,6 +1307,64 @@ pub fn printError(writer: anytype, err: CliError) !void {
     };
     try writer.print("Error: {s}\n", .{msg});
     try writer.writeAll("Run 'isolazi help' for usage information.\n");
+}
+
+/// Maximum number of build arguments
+const MAX_BUILD_ARGS = 32;
+
+/// Parse the 'build' subcommand arguments.
+/// Usage: isolazi build [options] <context>
+fn parseBuildCommand(args: []const []const u8) CliError!Command {
+    var build_cmd = BuildCommand{
+        .context_path = ".",
+    };
+
+    var build_args_buf: [MAX_BUILD_ARGS]BuildCommand.BuildArg = undefined;
+    var build_args_count: usize = 0;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+
+        if (arg.len > 0 and arg[0] == '-') {
+            if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--file")) {
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                build_cmd.file = args[i];
+            } else if (std.mem.eql(u8, arg, "-t") or std.mem.eql(u8, arg, "--tag")) {
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                build_cmd.tag = args[i];
+            } else if (std.mem.eql(u8, arg, "--build-arg")) {
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                if (build_args_count >= MAX_BUILD_ARGS) return CliError.InvalidArgument;
+                const arg_str = args[i];
+                if (std.mem.indexOf(u8, arg_str, "=")) |eq_pos| {
+                    build_args_buf[build_args_count] = .{
+                        .name = arg_str[0..eq_pos],
+                        .value = arg_str[eq_pos + 1 ..],
+                    };
+                    build_args_count += 1;
+                }
+            } else if (std.mem.eql(u8, arg, "--no-cache")) {
+                build_cmd.no_cache = true;
+            } else if (std.mem.eql(u8, arg, "-q") or std.mem.eql(u8, arg, "--quiet")) {
+                build_cmd.quiet = true;
+            } else {
+                return CliError.InvalidArgument;
+            }
+        } else {
+            // Positional argument = context path
+            build_cmd.context_path = arg;
+        }
+    }
+
+    if (build_args_count > 0) {
+        build_cmd.build_args = build_args_buf[0..build_args_count];
+    }
+
+    return Command{ .build = build_cmd };
 }
 
 // =============================================================================
