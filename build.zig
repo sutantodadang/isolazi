@@ -195,4 +195,49 @@ pub fn build(b: *std.Build) void {
     });
     const run_bench_tests = b.addRunArtifact(bench_tests);
     test_step.dependOn(&run_bench_tests.step);
+    // =========================================================================
+    // Cross-compilation helper
+    // =========================================================================
+
+    const targets: []const std.Target.Query = &.{
+        .{ .cpu_arch = .x86_64, .os_tag = .linux },
+        .{ .cpu_arch = .aarch64, .os_tag = .linux },
+        .{ .cpu_arch = .x86_64, .os_tag = .windows },
+        .{ .cpu_arch = .aarch64, .os_tag = .macos },
+    };
+
+    const build_all_step = b.step("all", "Build for all supported platforms");
+
+    for (targets) |t| {
+        const target_query = b.resolveTargetQuery(t);
+
+        // Create a module for this specific target
+        const target_mod = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target_query,
+            .optimize = optimize,
+        });
+
+        const cross_exe = b.addExecutable(.{
+            .name = "isolazi",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/main.zig"),
+                .target = target_query,
+                .optimize = optimize, // Use the same optimization level as main build
+                .imports = &.{
+                    .{ .name = "isolazi", .module = target_mod },
+                },
+            }),
+        });
+
+        const target_output = b.addInstallArtifact(cross_exe, .{
+            .dest_dir = .{
+                .override = .{
+                    .custom = t.zigTriple(b.allocator) catch @panic("OOM"),
+                },
+            },
+        });
+
+        build_all_step.dependOn(&target_output.step);
+    }
 }

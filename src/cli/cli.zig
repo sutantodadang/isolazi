@@ -1037,7 +1037,9 @@ pub fn buildConfig(run_cmd: *const RunCommand) !Config {
     var cfg = try Config.init(run_cmd.rootfs);
 
     // Set command
-    try cfg.setCommand(run_cmd.command);
+    if (run_cmd.command) |cmd| {
+        try cfg.setCommand(cmd);
+    }
 
     // Set argv (including argv[0])
     for (run_cmd.args) |arg| {
