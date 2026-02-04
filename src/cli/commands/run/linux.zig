@@ -139,7 +139,8 @@ fn runContainerImpl(
     const is_rabbitmq = std.mem.indexOf(u8, run_cmd.rootfs, "rabbitmq") != null;
 
     // If no command specified, use entrypoint for known images
-    if (modified_run_cmd.command.len == 0 or std.mem.eql(u8, modified_run_cmd.command, "/bin/sh")) {
+    const cmd_slice = modified_run_cmd.command orelse "";
+    if (cmd_slice.len == 0 or std.mem.eql(u8, cmd_slice, "/bin/sh")) {
         if (is_postgres or is_rabbitmq) {
             modified_run_cmd.command = "docker-entrypoint.sh";
             // Args will be set after buildConfig
@@ -153,12 +154,12 @@ fn runContainerImpl(
     };
 
     // For postgres, add default arg "postgres" if entrypoint
-    if (is_postgres and std.mem.eql(u8, modified_run_cmd.command, "docker-entrypoint.sh")) {
+    if (is_postgres and std.mem.eql(u8, modified_run_cmd.command orelse "", "docker-entrypoint.sh")) {
         cfg.addArg("postgres") catch {};
     }
 
     // For rabbitmq, add default arg "rabbitmq-server" if entrypoint
-    if (is_rabbitmq and std.mem.eql(u8, modified_run_cmd.command, "docker-entrypoint.sh")) {
+    if (is_rabbitmq and std.mem.eql(u8, modified_run_cmd.command orelse "", "docker-entrypoint.sh")) {
         cfg.addArg("rabbitmq-server") catch {};
     }
 
@@ -213,8 +214,9 @@ fn runContainerImpl(
 
     // Build command string for state tracking
     var cmd_display: [256]u8 = undefined;
-    const cmd_len = @min(run_cmd.command.len, 255);
-    @memcpy(cmd_display[0..cmd_len], run_cmd.command[0..cmd_len]);
+    const safe_cmd = run_cmd.command orelse "";
+    const cmd_len = @min(safe_cmd.len, 255);
+    @memcpy(cmd_display[0..cmd_len], safe_cmd[0..cmd_len]);
 
     // Register container (state will be updated to running with PID by runtime)
     _ = manager.createContainerWithId(&cid_buf, run_cmd.rootfs, cmd_display[0..cmd_len], null, .no, &[_]isolazi.container.state.PortMapping{}, &[_]isolazi.container.state.VolumeMount{}, &[_]isolazi.container.state.EnvVar{}) catch {};
