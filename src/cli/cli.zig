@@ -106,7 +106,7 @@ pub const Command = union(enum) {
 /// Arguments for the 'run' command
 pub const RunCommand = struct {
     rootfs: []const u8,
-    command: []const u8,
+    command: ?[]const u8 = null, // Optional - uses image default CMD if not specified
     args: []const []const u8,
     hostname: ?[]const u8 = null,
     cwd: ?[]const u8 = null,
@@ -116,6 +116,7 @@ pub const RunCommand = struct {
     volumes: []const VolumeMount = &[_]VolumeMount{},
     ports: []const PortMap = &[_]PortMap{},
     detach: bool = false, // Run container in background
+    restart_policy: config_mod.Config.RestartPolicy = .no, // Restart policy
     rootless: bool = false, // Enable rootless mode (user namespace)
     uid_maps: []const IdMap = &[_]IdMap{}, // Custom UID mappings
     gid_maps: []const IdMap = &[_]IdMap{}, // Custom GID mappings
@@ -341,7 +342,6 @@ pub fn parse(args: []const []const u8) CliError!Command {
 fn parseRunCommand(args: []const []const u8) CliError!Command {
     var run_cmd = RunCommand{
         .rootfs = undefined,
-        .command = undefined,
         .args = &[_][]const u8{},
     };
 
@@ -626,6 +626,16 @@ fn parseRunCommand(args: []const []const u8) CliError!Command {
                 run_cmd.apparmor_mode = .unconfined;
                 run_cmd.selinux_enabled = false;
                 run_cmd.selinux_type = .unconfined_t;
+            } else if (std.mem.eql(u8, arg, "--restart")) {
+                // Restart policy: --restart <policy>
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                const policy_str = args[i];
+                if (config_mod.Config.RestartPolicy.fromString(policy_str)) |policy| {
+                    run_cmd.restart_policy = policy;
+                } else {
+                    return CliError.InvalidArgument;
+                }
             } else {
                 return CliError.InvalidArgument;
             }
@@ -663,9 +673,7 @@ fn parseRunCommand(args: []const []const u8) CliError!Command {
     if (positional_count < 1) {
         return CliError.MissingRootfs;
     }
-    if (positional_count < 2) {
-        return CliError.MissingCommand;
-    }
+    // Command is now optional - images with default CMD/ENTRYPOINT don't need one
 
     // Set command args (including the command itself as argv[0])
     if (command_args_start < args.len) {
@@ -1166,6 +1174,7 @@ pub fn printHelp(writer: anytype) !void {
         \\    --rootless                Enable rootless mode (user namespace)
         \\    --uid-map C:H[:N]         Map container UID C to host UID H (N count, default 1)
         \\    --gid-map C:H[:N]         Map container GID C to host GID H (N count, default 1)
+        \\    --restart <policy>        Restart policy (no|always|on-failure|unless-stopped)
         \\
         \\OPTIONS for 'exec':
         \\    -i, --interactive         Keep STDIN open
