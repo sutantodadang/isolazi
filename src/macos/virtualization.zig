@@ -512,40 +512,16 @@ pub fn runWithLimaEx(
     try script.appendSlice(allocator, rootfs_path);
     try script.appendSlice(allocator, "/dev && ");
 
-    try script.appendSlice(allocator, "mount -t proc proc ");
-    try script.appendSlice(allocator, rootfs_path);
-    try script.appendSlice(allocator, "/proc && ");
-
-    try script.appendSlice(allocator, "mount -t sysfs sysfs ");
-    try script.appendSlice(allocator, rootfs_path);
-    try script.appendSlice(allocator, "/sys && ");
-
-    try script.appendSlice(allocator, "mount --bind /dev ");
-    try script.appendSlice(allocator, rootfs_path);
-    try script.appendSlice(allocator, "/dev && ");
-
+    // Create runtime directories
     try script.appendSlice(allocator, "mkdir -p ");
     try script.appendSlice(allocator, rootfs_path);
     try script.appendSlice(allocator, "/run ");
     try script.appendSlice(allocator, rootfs_path);
     try script.appendSlice(allocator, "/tmp && ");
 
-    try script.appendSlice(allocator, "mount -t tmpfs tmpfs ");
-    try script.appendSlice(allocator, rootfs_path);
-    try script.appendSlice(allocator, "/run && ");
-
-    try script.appendSlice(allocator, "mount -t tmpfs tmpfs ");
-    try script.appendSlice(allocator, rootfs_path);
-    try script.appendSlice(allocator, "/tmp && ");
-
-    // Handle volume mounts
+    // Create volume directories on host
     for (volumes) |vol| {
         try script.appendSlice(allocator, "mkdir -p ");
-        try script.appendSlice(allocator, rootfs_path);
-        try script.appendSlice(allocator, vol.container_path);
-        try script.appendSlice(allocator, " && mount --bind ");
-        try script.appendSlice(allocator, vol.host_path);
-        try script.append(allocator, ' ');
         try script.appendSlice(allocator, rootfs_path);
         try script.appendSlice(allocator, vol.container_path);
         try script.appendSlice(allocator, " && ");
@@ -579,40 +555,91 @@ pub fn runWithLimaEx(
         try script.appendSlice(allocator, " 2>/dev/null; ");
     }
 
-    // Add LSM configuration setup
-    if (lsm_config) |lsm| {
-        try lsm.toShellScript(&script, allocator);
+    // Write setup script for inside the namespace
+    const setup_script_path = try std.fmt.allocPrint(allocator, "{s}/setup.sh", .{container_id_dir});
+    try dynamic_allocs.append(allocator, setup_script_path);
+
+    var setup_script: std.ArrayList(u8) = .empty;
+    defer setup_script.deinit(allocator);
+
+    try setup_script.appendSlice(allocator, "#!/bin/sh\n");
+
+    // Safety: prevent propagation back to host
+    try setup_script.appendSlice(allocator, "mount --make-rprivate /\n");
+
+    // Mount proc (which unshare --mount-proc mounted to /proc in new ns) to destination
+    try setup_script.appendSlice(allocator, "mount --bind /proc \"");
+    try setup_script.appendSlice(allocator, rootfs_path);
+    try setup_script.appendSlice(allocator, "/proc\"\n");
+
+    // Mount sysfs
+    try setup_script.appendSlice(allocator, "mount -t sysfs sysfs \"");
+    try setup_script.appendSlice(allocator, rootfs_path);
+    try setup_script.appendSlice(allocator, "/sys\"\n");
+
+    // Mount dev
+    try setup_script.appendSlice(allocator, "mount --bind /dev \"");
+    try setup_script.appendSlice(allocator, rootfs_path);
+    try setup_script.appendSlice(allocator, "/dev\"\n");
+
+    // Mount tmpfs run
+    try setup_script.appendSlice(allocator, "mount -t tmpfs tmpfs \"");
+    try setup_script.appendSlice(allocator, rootfs_path);
+    try setup_script.appendSlice(allocator, "/run\"\n");
+
+    // Mount tmpfs tmp
+    try setup_script.appendSlice(allocator, "mount -t tmpfs tmpfs \"");
+    try setup_script.appendSlice(allocator, rootfs_path);
+    try setup_script.appendSlice(allocator, "/tmp\"\n");
+
+    // Handle volume mounts
+    for (volumes) |vol| {
+        try setup_script.appendSlice(allocator, "mount --bind \"");
+        try setup_script.appendSlice(allocator, vol.host_path);
+        try setup_script.appendSlice(allocator, "\" \"");
+        try setup_script.appendSlice(allocator, rootfs_path);
+        try setup_script.appendSlice(allocator, vol.container_path);
+        try setup_script.appendSlice(allocator, "\"\n");
     }
 
-    // Add unshare and chroot command
-    try script.appendSlice(allocator, "unshare --mount --uts --ipc --pid --fork --mount-proc");
-    if (rootless) {
-        try script.appendSlice(allocator, " --user --map-root-user");
+    // Add LSM configuration setup
+    if (lsm_config) |lsm| {
+        try lsm.toShellScript(&setup_script, allocator);
+    } else {
+        try setup_script.appendSlice(allocator, "AA_EXEC_PREFIX=\"\"; RUNCON_PREFIX=\"\";\n");
     }
-    try script.appendSlice(allocator, " chroot ");
-    try script.appendSlice(allocator, rootfs_path);
-    try script.appendSlice(allocator, " /usr/bin/env PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/lib/postgresql/17/bin:/usr/lib/postgresql/16/bin:/usr/lib/postgresql/15/bin:/opt/rabbitmq/sbin:/usr/lib/rabbitmq/bin:/opt/erlang/bin ");
+
+    // Exec chroot with LSM wrappers
+    try setup_script.appendSlice(allocator, "exec $AA_EXEC_PREFIX $RUNCON_PREFIX chroot \"");
+    try setup_script.appendSlice(allocator, rootfs_path);
+    try setup_script.appendSlice(allocator, "\" /usr/bin/env PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/lib/postgresql/17/bin:/usr/lib/postgresql/16/bin:/usr/lib/postgresql/15/bin:/opt/rabbitmq/sbin:/usr/lib/rabbitmq/bin:/opt/erlang/bin ");
 
     // Add env vars
     for (env_vars) |env| {
-        try script.appendSlice(allocator, env.key);
-        try script.append(allocator, '=');
-        try script.appendSlice(allocator, env.value);
-        try script.append(allocator, ' ');
+        try setup_script.appendSlice(allocator, env.key);
+        try setup_script.append(allocator, '=');
+        try setup_script.appendSlice(allocator, env.value);
+        try setup_script.append(allocator, ' ');
     }
 
     // Add the command
     for (command) |arg| {
-        try script.appendSlice(allocator, arg);
-        try script.append(allocator, ' ');
+        try setup_script.appendSlice(allocator, arg);
+        try setup_script.append(allocator, ' ');
     }
 
-    // Determine container directory and run.sh path
-    const container_dir = std.fs.path.dirname(rootfs_path) orelse return VirtualizationError.ConfigurationInvalid;
-    const run_script_path = try std.fmt.allocPrint(allocator, "{s}/run.sh", .{container_dir});
-    try dynamic_allocs.append(allocator, run_script_path);
+    const setup_file = try std.fs.cwd().createFile(setup_script_path, .{ .mode = 0o755 });
+    defer setup_file.close();
+    try setup_file.writeAll(setup_script.items);
+
+    // Finalize main run script
+    try script.appendSlice(allocator, "unshare --mount --uts --ipc --pid --fork --mount-proc -- /bin/sh \"");
+    try script.appendSlice(allocator, setup_script_path);
+    try script.appendSlice(allocator, "\"");
 
     // Write script to file
+    const run_script_path = try std.fmt.allocPrint(allocator, "{s}/run.sh", .{container_id_dir});
+    try dynamic_allocs.append(allocator, run_script_path);
     const run_file = try std.fs.cwd().createFile(run_script_path, .{ .mode = 0o755 });
     defer run_file.close();
     try run_file.writeAll(script.items);
@@ -657,7 +684,7 @@ pub fn runWithLimaEx(
 
         // Working directory (rootfs? or container dir?)
         // Let's use container dir so we can find things if needed
-        try lima_args.append(allocator, try std.fmt.allocPrint(allocator, "--working-directory={s}", .{container_dir}));
+        try lima_args.append(allocator, try std.fmt.allocPrint(allocator, "--working-directory={s}", .{container_id_dir}));
         try dynamic_allocs.append(allocator, lima_args.items[lima_args.items.len - 1]);
 
         // Logs: Use strict file path for output logging.
@@ -987,4 +1014,134 @@ pub fn checkLimaStatus(allocator: std.mem.Allocator) LimaStatus {
     if (std.mem.eql(u8, status, "Running")) return .Running;
     if (std.mem.eql(u8, status, "Stopped")) return .Stopped;
     return .Unknown; // e.g. "Starting"
+}
+
+/// Start a stopped container by re-executing its run.sh script within Lima
+pub fn startContainer(
+    allocator: std.mem.Allocator,
+    container_id: []const u8,
+    info: *const @import("../container/state.zig").ContainerInfo,
+) !void {
+    // Ensure VM is running
+    try ensureVMRunning(allocator);
+
+    // Get home directory for constructing paths
+    const home = std.process.getEnvVarOwned(allocator, "HOME") catch {
+        return VirtualizationError.ConfigurationInvalid;
+    };
+    defer allocator.free(home);
+
+    // Construct the run script path
+    const run_script_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/.isolazi/containers/{s}/run.sh",
+        .{ home, container_id },
+    );
+    defer allocator.free(run_script_path);
+
+    // Verify script exists (via Lima test -f)
+    const check_cmd = try std.fmt.allocPrint(allocator, "test -f \"{s}\"", .{run_script_path});
+    defer allocator.free(check_cmd);
+
+    const check_result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &[_][]const u8{ "limactl", "shell", "isolazi", "sh", "-c", check_cmd },
+    }) catch return VirtualizationError.CommandFailed;
+    defer allocator.free(check_result.stdout);
+    defer allocator.free(check_result.stderr);
+
+    if (check_result.term.Exited != 0) {
+        return VirtualizationError.ConfigurationInvalid; // run.sh doesn't exist
+    }
+
+    // Execute the run script based on restart policy
+    var lima_args: std.ArrayList([]const u8) = .empty;
+    defer lima_args.deinit(allocator);
+
+    try lima_args.append(allocator, "limactl");
+    try lima_args.append(allocator, "shell");
+    try lima_args.append(allocator, "isolazi");
+
+    // Environment variables for the container tag - need sudo for mounts
+    try lima_args.append(allocator, "--");
+    try lima_args.append(allocator, "sudo");
+    try lima_args.append(allocator, "env");
+
+    const isolazi_id_env = try std.fmt.allocPrint(allocator, "ISOLAZI_ID={s}", .{container_id});
+    defer allocator.free(isolazi_id_env);
+    try lima_args.append(allocator, isolazi_id_env);
+
+    // Track dynamic allocations that need cleanup after run()
+    var dynamic_allocs: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (dynamic_allocs.items) |ptr| allocator.free(ptr);
+        dynamic_allocs.deinit(allocator);
+    }
+
+    if (info.restart_policy == .no) {
+        // Simple execution - run in background via sh -c
+        const log_path = try std.fmt.allocPrint(allocator, "{s}/.isolazi/containers/{s}/stdout.log", .{ home, container_id });
+        try dynamic_allocs.append(allocator, log_path);
+        const bg_cmd = try std.fmt.allocPrint(allocator, "ISOLAZI_ID={s} sh \"{s}\" >> \"{s}\" 2>&1 &", .{ container_id, run_script_path, log_path });
+        try dynamic_allocs.append(allocator, bg_cmd);
+
+        // Clear the existing args and build a simpler command
+        lima_args.clearAndFree(allocator);
+        try lima_args.append(allocator, "limactl");
+        try lima_args.append(allocator, "shell");
+        try lima_args.append(allocator, "isolazi");
+        try lima_args.append(allocator, "--");
+        try lima_args.append(allocator, "sudo");
+        try lima_args.append(allocator, "sh");
+        try lima_args.append(allocator, "-c");
+        try lima_args.append(allocator, bg_cmd);
+    } else {
+        // Use systemd-run for restart policies
+        try lima_args.append(allocator, "systemd-run");
+
+        const unit_name = try std.fmt.allocPrint(allocator, "--unit=isolazi-{s}", .{container_id});
+        try dynamic_allocs.append(allocator, unit_name);
+        try lima_args.append(allocator, unit_name);
+
+        try lima_args.append(allocator, "--service-type=simple");
+
+        const policy_str = switch (info.restart_policy) {
+            .no => "no",
+            .always => "always",
+            .on_failure => "on-failure",
+            .unless_stopped => "always",
+        };
+        const restart_prop = try std.fmt.allocPrint(allocator, "--property=Restart={s}", .{policy_str});
+        try dynamic_allocs.append(allocator, restart_prop);
+        try lima_args.append(allocator, restart_prop);
+
+        try lima_args.append(allocator, "--property=TasksMax=infinity");
+        try lima_args.append(allocator, "--property=Delegate=yes");
+        try lima_args.append(allocator, "--property=LimitNOFILE=infinity");
+        try lima_args.append(allocator, "--property=LimitNPROC=infinity");
+
+        try lima_args.append(allocator, "sh");
+        try lima_args.append(allocator, run_script_path);
+    }
+
+    // Execute
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = lima_args.items,
+    }) catch return VirtualizationError.CommandFailed;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    // Update container state via ContainerManager
+    var manager = @import("../container/state.zig").ContainerManager.init(allocator) catch {
+        return VirtualizationError.ConfigurationInvalid;
+    };
+    defer manager.deinit();
+
+    manager.updateState(container_id, .running, null, null) catch {};
+
+    // Refresh port forwarding to re-establish bindings
+    if (info.ports.len > 0) {
+        refreshLimaPortForwarding(allocator);
+    }
 }
