@@ -841,7 +841,7 @@ pub fn stopInLima(allocator: std.mem.Allocator, container_id: []const u8) !void 
 
     // 2. Fallback: Find PIDs via /proc/*/environ using grep
     // Use grep -a -l to find files containing the ID, then extract PID
-    const find_cmd = try std.fmt.allocPrint(allocator, "grep -l -a 'ISOLAZI_ID={s}' /proc/[0-9]*/environ 2>/dev/null | cut -d/ -f3", .{container_id});
+    const find_cmd = try std.fmt.allocPrint(allocator, "sudo grep -l -a 'ISOLAZI_ID={s}' /proc/[0-9]*/environ 2>/dev/null | cut -d/ -f3", .{container_id});
     defer allocator.free(find_cmd);
 
     const result = std.process.Child.run(.{
@@ -909,7 +909,7 @@ pub fn isContainerAliveInLima(allocator: std.mem.Allocator, container_id: []cons
 
     // 2. Fallback: Search /proc/*/environ for the tag using grep
     // Use grep -a -q to search in binary files directly and exit on first match
-    const grep_cmd = try std.fmt.allocPrint(allocator, "grep -a -q 'ISOLAZI_ID={s}' /proc/[0-9]*/environ", .{container_id});
+    const grep_cmd = try std.fmt.allocPrint(allocator, "sudo grep -a -q 'ISOLAZI_ID={s}' /proc/[0-9]*/environ", .{container_id});
     defer allocator.free(grep_cmd);
 
     const result = std.process.Child.run(.{
