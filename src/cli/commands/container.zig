@@ -56,10 +56,10 @@ pub fn stopContainer(
 pub fn startContainer(
     allocator: std.mem.Allocator,
     start_cmd: isolazi.cli.StartCommand,
-    _: anytype, // stdout - unused currently
+    stdout: anytype,
     stderr: anytype,
 ) u8 {
-    const container_id = start_cmd.container_id;
+    const query = start_cmd.container_id;
 
     var manager = isolazi.container.ContainerManager.init(allocator) catch |err| {
         stderr.print("Error: Failed to initialize container manager: {}\n", .{err}) catch {};
@@ -68,9 +68,17 @@ pub fn startContainer(
     };
     defer manager.deinit();
 
-    // Verify container exists
-    var info = manager.getContainer(container_id) catch |err| {
-        stderr.print("Error: Container not found: {}\n", .{err}) catch {};
+    // Find the container
+    const full_id = manager.findContainer(query) catch {
+        stderr.print("Error: Container not found: error.ContainerNotFound\n", .{}) catch {};
+        stderr.flush() catch {};
+        return 1;
+    };
+    defer allocator.free(full_id);
+
+    // Get info
+    var info = manager.getContainer(full_id) catch |err| {
+        stderr.print("Error: Failed to get container info: {}\n", .{err}) catch {};
         stderr.flush() catch {};
         return 1;
     };
@@ -82,13 +90,32 @@ pub fn startContainer(
         return 0;
     }
 
-    // Start is more complex as we need to re-execute the container
-    // This would need platform-specific implementation
-    stderr.writeAll("Note: Container restart not yet fully implemented\n") catch {};
-    stderr.writeAll("Please use 'isolazi run' to start a new container\n") catch {};
-    stderr.flush() catch {};
+    // Platform-specific execution (comptime for cross-compilation)
+    const macos_virt = if (builtin.os.tag == .macos) isolazi.macos.virtualization else struct {
+        pub fn startContainer(_: std.mem.Allocator, _: []const u8, _: anytype) !void {
+            return error.NotImplemented;
+        }
+    };
 
-    return 1;
+    if (builtin.os.tag == .macos) {
+        macos_virt.startContainer(allocator, full_id, &info) catch |err| {
+            stderr.print("Error: Failed to start container on macOS: {}\n", .{err}) catch {};
+            stderr.flush() catch {};
+            return 1;
+        };
+    } else if (builtin.os.tag == .linux) {
+        // Placeholder for Linux start
+        stderr.print("Error: 'start' not implemented for Linux yet\n", .{}) catch {};
+        return 1;
+    } else {
+        stderr.print("Error: 'start' not implemented for this platform yet\n", .{}) catch {};
+        return 1;
+    }
+
+    stdout.print("{s}\n", .{full_id[0..12]}) catch {};
+    stdout.flush() catch {};
+
+    return 0;
 }
 
 /// Remove a container
