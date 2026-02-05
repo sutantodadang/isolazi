@@ -72,7 +72,7 @@ pub fn pullImage(
     }
 
     // Initialize registry client
-    var client = RegistryClient.init(allocator);
+    var client = try RegistryClient.init(allocator);
     defer client.deinit();
 
     // Report progress

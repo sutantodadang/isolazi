@@ -102,11 +102,13 @@ pub const RegistryClient = struct {
     /// Buffer size for redirect handling
     const REDIRECT_BUFFER_SIZE = 8 * 1024;
 
-    pub fn init(allocator: std.mem.Allocator) Self {
+    pub fn init(allocator: std.mem.Allocator) !Self {
+        var client = std.http.Client{ .allocator = allocator };
+        try client.ca_bundle.rescan(allocator);
         return Self{
             .allocator = allocator,
             .auth_token = null,
-            .http_client = std.http.Client{ .allocator = allocator },
+            .http_client = client,
         };
     }
 
@@ -140,7 +142,10 @@ pub const RegistryClient = struct {
             .response_writer = &body.writer,
             .extra_headers = extra_headers,
             .keep_alive = true, // Enable connection reuse
-        }) catch return RegistryError.NetworkError;
+        }) catch |err| {
+            std.debug.print("Network error during fetch: {s}\n", .{@errorName(err)});
+            return RegistryError.NetworkError;
+        };
 
         // Check status code
         switch (result.status) {
@@ -229,6 +234,7 @@ pub const RegistryClient = struct {
         // Use a fresh HTTP client for downloads to avoid thread conflicts
         var download_client = std.http.Client{ .allocator = self.allocator };
         defer download_client.deinit();
+        try download_client.ca_bundle.rescan(self.allocator);
 
         // First request with auth - don't follow redirects automatically
         var redirect_buffer: [REDIRECT_BUFFER_SIZE]u8 = undefined;
@@ -614,7 +620,7 @@ pub const RegistryClient = struct {
 // =============================================================================
 
 test "RegistryClient initialization" {
-    var client = RegistryClient.init(std.testing.allocator);
+    var client = try RegistryClient.init(std.testing.allocator);
     defer client.deinit();
     try std.testing.expect(client.auth_token == null);
 }
