@@ -15,9 +15,9 @@
 
 const std = @import("std");
 // Import image module directly for builder types
-const image_mod = @import("../../image/mod.zig");
+const image_mod = @import("isolazi").image;
 // Import cli module for BuildCommand type (re-export for convenience)
-const cli = @import("../cli.zig");
+const cli = @import("isolazi").cli;
 
 /// Re-export BuildCommand from cli for convenience
 pub const BuildCommand = cli.BuildCommand;

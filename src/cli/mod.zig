@@ -18,6 +18,7 @@ pub const RmCommand = cli.RmCommand;
 pub const InspectCommand = cli.InspectCommand;
 pub const PsCommand = cli.PsCommand;
 pub const CreateCommand = cli.CreateCommand;
+pub const BuildCommand = cli.BuildCommand;
 pub const CliError = cli.CliError;
 
 pub const parse = cli.parse;
