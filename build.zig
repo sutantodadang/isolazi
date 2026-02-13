@@ -40,6 +40,7 @@ pub fn build(b: *std.Build) void {
         // which requires us to specify a target.
         .target = target,
     });
+    mod.addImport("isolazi", mod);
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
@@ -229,6 +230,7 @@ pub fn build(b: *std.Build) void {
                 },
             }),
         });
+        target_mod.addImport("isolazi", target_mod);
 
         const target_output = b.addInstallArtifact(cross_exe, .{
             .dest_dir = .{
