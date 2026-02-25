@@ -175,6 +175,28 @@ pub fn pullImage(
     // Store manifest in cache
     try img_cache.storeManifest(&ref, manifest_data);
 
+
+    // Download OCI config blob (needed for Entrypoint/Cmd at container run)
+    if (root.object.get("config")) |config_obj| {
+        if (config_obj.object.get("digest")) |config_digest_val| {
+            const config_digest = config_digest_val.string;
+            if (!try img_cache.hasBlob(config_digest)) {
+                if (progress_callback) |cb| {
+                    cb(.downloading_layer, "Downloading image config");
+                }
+                const config_blob_path = try img_cache.getBlobPath(config_digest);
+                defer allocator.free(config_blob_path);
+                const config_tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{config_blob_path});
+                defer allocator.free(config_tmp_path);
+                try client.downloadBlobToFile(ref.repository, config_digest, config_tmp_path);
+                std.fs.renameAbsolute(config_tmp_path, config_blob_path) catch |e| {
+                    std.fs.deleteFileAbsolute(config_tmp_path) catch {};
+                    return e;
+                };
+            }
+        }
+    }
+
     // Get layers from the manifest
     const layers = root.object.get("layers") orelse return error.InvalidManifest;
 
