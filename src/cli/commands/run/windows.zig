@@ -239,25 +239,63 @@ pub fn runContainer(
     };
     defer allocator.free(wsl_rootfs);
 
-    // Get command to run (default: /bin/sh)
+    // Get command to run - read from OCI image config if not specified
     var cmd_args: std.ArrayList([]const u8) = .empty;
     defer cmd_args.deinit(allocator);
-
+    // Storage for image config data (kept alive so cmd_args can reference strings from it)
+    var img_config_data: ?[]u8 = null;
+    defer if (img_config_data) |d| allocator.free(d);
+    var img_config_parsed: ?std.json.Parsed(std.json.Value) = null;
+    defer if (img_config_parsed) |*p| p.deinit();
+    var workdir: []const u8 = "/"; // Default working directory (overridden by OCI WorkingDir)
     if (opts.command_args.len > 0) {
         // User specified command
         for (opts.command_args) |arg| {
             try cmd_args.append(allocator, arg);
         }
     } else {
-        // Check if this is a postgres image - auto-run entrypoint
-        if (std.mem.indexOf(u8, image_name, "postgres") != null) {
-            try cmd_args.append(allocator, "docker-entrypoint.sh");
-            try cmd_args.append(allocator, "postgres");
-        } else if (std.mem.indexOf(u8, image_name, "rabbitmq") != null) {
-            try cmd_args.append(allocator, "docker-entrypoint.sh");
-            try cmd_args.append(allocator, "rabbitmq-server");
-        } else {
-            // Default command
+        // Read Entrypoint/Cmd from OCI image config
+        var got_cmd = false;
+        read_config: {
+            const config_ref = root.object.get("config") orelse break :read_config;
+            const config_digest = (config_ref.object.get("digest") orelse break :read_config).string;
+            const config_data = cache.readBlob(config_digest) catch break :read_config;
+            img_config_data = config_data;
+            const config_json = std.json.parseFromSlice(std.json.Value, allocator, config_data, .{}) catch break :read_config;
+            img_config_parsed = config_json;
+
+            const cfg = config_json.value.object.get("config") orelse break :read_config;
+
+            // Extract WorkingDir from OCI config
+            if (cfg.object.get("WorkingDir")) |wd| {
+                if (wd == .string and wd.string.len > 0) {
+                    workdir = wd.string;
+                }
+            }
+
+            // Docker behavior: Entrypoint + Cmd combined
+            if (cfg.object.get("Entrypoint")) |ep| {
+                if (ep == .array) {
+                    for (ep.array.items) |item| {
+                        if (item == .string) {
+                            try cmd_args.append(allocator, item.string);
+                            got_cmd = true;
+                        }
+                    }
+                }
+            }
+            if (cfg.object.get("Cmd")) |cmd| {
+                if (cmd == .array) {
+                    for (cmd.array.items) |item| {
+                        if (item == .string) {
+                            try cmd_args.append(allocator, item.string);
+                            got_cmd = true;
+                        }
+                    }
+                }
+            }
+        }
+        if (!got_cmd) {
             try cmd_args.append(allocator, "/bin/sh");
         }
     }
@@ -270,137 +308,146 @@ pub fn runContainer(
     try wsl_cmd.append(allocator, "-u");
     try wsl_cmd.append(allocator, "root");
     try wsl_cmd.append(allocator, "--");
-
-    // For detach mode, wrap everything in nohup/setsid
-    if (opts.detach_mode) {
-        try wsl_cmd.append(allocator, "setsid");
-    }
-
-    // Always use shell script approach for proper setup
-    try wsl_cmd.append(allocator, "unshare");
-    try wsl_cmd.append(allocator, "--mount");
-    try wsl_cmd.append(allocator, "--uts");
-    try wsl_cmd.append(allocator, "--ipc");
-    try wsl_cmd.append(allocator, "--pid");
-    try wsl_cmd.append(allocator, "--fork");
-
-    // Add user namespace for rootless containers
-    if (opts.rootless) {
-        try wsl_cmd.append(allocator, "--user");
-        try wsl_cmd.append(allocator, "--map-root-user");
-    }
-
     try wsl_cmd.append(allocator, "sh");
     try wsl_cmd.append(allocator, "-c");
 
+    // Overlay paths for this container
+    const overlay_dir = try std.fmt.allocPrint(allocator, "/tmp/isolazi/{s}", .{container_id});
+    defer allocator.free(overlay_dir);
+    const overlay_upper = try std.fmt.allocPrint(allocator, "{s}/upper", .{overlay_dir});
+    defer allocator.free(overlay_upper);
+    const overlay_work = try std.fmt.allocPrint(allocator, "{s}/work", .{overlay_dir});
+    defer allocator.free(overlay_work);
+    const overlay_merged = try std.fmt.allocPrint(allocator, "{s}/merged", .{overlay_dir});
+    defer allocator.free(overlay_merged);
+
+    // Build outer wrapper script that writes pidfile BEFORE entering unshare PID namespace.
+    // We use sh -c 'OUTER' 'INNER' pattern: the outer script references $0 which expands to
+    // the INNER script argument, avoiding single-quote escaping issues.
+    var outer_buf: std.ArrayList(u8) = .empty;
+    defer outer_buf.deinit(allocator);
+
+    // Outer script: create overlay dir, write host-visible PID, exec into unshare
+    try outer_buf.appendSlice(allocator, "mkdir -p ");
+    try outer_buf.appendSlice(allocator, overlay_upper);
+    try outer_buf.appendSlice(allocator, " ");
+    try outer_buf.appendSlice(allocator, overlay_work);
+    try outer_buf.appendSlice(allocator, " ");
+    try outer_buf.appendSlice(allocator, overlay_merged);
+    try outer_buf.appendSlice(allocator, " && echo $$ > ");
+    try outer_buf.appendSlice(allocator, overlay_dir);
+    try outer_buf.appendSlice(allocator, "/pid && exec unshare --mount --uts --ipc --pid --fork ");
+    if (opts.rootless) {
+        try outer_buf.appendSlice(allocator, "--user --map-root-user ");
+    }
+    try outer_buf.appendSlice(allocator, "sh ");
+    try outer_buf.appendSlice(allocator, overlay_dir);
+    try outer_buf.appendSlice(allocator, "/run.sh");
+
+    // Inner script: overlay setup, mounts, chroot (runs INSIDE unshare namespace)
     var script_buf: std.ArrayList(u8) = .empty;
     defer script_buf.deinit(allocator);
 
-    // Track allocated paths for cleanup
-    var allocated_paths: [64][]const u8 = undefined;
-    var alloc_count: usize = 0;
-    defer {
-        for (allocated_paths[0..alloc_count]) |p| {
-            allocator.free(p);
-        }
-    }
-
-    // Mount proc inside the rootfs
-    try script_buf.appendSlice(allocator, "mount -t proc proc ");
+    // Mount overlay: NTFS rootfs (lower/read-only) + tmpfs upper (writable) = merged
+    try script_buf.appendSlice(allocator, "mount -t overlay overlay -o lowerdir=");
     try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, ",upperdir=");
+    try script_buf.appendSlice(allocator, overlay_upper);
+    try script_buf.appendSlice(allocator, ",workdir=");
+    try script_buf.appendSlice(allocator, overlay_work);
+    try script_buf.appendSlice(allocator, " ");
+    try script_buf.appendSlice(allocator, overlay_merged);
+    try script_buf.appendSlice(allocator, " && ");
+
+    // Mount proc inside the overlay merged rootfs
+    try script_buf.appendSlice(allocator, "mount -t proc proc ");
+    try script_buf.appendSlice(allocator, overlay_merged);
     try script_buf.appendSlice(allocator, "/proc && ");
 
     // Create /dev/fd symlink for bash process substitution
     try script_buf.appendSlice(allocator, "ln -sf /proc/self/fd ");
-    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, overlay_merged);
     try script_buf.appendSlice(allocator, "/dev/fd 2>/dev/null; ");
 
     // Ensure /dev exists inside the rootfs and bind common device nodes
     try script_buf.appendSlice(allocator, "mkdir -p ");
-    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, overlay_merged);
     try script_buf.appendSlice(allocator, "/dev && ");
     try script_buf.appendSlice(allocator, "touch ");
-    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, overlay_merged);
     try script_buf.appendSlice(allocator, "/dev/null && mount --bind /dev/null ");
-    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, overlay_merged);
     try script_buf.appendSlice(allocator, "/dev/null 2>/dev/null; ");
 
     try script_buf.appendSlice(allocator, "touch ");
-    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, overlay_merged);
     try script_buf.appendSlice(allocator, "/dev/tty && mount --bind /dev/tty ");
-    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, overlay_merged);
     try script_buf.appendSlice(allocator, "/dev/tty 2>/dev/null; ");
 
     try script_buf.appendSlice(allocator, "touch ");
-    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, overlay_merged);
     try script_buf.appendSlice(allocator, "/dev/random && mount --bind /dev/random ");
-    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, overlay_merged);
     try script_buf.appendSlice(allocator, "/dev/random 2>/dev/null; ");
 
     try script_buf.appendSlice(allocator, "touch ");
-    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, overlay_merged);
     try script_buf.appendSlice(allocator, "/dev/urandom && mount --bind /dev/urandom ");
-    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, overlay_merged);
     try script_buf.appendSlice(allocator, "/dev/urandom 2>/dev/null; ");
 
-    // For postgres images, set up required directories on tmpfs
+    // Mount /dev/shm as tmpfs (needed by postgres and many services)
+    try script_buf.appendSlice(allocator, "mkdir -p ");
+    try script_buf.appendSlice(allocator, overlay_merged);
+    try script_buf.appendSlice(allocator, "/dev/shm && mount -t tmpfs tmpfs ");
+    try script_buf.appendSlice(allocator, overlay_merged);
+    try script_buf.appendSlice(allocator, "/dev/shm 2>/dev/null; ");
+
+    // Mount /tmp as tmpfs for all containers
+    try script_buf.appendSlice(allocator, "mount -t tmpfs tmpfs ");
+    try script_buf.appendSlice(allocator, overlay_merged);
+    try script_buf.appendSlice(allocator, "/tmp 2>/dev/null; ");
+
+    // Mount /run as tmpfs (needed by many init scripts and services)
+    try script_buf.appendSlice(allocator, "mkdir -p ");
+    try script_buf.appendSlice(allocator, overlay_merged);
+    try script_buf.appendSlice(allocator, "/run && mount -t tmpfs tmpfs ");
+    try script_buf.appendSlice(allocator, overlay_merged);
+    try script_buf.appendSlice(allocator, "/run 2>/dev/null; ");
+
+    // Track allocated paths for cleanup
+    var allocated_paths: [32][]const u8 = undefined;
+    var alloc_count: usize = 0;
+    defer for (allocated_paths[0..alloc_count]) |p| allocator.free(p);
+
+    // Mount each volume (named volumes use WSL-native paths for proper permission support)
     const is_postgres = std.mem.indexOf(u8, image_name, "postgres") != null;
-    if (is_postgres) {
-        try script_buf.appendSlice(allocator, "mkdir -p ");
-        try script_buf.appendSlice(allocator, wsl_rootfs);
-        try script_buf.appendSlice(allocator, "/var/run/postgresql && mount -t tmpfs tmpfs ");
-        try script_buf.appendSlice(allocator, wsl_rootfs);
-        try script_buf.appendSlice(allocator, "/var/run/postgresql && chown 70:70 ");
-        try script_buf.appendSlice(allocator, wsl_rootfs);
-        try script_buf.appendSlice(allocator, "/var/run/postgresql && chmod 775 ");
-        try script_buf.appendSlice(allocator, wsl_rootfs);
-        try script_buf.appendSlice(allocator, "/var/run/postgresql && ");
-
-        try script_buf.appendSlice(allocator, "mkdir -p ");
-        try script_buf.appendSlice(allocator, wsl_rootfs);
-        try script_buf.appendSlice(allocator, "/var/lib/postgresql/data && mount -t tmpfs tmpfs ");
-        try script_buf.appendSlice(allocator, wsl_rootfs);
-        try script_buf.appendSlice(allocator, "/var/lib/postgresql/data && chown 70:70 ");
-        try script_buf.appendSlice(allocator, wsl_rootfs);
-        try script_buf.appendSlice(allocator, "/var/lib/postgresql/data && ");
-    }
-
-    // For rabbitmq images, set up required directories on tmpfs
-    const is_rabbitmq = std.mem.indexOf(u8, image_name, "rabbitmq") != null;
-    if (is_rabbitmq) {
-        try script_buf.appendSlice(allocator, "mkdir -p ");
-        try script_buf.appendSlice(allocator, wsl_rootfs);
-        try script_buf.appendSlice(allocator, "/var/lib/rabbitmq && mount -t tmpfs tmpfs ");
-        try script_buf.appendSlice(allocator, wsl_rootfs);
-        try script_buf.appendSlice(allocator, "/var/lib/rabbitmq && chown 999:999 ");
-        try script_buf.appendSlice(allocator, wsl_rootfs);
-        try script_buf.appendSlice(allocator, "/var/lib/rabbitmq && chmod 700 ");
-        try script_buf.appendSlice(allocator, wsl_rootfs);
-        try script_buf.appendSlice(allocator, "/var/lib/rabbitmq && ");
-
-        try script_buf.appendSlice(allocator, "mkdir -p ");
-        try script_buf.appendSlice(allocator, wsl_rootfs);
-        try script_buf.appendSlice(allocator, "/var/log/rabbitmq && mount -t tmpfs tmpfs ");
-        try script_buf.appendSlice(allocator, wsl_rootfs);
-        try script_buf.appendSlice(allocator, "/var/log/rabbitmq && chown 999:999 ");
-        try script_buf.appendSlice(allocator, wsl_rootfs);
-        try script_buf.appendSlice(allocator, "/var/log/rabbitmq && chmod 755 ");
-        try script_buf.appendSlice(allocator, wsl_rootfs);
-        try script_buf.appendSlice(allocator, "/var/log/rabbitmq && ");
-    }
-
-    // Mount each volume
     for (opts.volumes) |vol| {
-        const wsl_host = windows.windowsToWslPath(allocator, vol.host_path) catch vol.host_path;
-        if (wsl_host.ptr != vol.host_path.ptr and alloc_count < allocated_paths.len) {
-            allocated_paths[alloc_count] = wsl_host;
-            alloc_count += 1;
+        // Detect named volumes (not absolute paths) and resolve to WSL-native path
+        const is_named_volume = vol.host_path.len > 0 and vol.host_path[0] != '/' and
+            !(vol.host_path.len >= 2 and vol.host_path[1] == ':');
+
+        var wsl_host: []const u8 = undefined;
+        if (is_named_volume) {
+            // Named volumes → WSL-native path for full Linux fs permissions (chmod/chown)
+            wsl_host = try std.fmt.allocPrint(allocator, "/tmp/isolazi/volumes/{s}", .{vol.host_path});
+            if (alloc_count < allocated_paths.len) {
+                allocated_paths[alloc_count] = wsl_host;
+                alloc_count += 1;
+            }
+        } else {
+            wsl_host = windows.windowsToWslPath(allocator, vol.host_path) catch vol.host_path;
+            if (wsl_host.ptr != vol.host_path.ptr and alloc_count < allocated_paths.len) {
+                allocated_paths[alloc_count] = wsl_host;
+                alloc_count += 1;
+            }
         }
         try script_buf.appendSlice(allocator, "mkdir -p ");
         try script_buf.appendSlice(allocator, wsl_host);
         try script_buf.appendSlice(allocator, " && ");
         try script_buf.appendSlice(allocator, "mkdir -p ");
-        try script_buf.appendSlice(allocator, wsl_rootfs);
+        try script_buf.appendSlice(allocator, overlay_merged);
         try script_buf.appendSlice(allocator, vol.container_path);
         try script_buf.appendSlice(allocator, " && mount --bind ");
         if (vol.read_only) {
@@ -408,7 +455,7 @@ pub fn runContainer(
         }
         try script_buf.appendSlice(allocator, wsl_host);
         try script_buf.append(allocator, ' ');
-        try script_buf.appendSlice(allocator, wsl_rootfs);
+        try script_buf.appendSlice(allocator, overlay_merged);
         try script_buf.appendSlice(allocator, vol.container_path);
         try script_buf.appendSlice(allocator, " && ");
     }
@@ -438,9 +485,9 @@ pub fn runContainer(
         try script_buf.appendSlice(allocator, " 2>/dev/null; ");
     }
 
-    // Add chroot command with env vars
+    // Add chroot command with env vars (chroot into overlay merged)
     try script_buf.appendSlice(allocator, "chroot ");
-    try script_buf.appendSlice(allocator, wsl_rootfs);
+    try script_buf.appendSlice(allocator, overlay_merged);
     try script_buf.appendSlice(allocator, " /usr/bin/env -i ");
 
     // Set minimal required environment
@@ -488,28 +535,35 @@ pub fn runContainer(
         try script_buf.append(allocator, ' ');
     }
 
-    // Run the command with log capture
-    if (opts.detach_mode) {
+    // Set working directory from OCI config (e.g., /data for redis, /var/lib/postgresql for postgres)
+    if (!std.mem.eql(u8, workdir, "/")) {
+        try script_buf.appendSlice(allocator, "sh -c 'cd ");
+        try script_buf.appendSlice(allocator, workdir);
+        try script_buf.appendSlice(allocator, " && exec ");
         for (cmd_args.items) |arg| {
             try runmod.quoteArg(&script_buf, allocator, arg);
         }
+        // Close the sh -c quoted command
+        try script_buf.appendSlice(allocator, "'");
     } else {
         for (cmd_args.items) |arg| {
             try runmod.quoteArg(&script_buf, allocator, arg);
         }
-        try script_buf.appendSlice(allocator, "2>&1 | tee ");
-        try script_buf.appendSlice(allocator, wsl_stdout_log);
     }
 
-    // For detach mode, add redirections at the end
+    // Run the command with log capture
     if (opts.detach_mode) {
         try script_buf.appendSlice(allocator, " >> ");
         try script_buf.appendSlice(allocator, wsl_stdout_log);
         try script_buf.appendSlice(allocator, " 2>> ");
         try script_buf.appendSlice(allocator, wsl_stderr_log);
+    } else {
+        try script_buf.appendSlice(allocator, " 2>&1 | tee ");
+        try script_buf.appendSlice(allocator, wsl_stdout_log);
     }
 
-    try wsl_cmd.append(allocator, script_buf.items);
+    // Append outer wrapper script only (inner script written to file separately)
+    try wsl_cmd.append(allocator, outer_buf.items);
 
     if (opts.detach_mode) {
         try stdout.print("{s}\n", .{container_id});
@@ -554,9 +608,60 @@ pub fn runContainer(
         cmd_str_len += copy_len;
     }
 
-    _ = manager.createContainerWithId(&container_id, image_name, cmd_str_buf[0..cmd_str_len], null, .no, &[_]isolazi.container.state.PortMapping{}, &[_]isolazi.container.state.VolumeMount{}, &[_]isolazi.container.state.EnvVar{}) catch |err| {
+    // Convert ports to state format for persistence
+    var state_ports_buf: [32]isolazi.container.state.PortMapping = undefined;
+    for (opts.ports, 0..) |p, i| {
+        state_ports_buf[i] = .{
+            .host_port = p.host_port,
+            .container_port = p.container_port,
+            .protocol = if (p.protocol == .udp) .udp else .tcp,
+        };
+    }
+    const state_ports = state_ports_buf[0..opts.ports.len];
+
+    // Convert volumes to state format for persistence
+    var state_vols_buf: [32]isolazi.container.state.VolumeMount = undefined;
+    for (opts.volumes, 0..) |v, i| {
+        state_vols_buf[i] = .{
+            .host_path = v.host_path,
+            .container_path = v.container_path,
+        };
+    }
+    const state_vols = state_vols_buf[0..opts.volumes.len];
+
+    // Convert env vars to state format for persistence
+    var state_envs_buf: [64]isolazi.container.state.EnvVar = undefined;
+    for (opts.env_vars, 0..) |e, i| {
+        state_envs_buf[i] = .{
+            .key = e.key,
+            .value = e.value,
+        };
+    }
+    const state_envs = state_envs_buf[0..opts.env_vars.len];
+
+    _ = manager.createContainerWithId(&container_id, image_name, cmd_str_buf[0..cmd_str_len], null, opts.restart_policy, state_ports, state_vols, state_envs) catch |err| {
         try stderr.print("Warning: Failed to register container: {}\n", .{err});
     };
+
+    // Write inner script to file in WSL before spawning the container process
+    {
+        const run_sh_path = try std.fmt.allocPrint(allocator, "{s}/run.sh", .{overlay_dir});
+        defer allocator.free(run_sh_path);
+        const write_sh_cmd = try std.fmt.allocPrint(allocator, "mkdir -p {s} && cat > {s}", .{ overlay_dir, run_sh_path });
+        defer allocator.free(write_sh_cmd);
+        var write_cmd = [_][]const u8{ "wsl", "-u", "root", "--", "sh", "-c", write_sh_cmd };
+        var write_child = std.process.Child.init(&write_cmd, allocator);
+        write_child.stdin_behavior = .Pipe;
+        write_child.stdout_behavior = .Ignore;
+        write_child.stderr_behavior = .Ignore;
+        try write_child.spawn();
+        if (write_child.stdin) |stdin| {
+            stdin.writeAll(script_buf.items) catch {};
+            stdin.close();
+            write_child.stdin = null;
+        }
+        _ = write_child.wait() catch {};
+    }
 
     // Execute in WSL
     var child = std.process.Child.init(wsl_cmd.items, allocator);
@@ -565,6 +670,11 @@ pub fn runContainer(
         child.stdin_behavior = .Ignore;
         child.stdout_behavior = .Ignore;
         child.stderr_behavior = .Ignore;
+        // Detach from parent's console to prevent the WSL process from being
+        // killed when the parent process chain exits (e.g., compose up).
+        // Without this, WSL processes inherit the console and may receive
+        // CTRL_CLOSE_EVENT when a parent in the chain terminates.
+        child.create_no_window = true;
     } else {
         child.stdin_behavior = .Inherit;
         child.stdout_behavior = .Inherit;
@@ -574,11 +684,49 @@ pub fn runContainer(
     try child.spawn();
 
     if (opts.detach_mode) {
-        manager.updateState(&container_id, .running, null, null) catch {};
+        // Wait briefly for the WSL process to start and write its PID to the pidfile
+        std.Thread.sleep(200 * std.time.ns_per_ms);
+
+        // Read the PID from the pidfile to enable reliable liveness checks
+        var wsl_pid: ?i32 = null;
+        {
+            const pid_cmd = try std.fmt.allocPrint(allocator, "cat {s}/pid 2>/dev/null", .{overlay_dir});
+            defer allocator.free(pid_cmd);
+            const pid_result = std.process.Child.run(.{
+                .allocator = allocator,
+                .argv = &[_][]const u8{ "wsl", "-u", "root", "--", "sh", "-c", pid_cmd },
+            }) catch null;
+            if (pid_result) |res| {
+                defer allocator.free(res.stdout);
+                defer allocator.free(res.stderr);
+                const trimmed = std.mem.trim(u8, res.stdout, &[_]u8{ ' ', '\n', '\r', '\t' });
+                wsl_pid = std.fmt.parseInt(i32, trimmed, 10) catch null;
+            }
+        }
+
+        manager.updateState(&container_id, .running, wsl_pid, null) catch {};
         return 0;
     }
 
-    manager.updateState(&container_id, .running, null, null) catch {};
+    // Read PID for foreground mode too
+    var fg_pid: ?i32 = null;
+    {
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+        const pid_cmd = try std.fmt.allocPrint(allocator, "cat {s}/pid 2>/dev/null", .{overlay_dir});
+        defer allocator.free(pid_cmd);
+        const pid_result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &[_][]const u8{ "wsl", "-u", "root", "--", "sh", "-c", pid_cmd },
+        }) catch null;
+        if (pid_result) |res| {
+            defer allocator.free(res.stdout);
+            defer allocator.free(res.stderr);
+            const trimmed = std.mem.trim(u8, res.stdout, &[_]u8{ ' ', '\n', '\r', '\t' });
+            fg_pid = std.fmt.parseInt(i32, trimmed, 10) catch null;
+        }
+    }
+
+    manager.updateState(&container_id, .running, fg_pid, null) catch {};
 
     const term = try child.wait();
 

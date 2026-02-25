@@ -101,6 +101,26 @@ pub const Command = union(enum) {
     images: void,
     version: void,
     help: void,
+    compose: ComposeCommand,
+};
+
+/// Arguments for the 'compose' command
+pub const ComposeCommand = struct {
+    op: Operation,
+    file: []const u8 = "docker-compose.yml",
+    detach: bool = false,
+    follow: bool = false,
+    tail: usize = 0,
+    pub const Operation = enum {
+        up,
+        down,
+        ps,
+        logs,
+        stop,
+        restart,
+        pull,
+        config,
+    };
 };
 
 /// Arguments for the 'run' command
@@ -333,6 +353,10 @@ pub fn parse(args: []const []const u8) CliError!Command {
 
     if (std.mem.eql(u8, cmd, "build")) {
         return parseBuildCommand(args[2..]);
+    }
+
+    if (std.mem.eql(u8, cmd, "compose")) {
+        return parseComposeCommand(args[2..]);
     }
 
     return CliError.UnknownCommand;
@@ -654,21 +678,22 @@ fn parseRunCommand(args: []const []const u8) CliError!Command {
     }
 
     // Store env vars, volumes, and ports in the command
-    if (env_vars_count > 0) {
-        run_cmd.env_vars = env_vars_buf[0..env_vars_count];
-    }
-    if (volumes_count > 0) {
-        run_cmd.volumes = volumes_buf[0..volumes_count];
-    }
-    if (ports_count > 0) {
-        run_cmd.ports = ports_buf[0..ports_count];
-    }
-    if (uid_maps_count > 0) {
-        run_cmd.uid_maps = uid_maps_buf[0..uid_maps_count];
-    }
-    if (gid_maps_count > 0) {
-        run_cmd.gid_maps = gid_maps_buf[0..gid_maps_count];
-    }
+    // FREEZE FIX: Do not return refs to local stack vars!
+    // if (env_vars_count > 0) {
+    //     run_cmd.env_vars = env_vars_buf[0..env_vars_count];
+    // }
+    // if (volumes_count > 0) {
+    //     run_cmd.volumes = volumes_buf[0..volumes_count];
+    // }
+    // if (ports_count > 0) {
+    //     run_cmd.ports = ports_buf[0..ports_count];
+    // }
+    // if (uid_maps_count > 0) {
+    //     run_cmd.uid_maps = uid_maps_buf[0..uid_maps_count];
+    // }
+    // if (gid_maps_count > 0) {
+    //     run_cmd.gid_maps = gid_maps_buf[0..gid_maps_count];
+    // }
 
     if (positional_count < 1) {
         return CliError.MissingRootfs;
@@ -728,6 +753,80 @@ fn parseIdMap(s: []const u8) ?IdMap {
         .host_id = host_id,
         .count = count,
     };
+}
+
+/// Parse the 'compose' subcommand arguments
+fn parseComposeCommand(args: []const []const u8) CliError!Command {
+    // Parse global flags before subcommand (e.g., -f/--file)
+    var file: []const u8 = "docker-compose.yml";
+    var subcmd_idx: usize = 0;
+
+    // Scan for global flags before the subcommand
+    while (subcmd_idx < args.len) : (subcmd_idx += 1) {
+        const arg = args[subcmd_idx];
+        if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--file")) {
+            subcmd_idx += 1;
+            if (subcmd_idx >= args.len) return CliError.InvalidArgument;
+            file = args[subcmd_idx];
+        } else {
+            break; // First non-flag arg is the subcommand
+        }
+    }
+
+    if (subcmd_idx >= args.len) return CliError.NoCommand;
+
+    const subcmd = args[subcmd_idx];
+    var op: ComposeCommand.Operation = undefined;
+    if (std.mem.eql(u8, subcmd, "up")) {
+        op = .up;
+    } else if (std.mem.eql(u8, subcmd, "down")) {
+        op = .down;
+    } else if (std.mem.eql(u8, subcmd, "ps")) {
+        op = .ps;
+    } else if (std.mem.eql(u8, subcmd, "logs")) {
+        op = .logs;
+    } else if (std.mem.eql(u8, subcmd, "stop")) {
+        op = .stop;
+    } else if (std.mem.eql(u8, subcmd, "restart")) {
+        op = .restart;
+    } else if (std.mem.eql(u8, subcmd, "pull")) {
+        op = .pull;
+    } else if (std.mem.eql(u8, subcmd, "config")) {
+        op = .config;
+    } else {
+        return CliError.UnknownCommand;
+    }
+    var cmd = ComposeCommand{
+        .op = op,
+        .file = file,
+    };
+
+    // Parse subcommand-specific flags
+    var i: usize = subcmd_idx + 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--follow")) {
+            if (op == .logs) {
+                cmd.follow = true;
+            }
+        } else if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--file")) {
+            // -f after subcommand: --follow for logs, --file for everything else
+            if (op == .logs) {
+                cmd.follow = true;
+            } else {
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                cmd.file = args[i];
+            }
+        } else if (std.mem.eql(u8, arg, "-n") or std.mem.eql(u8, arg, "--tail")) {
+            i += 1;
+            if (i >= args.len) return CliError.InvalidArgument;
+            cmd.tail = std.fmt.parseInt(usize, args[i], 10) catch return CliError.InvalidArgument;
+        } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--detach")) {
+            cmd.detach = true;
+        }
+    }
+    return Command{ .compose = cmd };
 }
 
 /// Parse the 'exec' subcommand arguments.
@@ -1162,6 +1261,7 @@ pub fn printHelp(writer: anytype) !void {
         \\    pull <image>                     Pull an image from a registry
         \\    images                           List cached images
         \\    prune [-f]                       Remove stopped containers and unused images
+        \\    compose <subcommand>              Manage multi-container applications
         \\    update                           Update isolazi to the latest version
         \\    version                          Print version information
         \\    help                             Print this help message
@@ -1246,6 +1346,22 @@ pub fn printHelp(writer: anytype) !void {
         \\
         \\OPTIONS for 'rm':
         \\    -f, --force          Force remove running container
+        \\
+        \\COMPOSE SUBCOMMANDS:
+        \\    isolazi compose up [-d] [-f FILE]           Create and start services
+        \\    isolazi compose down [-f FILE]              Stop and remove services
+        \\    isolazi compose ps [-f FILE]                List running services
+        \\    isolazi compose logs [-f] [--tail N] [-f FILE]  View service logs
+        \\    isolazi compose stop [-f FILE]              Stop services
+        \\    isolazi compose restart [-f FILE]           Restart services
+        \\    isolazi compose pull [-f FILE]              Pull service images
+        \\    isolazi compose config [-f FILE]            Validate and print config
+        \\
+        \\OPTIONS for 'compose':
+        \\    -f, --file <path>         Compose file (default: docker-compose.yml)
+        \\    -d, --detach              Run services in background (up only)
+        \\    --follow                  Follow log output (logs only)
+        \\    --tail <N>                Number of log lines to show (logs only)
         \\
         \\IMAGE REFERENCES:
         \\    alpine                          Short name (defaults to docker.io)

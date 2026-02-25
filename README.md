@@ -4,7 +4,7 @@ A minimal container runtime written in Zig, inspired by Docker, Podman, and OCI 
 
 ## Features
 
-- 🐳 **Docker-like CLI** - Familiar commands: `run`, `pull`, `ps`, `stop`, `rm`, `exec`
+ 🐳 **Docker-like CLI** - Familiar commands: `run`, `pull`, `ps`, `stop`, `rm`, `exec`, `compose`
 - 📦 **OCI Image Support** - Pull images from Docker Hub and other registries
 - 🔒 **Process Isolation** - Linux namespaces (PID, mount, UTS, IPC, **network**, **user**, **cgroup**)
 - 🛡️ **Seccomp Filtering** - Block dangerous syscalls with configurable profiles
@@ -15,12 +15,13 @@ A minimal container runtime written in Zig, inspired by Docker, Podman, and OCI 
 - 🗂️ **Filesystem Isolation** - Using `pivot_root` or `chroot`
 - 🔧 **Exec into Containers** - Execute commands in running containers using `nsenter`
 - 🪟 **Windows Support** - Run containers via WSL2 backend
-- 🍎 **macOS Support** - Run containers via Apple Virtualization framework
+ 🍎 **macOS Support** - Run containers via Apple Virtualization framework
+ 🧩 **Docker Compose** - Multi-container orchestration with `docker-compose.yml` support
 - ⚡ **Fast & Lightweight** - Written in Zig with minimal dependencies
 
-## Current Status (January 26, 2026)
+## Current Status (February 23, 2026)
 
-- ✅ **Core commands**: `run`, `build`, `pull`, `images`, `ps`, `create`, `start`, `stop`, `rm`, `exec`, `logs`, `prune`, `update`
+ ✅ **Core commands**: `run`, `build`, `pull`, `images`, `ps`, `create`, `start`, `stop`, `rm`, `exec`, `logs`, `prune`, `update`, `compose`
 - ✅ **Image Builder**: Build images from Isolazifile/Dockerfile (`FROM`, `RUN`, `COPY`, `ADD`, `ENV`, `WORKDIR`, `ARG`, `CMD`, `ENTRYPOINT`)
 - ✅ **Prune behavior**: `prune` removes stopped containers and unused images; `prune -f/--force` removes all containers
 - ✅ **Rootless mode**: `--rootless` with optional `--uid-map`/`--gid-map`
@@ -28,7 +29,8 @@ A minimal container runtime written in Zig, inspired by Docker, Podman, and OCI 
 - ✅ **Security**: seccomp filtering, AppArmor/SELinux toggles, user namespaces
 - ✅ **Resource limits**: cgroup v2 memory/CPU/I/O/OOM controls
 - ✅ **Platforms**: Linux (native), Windows (WSL2), macOS (Linux VM via Lima/vfkit)
-- ✅ **Cross-builds**: targets validated for `x86_64-windows`, `x86_64-linux`, `x86_64-macos`, `aarch64-macos`
+ ✅ **Cross-builds**: targets validated for `x86_64-windows`, `x86_64-linux`, `x86_64-macos`, `aarch64-macos`
+ ✅ **Docker Compose**: `compose up`, `down`, `ps`, `logs`, `stop`, `restart`, `pull`, `config` with env var substitution and dependency ordering
 
 ## Installation
 
@@ -314,6 +316,79 @@ isolazi pull docker.io/library/nginx:latest
 isolazi pull ghcr.io/owner/repo:tag
 ```
 
+### Docker Compose
+
+isolazi supports multi-container orchestration using `docker-compose.yml` files.
+
+```yaml
+# docker-compose.yml
+version: '3'
+services:
+  web:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+  api:
+    image: node:18-alpine
+    environment:
+      - DATABASE_URL=postgres://db:5432/myapp
+    depends_on:
+      - db
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: myapp
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data:/var/lib/postgresql/data
+```
+
+```bash
+# Start all services (respects depends_on order)
+isolazi compose up
+
+# Start in detached mode
+isolazi compose up -d
+
+# Use a specific compose file
+isolazi compose -f ./path/to/docker-compose.yml up -d
+
+# View running services
+isolazi compose ps
+
+# View service logs
+isolazi compose logs
+isolazi compose logs -f          # Follow log output
+isolazi compose logs -n 50       # Last 50 lines
+
+# Stop all services
+isolazi compose stop
+
+# Restart all services
+isolazi compose restart
+
+# Stop and remove all containers
+isolazi compose down
+
+# Pull latest images for all services
+isolazi compose pull
+
+# Validate and display compose configuration
+isolazi compose config
+```
+
+**Supported `docker-compose.yml` features:**
+- Service definitions with `image`, `ports`, `environment`, `volumes`, `depends_on`
+- Environment variables as list (`- KEY=VALUE`) or map (`KEY: VALUE`)
+- Variable substitution: `$VAR`, `${VAR}`, `${VAR:-default}`
+- `.env` file loading
+- Topological dependency ordering with cycle detection
+- `command` and `working_dir` overrides
+
 ## Usage
 
 ```
@@ -336,6 +411,7 @@ COMMANDS:
     update                           Update isolazi to the latest version
     version                          Print version information
     help                             Print this help message
+    compose <subcommand> [OPTIONS]    Multi-container orchestration
 
 OPTIONS for 'build':
     -f, --file <path>         Name of the Isolazifile (default: 'Isolazifile')
@@ -402,6 +478,19 @@ OPTIONS for 'rm':
 
 OPTIONS for 'prune':
     -f, --force          Remove all containers (including running)
+
+OPTIONS for 'compose':
+    -f, --file <path>         Compose file (default: 'docker-compose.yml')
+
+    SUBCOMMANDS:
+    up [-d]                   Create and start all services
+    down                      Stop and remove all service containers
+    ps                        List running service containers
+    logs [-f] [-n N]          View service logs
+    stop                      Stop all running services
+    restart                   Restart all services
+    pull                      Pull images for all services
+    config                    Validate and display compose configuration
 ```
 
 ## Image References
@@ -423,6 +512,7 @@ isolazi/
 │   ├── main.zig          # CLI entry point
 │   ├── root.zig          # Module exports
 │   ├── cli/              # Command-line interface
+│   │   ├── compose.zig  # Docker Compose orchestration
 │   ├── config/           # Container configuration
 │   ├── container/        # Container state management
 │   ├── image/            # OCI image handling

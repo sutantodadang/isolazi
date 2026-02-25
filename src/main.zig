@@ -32,6 +32,7 @@ const windows = if (builtin.os.tag == .windows) isolazi.windows else struct {
 };
 
 pub fn main() !u8 {
+
     // Get the writer for stdout/stderr
     var stderr_buffer: [4096]u8 = undefined;
     var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
@@ -77,6 +78,7 @@ const runOnWindows = if (builtin.os.tag == .windows) struct {
         stderr: anytype,
     ) !u8 {
         // Handle help and version locally (no need for WSL)
+
         // Handle update command (special case not in CLI parser yet)
         if (args.len >= 2 and std.mem.eql(u8, args[1], "update")) {
             return commands.update.selfUpdate(allocator, args, stdout, stderr);
@@ -88,6 +90,7 @@ const runOnWindows = if (builtin.os.tag == .windows) struct {
             try stderr.flush();
             return 1;
         };
+
 
         switch (command) {
             .version => {
@@ -115,6 +118,7 @@ const runOnWindows = if (builtin.os.tag == .windows) struct {
             .logs => |cmd| return commands.logs.showLogs(allocator, cmd, stdout, stderr),
             .prune => |cmd| return commands.prune.prune(allocator, cmd, stdout, stderr),
             .build => |cmd| return commands.build.buildImage(allocator, cmd, stdout, stderr),
+            .compose => return commands.compose.run(allocator, args, stdout, stderr),
         }
 
         // Check if WSL is available (only needed for 'run' command)
@@ -266,6 +270,7 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
             .logs => |logs_cmd| return commands.logs.showLogs(allocator, logs_cmd, stdout, stderr),
             .prune => |prune_cmd| return commands.prune.prune(allocator, prune_cmd, stdout, stderr),
             .build => |build_cmd| return commands.build.buildImage(allocator, build_cmd, stdout, stderr),
+            .compose => return commands.compose.run(allocator, args, stdout, stderr),
         }
     }
 
@@ -339,6 +344,7 @@ const runOnLinux = if (builtin.os.tag == .linux) struct {
             .inspect => |cmd| return commands.inspect.inspectContainer(allocator, cmd, stdout, stderr),
             .create => |_| return commands.create.createContainer(allocator, args, stdout, stderr),
             .build => |build_cmd| return commands.build.buildImage(allocator, build_cmd, stdout, stderr),
+            .compose => return commands.compose.run(allocator, args, stdout, stderr),
         }
     }
 
