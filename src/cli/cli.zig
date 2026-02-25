@@ -20,7 +20,7 @@ const runtime_mod = @import("../runtime/mod.zig");
 const Config = config_mod.Config;
 
 /// CLI version string
-pub const VERSION = "0.2.5";
+pub const VERSION = "0.2.6";
 
 /// CLI error types
 pub const CliError = error{
