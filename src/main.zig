@@ -84,13 +84,17 @@ const runOnWindows = if (builtin.os.tag == .windows) struct {
             return commands.update.selfUpdate(allocator, args, stdout, stderr);
         }
 
+        // Handle startup restart: `isolazi startup` starts containers with restart=always/unless-stopped
+        if (args.len >= 2 and std.mem.eql(u8, args[1], "startup")) {
+            return startupRestart(allocator, stdout, stderr);
+        }
+
         // Parse CLI arguments
         const command = isolazi.cli.parse(args) catch |err| {
             try isolazi.cli.printError(stderr, err);
             try stderr.flush();
             return 1;
         };
-
 
         switch (command) {
             .version => {
@@ -191,6 +195,58 @@ const runOnWindows = if (builtin.os.tag == .windows) struct {
     }
 }.call;
 
+/// Start all containers with restart policy 'always' or 'unless-stopped'.
+/// Intended to be called at system startup (e.g., via Windows Task Scheduler
+/// or systemd service) to restore containers that should auto-restart.
+fn startupRestart(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype) u8 {
+    var manager = isolazi.container.ContainerManager.init(allocator) catch |err| {
+        stderr.print("Error: Failed to initialize container manager: {}\n", .{err}) catch {};
+        return 1;
+    };
+    defer manager.deinit();
+
+    // List all containers (including stopped)
+    const containers = manager.listContainers(true) catch |err| {
+        stderr.print("Error: Failed to list containers: {}\n", .{err}) catch {};
+        return 1;
+    };
+    defer {
+        for (containers) |*c| {
+            @constCast(c).deinit();
+        }
+        allocator.free(containers);
+    }
+
+    var started: u32 = 0;
+    for (containers) |ct| {
+        // Skip running containers
+        if (ct.state == .running) continue;
+
+        // Only restart containers with appropriate restart policy
+        const should_restart = switch (ct.restart_policy) {
+            .always => true,
+            .unless_stopped => true,
+            .on_failure => false, // Don't auto-start on boot for on-failure
+            .no => false,
+        };
+        if (!should_restart) continue;
+
+        stdout.print("Starting container {s} ({s})...\n", .{ ct.id[0..12], ct.image }) catch {};
+        stdout.flush() catch {};
+
+        // Use the start command infrastructure
+        const start_cmd = isolazi.cli.StartCommand{ .container_id = &ct.id };
+        const result = commands.container.startContainer(allocator, start_cmd, stdout, stderr);
+        if (result == 0) {
+            started += 1;
+        }
+    }
+
+    stdout.print("Started {d} container(s) with auto-restart policy.\n", .{started}) catch {};
+    stdout.flush() catch {};
+    return 0;
+}
+
 /// Pull image on Windows (native, no WSL needed)
 /// Pull image on Windows (delegated to shared pull command)
 // pullImageWindows and listImagesWindows removed (delegated)
@@ -235,6 +291,7 @@ const runOnMacOS = if (builtin.os.tag == .macos) struct {
             // Handle special commands (not in standard CLI parser)
             if (std.mem.eql(u8, cmd, "update")) return commands.update.selfUpdate(allocator, args, stdout, stderr);
             if (std.mem.eql(u8, cmd, "vm")) return commands.vm.run(allocator, args, stdout, stderr);
+            if (std.mem.eql(u8, cmd, "startup")) return startupRestart(allocator, stdout, stderr);
         }
 
         // Parse arguments
@@ -309,6 +366,11 @@ const runOnLinux = if (builtin.os.tag == .linux) struct {
         // Handle update command specially (not part of CLI parser)
         if (args.len >= 2 and std.mem.eql(u8, args[1], "update")) {
             return commands.update.selfUpdate(allocator, args, stdout, stderr);
+        }
+
+        // Handle startup restart
+        if (args.len >= 2 and std.mem.eql(u8, args[1], "startup")) {
+            return startupRestart(allocator, stdout, stderr);
         }
 
         // Parse CLI arguments
