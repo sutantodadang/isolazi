@@ -604,6 +604,15 @@ fn composeUp(
             try run_args.append(a, "--privileged");
         }
 
+        // Container name (from container_name or default to project-service)
+        if (cfg.container_name) |cn| {
+            try run_args.append(a, "--name");
+            try run_args.append(a, cn);
+        } else {
+            try run_args.append(a, "--name");
+            try run_args.append(a, try std.fmt.allocPrint(a, "{s}-{s}", .{ project_name, svc_name }));
+        }
+
         // Image (positional arg)
         try run_args.append(a, cfg.image.?);
 

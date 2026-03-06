@@ -19,6 +19,161 @@ pub const Executor = struct {
         return .{ .allocator = allocator };
     }
 
+    /// Escape single quotes for embedding inside a single-quoted shell string.
+    /// Replaces each ' with '\'' (end quote, escaped quote, start quote).
+    fn shellEscapeSingleQuotes(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
+        var result: std.ArrayList(u8) = .empty;
+        defer result.deinit(allocator);
+        for (input) |c| {
+            if (c == '\'') {
+                try result.appendSlice(allocator, "'\\''");
+            } else {
+                try result.append(allocator, c);
+            }
+        }
+        return result.toOwnedSlice(allocator);
+    }
+
+    /// Append mount setup commands for /dev, /sys, /dev/pts, /dev/shm inside chroot.
+    fn appendMountSetup(script: *std.ArrayList(u8), allocator: std.mem.Allocator, rootfs: []const u8) !void {
+        // Mount proc
+        try script.appendSlice(allocator, "mkdir -p ");
+        try script.appendSlice(allocator, rootfs);
+        try script.appendSlice(allocator, "/proc && ");
+        try script.appendSlice(allocator, "mount -t proc proc ");
+        try script.appendSlice(allocator, rootfs);
+        try script.appendSlice(allocator, "/proc && ");
+
+        // Bind-mount /dev
+        try script.appendSlice(allocator, "mkdir -p ");
+        try script.appendSlice(allocator, rootfs);
+        try script.appendSlice(allocator, "/dev && ");
+        try script.appendSlice(allocator, "mount --bind /dev ");
+        try script.appendSlice(allocator, rootfs);
+        try script.appendSlice(allocator, "/dev && ");
+
+        // Mount devpts
+        try script.appendSlice(allocator, "mkdir -p ");
+        try script.appendSlice(allocator, rootfs);
+        try script.appendSlice(allocator, "/dev/pts && ");
+        try script.appendSlice(allocator, "mount -t devpts devpts ");
+        try script.appendSlice(allocator, rootfs);
+        try script.appendSlice(allocator, "/dev/pts 2>/dev/null || true; ");
+
+        // Mount sysfs
+        try script.appendSlice(allocator, "mkdir -p ");
+        try script.appendSlice(allocator, rootfs);
+        try script.appendSlice(allocator, "/sys && ");
+        try script.appendSlice(allocator, "mount -t sysfs sysfs ");
+        try script.appendSlice(allocator, rootfs);
+        try script.appendSlice(allocator, "/sys && ");
+
+        // Mount tmpfs for /dev/shm
+        try script.appendSlice(allocator, "mkdir -p ");
+        try script.appendSlice(allocator, rootfs);
+        try script.appendSlice(allocator, "/dev/shm && ");
+        try script.appendSlice(allocator, "mount -t tmpfs tmpfs ");
+        try script.appendSlice(allocator, rootfs);
+        try script.appendSlice(allocator, "/dev/shm && ");
+
+        // Copy resolv.conf for DNS resolution
+        try script.appendSlice(allocator, "mkdir -p ");
+        try script.appendSlice(allocator, rootfs);
+        try script.appendSlice(allocator, "/etc && ");
+        try script.appendSlice(allocator, "cp /etc/resolv.conf ");
+        try script.appendSlice(allocator, rootfs);
+        try script.appendSlice(allocator, "/etc/resolv.conf && ");
+    }
+
+    /// Append cleanup (umount) trap so mounts are removed even on failure.
+    fn appendCleanupTrap(script: *std.ArrayList(u8), allocator: std.mem.Allocator, rootfs: []const u8) !void {
+        try script.appendSlice(allocator, "cleanup() { ");
+        // Unmount in reverse order; ignore errors if not mounted
+        const mounts = [_][]const u8{ "/dev/shm", "/sys", "/dev/pts", "/dev", "/proc" };
+        for (mounts) |mnt| {
+            try script.appendSlice(allocator, "umount ");
+            try script.appendSlice(allocator, rootfs);
+            try script.appendSlice(allocator, mnt);
+            try script.appendSlice(allocator, " 2>/dev/null || true; ");
+        }
+        try script.appendSlice(allocator, "}; trap cleanup EXIT; ");
+    }
+
+    /// Append chroot command with env vars, workdir, and the user command.
+    fn appendChrootCommand(
+        script: *std.ArrayList(u8),
+        allocator: std.mem.Allocator,
+        rootfs: []const u8,
+        command: []const u8,
+        env_vars: []const isolazifile.EnvInstruction.EnvVar,
+        workdir: ?[]const u8,
+    ) !void {
+        try script.appendSlice(allocator, "chroot ");
+        try script.appendSlice(allocator, rootfs);
+        try script.appendSlice(allocator, " /bin/sh -c '");
+
+        // Standard environment
+        try script.appendSlice(allocator, "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; ");
+        try script.appendSlice(allocator, "export HOME=/root; ");
+
+        // User-defined environment variables with proper escaping
+        for (env_vars) |env| {
+            const escaped_value = try shellEscapeSingleQuotes(allocator, env.value);
+            defer allocator.free(escaped_value);
+            try script.appendSlice(allocator, "export ");
+            try script.appendSlice(allocator, env.key);
+            try script.appendSlice(allocator, "='");
+            try script.appendSlice(allocator, escaped_value);
+            try script.appendSlice(allocator, "'; ");
+        }
+
+        if (workdir) |wd| {
+            try script.appendSlice(allocator, "cd ");
+            try script.appendSlice(allocator, wd);
+            try script.appendSlice(allocator, " && ");
+        }
+
+        // Escape single quotes in the command itself
+        const escaped_cmd = try shellEscapeSingleQuotes(allocator, command);
+        defer allocator.free(escaped_cmd);
+        try script.appendSlice(allocator, escaped_cmd);
+        try script.appendSlice(allocator, "'");
+    }
+
+    /// Check child process termination status and return error with stderr output.
+    fn checkTermResult(term: std.process.Child.Term, stderr: []const u8) !void {
+        switch (term) {
+            .Exited => |code| {
+                if (code != 0) {
+                    if (stderr.len > 0) {
+                        // Print last 2000 chars of stderr to avoid flooding
+                        const start = if (stderr.len > 2000) stderr.len - 2000 else 0;
+                        std.debug.print("Build command failed (exit code {d}):\n{s}\n", .{ code, stderr[start..] });
+                    } else {
+                        std.debug.print("Build command failed with exit code {d} (no stderr output)\n", .{code});
+                    }
+                    return error.CommandFailed;
+                }
+            },
+            .Signal => |sig| {
+                std.debug.print("Build command killed by signal {d}\n", .{sig});
+                if (stderr.len > 0) {
+                    const start = if (stderr.len > 2000) stderr.len - 2000 else 0;
+                    std.debug.print("{s}\n", .{stderr[start..]});
+                }
+                return error.CommandFailed;
+            },
+            .Stopped => |sig| {
+                std.debug.print("Build command stopped by signal {d}\n", .{sig});
+                return error.CommandFailed;
+            },
+            .Unknown => |code| {
+                std.debug.print("Build command terminated with unknown status {d}\n", .{code});
+                return error.CommandFailed;
+            },
+        }
+    }
+
     /// Run a command inside the build container
     pub fn runCommand(
         self: *Executor,
@@ -62,9 +217,6 @@ pub const Executor = struct {
         env_vars: []const isolazifile.EnvInstruction.EnvVar,
         workdir: ?[]const u8,
     ) !void {
-        // Construct WSL command to run in container environment
-        // wsl -u root -- unshare --mount --uts --ipc --pid --fork sh -c "setup && command"
-
         var wsl_cmd: std.ArrayList([]const u8) = .empty;
         defer wsl_cmd.deinit(self.allocator);
 
@@ -81,72 +233,34 @@ pub const Executor = struct {
         try wsl_cmd.append(self.allocator, "sh");
         try wsl_cmd.append(self.allocator, "-c");
 
-        // Convert Windows path to WSL path
         const wsl_rootfs = try self.windowsToWslPath(rootfs_path);
         defer self.allocator.free(wsl_rootfs);
 
-        // Build the setup script + command
         var script: std.ArrayList(u8) = .empty;
         defer script.deinit(self.allocator);
 
-        // 1. Mount proc
-        try script.appendSlice(self.allocator, "mkdir -p ");
-        try script.appendSlice(self.allocator, wsl_rootfs);
-        try script.appendSlice(self.allocator, "/proc && ");
+        // Setup cleanup trap to unmount on exit
+        try appendCleanupTrap(&script, self.allocator, wsl_rootfs);
 
-        try script.appendSlice(self.allocator, "mount -t proc proc ");
-        try script.appendSlice(self.allocator, wsl_rootfs);
-        try script.appendSlice(self.allocator, "/proc && ");
+        // Mount all required filesystems (/proc, /dev, /dev/pts, /sys, /dev/shm, resolv.conf)
+        try appendMountSetup(&script, self.allocator, wsl_rootfs);
 
-        // Copy resolv.conf
-        try script.appendSlice(self.allocator, "mkdir -p ");
-        try script.appendSlice(self.allocator, wsl_rootfs);
-        try script.appendSlice(self.allocator, "/etc && ");
-        try script.appendSlice(self.allocator, "cp /etc/resolv.conf ");
-        try script.appendSlice(self.allocator, wsl_rootfs);
-        try script.appendSlice(self.allocator, "/etc/resolv.conf && ");
-
-        // 2. Chroot and run
-        try script.appendSlice(self.allocator, "chroot ");
-        try script.appendSlice(self.allocator, wsl_rootfs);
-        try script.appendSlice(self.allocator, " /bin/sh -c '");
-
-        // Environment variables
-        try script.appendSlice(self.allocator, "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; ");
-        try script.appendSlice(self.allocator, "export HOME=/root; ");
-
-        for (env_vars) |env| {
-            try script.appendSlice(self.allocator, "export ");
-            try script.appendSlice(self.allocator, env.key);
-            try script.appendSlice(self.allocator, "='");
-            // Simple escaping
-            try script.appendSlice(self.allocator, env.value);
-            try script.appendSlice(self.allocator, "'; ");
-        }
-
-        if (workdir) |wd| {
-            try script.appendSlice(self.allocator, "cd ");
-            try script.appendSlice(self.allocator, wd);
-            try script.appendSlice(self.allocator, " && ");
-        }
-        try script.appendSlice(self.allocator, command);
-        try script.appendSlice(self.allocator, "'");
+        // Chroot and execute the command
+        try appendChrootCommand(&script, self.allocator, wsl_rootfs, command, env_vars, workdir);
 
         try wsl_cmd.append(self.allocator, script.items);
 
         const result = try std.process.Child.run(.{
             .allocator = self.allocator,
             .argv = wsl_cmd.items,
+            .max_output_bytes = 10 * 1024 * 1024, // 10MB to capture large apt-get output
         });
         defer {
             self.allocator.free(result.stdout);
             self.allocator.free(result.stderr);
         }
 
-        if (result.term.Exited != 0) {
-            std.debug.print("Build command failed: {s}\n", .{result.stderr});
-            return error.CommandFailed;
-        }
+        try checkTermResult(result.term, result.stderr);
     }
 
     fn archiveWindows(self: *Executor, source_path: []const u8, dest_tar_path: []const u8) !void {
@@ -226,61 +340,28 @@ pub const Executor = struct {
         var script: std.ArrayList(u8) = .empty;
         defer script.deinit(self.allocator);
 
-        // Mount proc
-        // Mount proc
-        try script.appendSlice(self.allocator, "mkdir -p ");
-        try script.appendSlice(self.allocator, rootfs_path);
-        try script.appendSlice(self.allocator, "/proc && ");
-        try script.appendSlice(self.allocator, "mount -t proc proc ");
-        try script.appendSlice(self.allocator, rootfs_path);
-        try script.appendSlice(self.allocator, "/proc && ");
+        // Setup cleanup trap to unmount on exit
+        try appendCleanupTrap(&script, self.allocator, rootfs_path);
 
-        // Copy resolv.conf
-        try script.appendSlice(self.allocator, "mkdir -p ");
-        try script.appendSlice(self.allocator, rootfs_path);
-        try script.appendSlice(self.allocator, "/etc && ");
-        try script.appendSlice(self.allocator, "cp /etc/resolv.conf ");
-        try script.appendSlice(self.allocator, rootfs_path);
-        try script.appendSlice(self.allocator, "/etc/resolv.conf && ");
+        // Mount all required filesystems
+        try appendMountSetup(&script, self.allocator, rootfs_path);
 
-        // Chroot and run
-        try script.appendSlice(self.allocator, "chroot ");
-        try script.appendSlice(self.allocator, rootfs_path);
-        try script.appendSlice(self.allocator, " /bin/sh -c '");
-
-        try script.appendSlice(self.allocator, "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; ");
-        try script.appendSlice(self.allocator, "export HOME=/root; ");
-
-        for (env_vars) |env| {
-            try script.appendSlice(self.allocator, "export ");
-            try script.appendSlice(self.allocator, env.key);
-            try script.appendSlice(self.allocator, "='");
-            try script.appendSlice(self.allocator, env.value);
-            try script.appendSlice(self.allocator, "'; ");
-        }
-
-        if (workdir) |wd| {
-            try script.appendSlice(self.allocator, "cd ");
-            try script.appendSlice(self.allocator, wd);
-            try script.appendSlice(self.allocator, " && ");
-        }
-        try script.appendSlice(self.allocator, command);
-        try script.appendSlice(self.allocator, "'");
+        // Chroot and execute the command
+        try appendChrootCommand(&script, self.allocator, rootfs_path, command, env_vars, workdir);
 
         try cmd_list.append(self.allocator, script.items);
 
         const result = try std.process.Child.run(.{
             .allocator = self.allocator,
             .argv = cmd_list.items,
+            .max_output_bytes = 10 * 1024 * 1024,
         });
         defer {
             self.allocator.free(result.stdout);
             self.allocator.free(result.stderr);
         }
 
-        if (result.term.Exited != 0) {
-            return error.CommandFailed;
-        }
+        try checkTermResult(result.term, result.stderr);
     }
 
     fn archiveLinux(self: *Executor, source_path: []const u8, dest_tar_path: []const u8) !void {
@@ -313,7 +394,7 @@ pub const Executor = struct {
         defer lima_cmd.deinit(self.allocator);
 
         try lima_cmd.append(self.allocator, "lima");
-        try lima_cmd.append(self.allocator, "sudo"); // Need root in VM
+        try lima_cmd.append(self.allocator, "sudo");
         try lima_cmd.append(self.allocator, "unshare");
         try lima_cmd.append(self.allocator, "--mount");
         try lima_cmd.append(self.allocator, "--uts");
@@ -326,59 +407,28 @@ pub const Executor = struct {
         var script: std.ArrayList(u8) = .empty;
         defer script.deinit(self.allocator);
 
-        // Mount proc
-        // Mount proc
-        try script.appendSlice(self.allocator, "mkdir -p ");
-        try script.appendSlice(self.allocator, rootfs_path);
-        try script.appendSlice(self.allocator, "/proc && ");
-        try script.appendSlice(self.allocator, "mount -t proc proc ");
-        try script.appendSlice(self.allocator, rootfs_path);
-        try script.appendSlice(self.allocator, "/proc && ");
+        // Setup cleanup trap to unmount on exit
+        try appendCleanupTrap(&script, self.allocator, rootfs_path);
 
-        // Copy resolv.conf
-        try script.appendSlice(self.allocator, "mkdir -p ");
-        try script.appendSlice(self.allocator, rootfs_path);
-        try script.appendSlice(self.allocator, "/etc && ");
-        try script.appendSlice(self.allocator, "cp /etc/resolv.conf ");
-        try script.appendSlice(self.allocator, rootfs_path);
-        try script.appendSlice(self.allocator, "/etc/resolv.conf && ");
+        // Mount all required filesystems
+        try appendMountSetup(&script, self.allocator, rootfs_path);
 
-        // Chroot
-        try script.appendSlice(self.allocator, "chroot ");
-        try script.appendSlice(self.allocator, rootfs_path);
-        try script.appendSlice(self.allocator, " /bin/sh -c '");
-
-        try script.appendSlice(self.allocator, "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; ");
-        try script.appendSlice(self.allocator, "export HOME=/root; ");
-
-        for (env_vars) |env| {
-            try script.appendSlice(self.allocator, "export ");
-            try script.appendSlice(self.allocator, env.key);
-            try script.appendSlice(self.allocator, "='");
-            try script.appendSlice(self.allocator, env.value);
-            try script.appendSlice(self.allocator, "'; ");
-        }
-
-        if (workdir) |wd| {
-            try script.appendSlice(self.allocator, "cd ");
-            try script.appendSlice(self.allocator, wd);
-            try script.appendSlice(self.allocator, " && ");
-        }
-        try script.appendSlice(self.allocator, command);
-        try script.appendSlice(self.allocator, "'");
+        // Chroot and execute the command
+        try appendChrootCommand(&script, self.allocator, rootfs_path, command, env_vars, workdir);
 
         try lima_cmd.append(self.allocator, script.items);
 
         const result = try std.process.Child.run(.{
             .allocator = self.allocator,
             .argv = lima_cmd.items,
+            .max_output_bytes = 10 * 1024 * 1024,
         });
         defer {
             self.allocator.free(result.stdout);
             self.allocator.free(result.stderr);
         }
 
-        if (result.term.Exited != 0) return error.CommandFailed;
+        try checkTermResult(result.term, result.stderr);
     }
 
     fn archiveMacos(self: *Executor, source_path: []const u8, dest_tar_path: []const u8) !void {

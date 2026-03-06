@@ -660,7 +660,7 @@ pub fn runContainer(
     }
     const state_envs = state_envs_buf[0..opts.env_vars.len];
 
-    _ = manager.createContainerWithId(&container_id, image_name, cmd_str_buf[0..cmd_str_len], null, opts.restart_policy, state_ports, state_vols, state_envs, workdir) catch |err| {
+    _ = manager.createContainerWithId(&container_id, image_name, cmd_str_buf[0..cmd_str_len], opts.name, opts.restart_policy, state_ports, state_vols, state_envs, workdir) catch |err| {
         try stderr.print("Warning: Failed to register container: {}\n", .{err});
     };
 

@@ -20,7 +20,7 @@ const runtime_mod = @import("../runtime/mod.zig");
 const Config = config_mod.Config;
 
 /// CLI version string
-pub const VERSION = "0.2.7";
+pub const VERSION = "0.2.8";
 
 /// CLI error types
 pub const CliError = error{
@@ -137,6 +137,7 @@ pub const RunCommand = struct {
     ports: []const PortMap = &[_]PortMap{},
     detach: bool = false, // Run container in background
     restart_policy: config_mod.Config.RestartPolicy = .no, // Restart policy
+    name: ?[]const u8 = null, // Custom container name
     rootless: bool = false, // Enable rootless mode (user namespace)
     uid_maps: []const IdMap = &[_]IdMap{}, // Custom UID mappings
     gid_maps: []const IdMap = &[_]IdMap{}, // Custom GID mappings
@@ -433,6 +434,10 @@ fn parseRunCommand(args: []const []const u8) CliError!Command {
                 const port_map = parsePortMapping(port_str) orelse return CliError.InvalidPortMapping;
                 ports_buf[ports_count] = port_map;
                 ports_count += 1;
+            } else if (std.mem.eql(u8, arg, "--name")) {
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                run_cmd.name = args[i];
             } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--detach")) {
                 // Detach mode
                 run_cmd.detach = true;
@@ -1249,7 +1254,7 @@ pub fn printHelp(writer: anytype) !void {
         \\    isolazi <COMMAND> [OPTIONS]
         \\
         \\COMMANDS:
-        \\    run [-d] <image> [command]       Run a command in a new container
+        \\    run [-d] [--name NAME] <image> [command]  Run a command in a new container
         \\    exec <container> <command>       Execute a command in a running container
         \\    logs [-f] <container>            Display container logs
         \\    create [--name NAME] <image>     Create a container without starting
@@ -1268,6 +1273,7 @@ pub fn printHelp(writer: anytype) !void {
         \\
         \\OPTIONS for 'run':
         \\    -d, --detach              Run container in background
+        \\    --name <name>             Assign a name to the container
         \\    -e, --env KEY=VALUE       Set environment variable (can use comma: KEY1=V1,KEY2=V2)
         \\    -v, --volume SRC:DST[:ro] Mount a volume (can be repeated)
         \\    -p, --port HOST:CONTAINER Publish port (can be repeated)
