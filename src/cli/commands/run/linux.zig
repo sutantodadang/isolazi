@@ -219,7 +219,7 @@ fn runContainerImpl(
     @memcpy(cmd_display[0..cmd_len], safe_cmd[0..cmd_len]);
 
     // Register container (state will be updated to running with PID by runtime)
-    _ = manager.createContainerWithId(&cid_buf, run_cmd.rootfs, cmd_display[0..cmd_len], null, .no, &[_]isolazi.container.state.PortMapping{}, &[_]isolazi.container.state.VolumeMount{}, &[_]isolazi.container.state.EnvVar{}) catch {};
+    _ = manager.createContainerWithId(&cid_buf, run_cmd.rootfs, cmd_display[0..cmd_len], null, .no, &[_]isolazi.container.state.PortMapping{}, &[_]isolazi.container.state.VolumeMount{}, &[_]isolazi.container.state.EnvVar{}, "/") catch {};
 
     // Handle detached mode: fork a monitor process and exit
     if (run_cmd.detach) {

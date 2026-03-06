@@ -395,6 +395,7 @@ pub fn runContainer(
             persist_ports.items,
             persist_vols.items,
             persist_envs.items,
+            "/",
         ) catch {};
     }
 

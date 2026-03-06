@@ -83,6 +83,9 @@ pub const ContainerInfo = struct {
 
     restart_policy: config_mod.Config.RestartPolicy = .no,
 
+    /// Working directory inside the container (from OCI config)
+    workdir: []const u8 = "/",
+
     /// Persisted port mappings for container restart
     ports: []PortMapping = &[_]PortMapping{},
     /// Persisted volume mounts for container restart
@@ -96,6 +99,7 @@ pub const ContainerInfo = struct {
         self.allocator.free(self.image);
         self.allocator.free(self.command);
         if (self.name) |n| self.allocator.free(n);
+        if (!std.mem.eql(u8, self.workdir, "/")) self.allocator.free(self.workdir);
         // Free port mappings
         self.allocator.free(self.ports);
         // Free volume mounts (strings are slices into parsed JSON, freed with parse result)
@@ -214,7 +218,7 @@ pub const ContainerManager = struct {
     }
 
     /// Create a new container with a pre-generated ID (does not start it)
-    /// Now also persists ports, volumes, and env_vars for restart support
+    /// Now also persists ports, volumes, env_vars, and workdir for restart support
     pub fn createContainerWithId(
         self: *Self,
         container_id: *const [32]u8,
@@ -225,6 +229,7 @@ pub const ContainerManager = struct {
         ports: []const PortMapping,
         volumes: []const VolumeMount,
         env_vars: []const EnvVar,
+        workdir: []const u8,
     ) !void {
 
         // Create container directory
@@ -273,6 +278,11 @@ pub const ContainerManager = struct {
         // restart_policy
         try json.appendSlice(self.allocator, "  \"restart_policy\": \"");
         try json.appendSlice(self.allocator, restart_policy.toString());
+        try json.appendSlice(self.allocator, "\",\n");
+
+        // workdir
+        try json.appendSlice(self.allocator, "  \"workdir\": \"");
+        try json.appendSlice(self.allocator, workdir);
         try json.appendSlice(self.allocator, "\",\n");
 
         // ports array
@@ -359,6 +369,7 @@ pub const ContainerManager = struct {
         const cmd_str = root.get("command").?.string;
         const created_at = root.get("created_at").?.integer;
         const restart_policy_str = if (root.get("restart_policy")) |rp| rp.string else "no";
+        const workdir_str = if (root.get("workdir")) |wd| wd.string else "/";
 
         try json.appendSlice(self.allocator, "{\n");
         try json.appendSlice(self.allocator, "  \"id\": \"");
@@ -399,6 +410,11 @@ pub const ContainerManager = struct {
         // restart_policy
         try json.appendSlice(self.allocator, "  \"restart_policy\": \"");
         try json.appendSlice(self.allocator, restart_policy_str);
+        try json.appendSlice(self.allocator, "\",\n");
+
+        // workdir
+        try json.appendSlice(self.allocator, "  \"workdir\": \"");
+        try json.appendSlice(self.allocator, workdir_str);
         try json.appendSlice(self.allocator, "\"");
 
         // Timestamp fields
@@ -574,6 +590,8 @@ pub const ContainerManager = struct {
 
             if (!alive) {
                 container_state = .stopped;
+                // Persist corrected state to disk so it's not stale on next read
+                self.updateState(id_str, .stopped, null, null) catch {};
             }
         }
 
@@ -667,6 +685,7 @@ pub const ContainerManager = struct {
             .exit_code = if (root.get("exit_code")) |v| if (v == .integer) @intCast(v.integer) else null else null,
             .name = if (root.get("name")) |v| if (v == .string) try self.allocator.dupe(u8, v.string) else null else null,
             .restart_policy = restart_policy,
+            .workdir = if (root.get("workdir")) |wd| if (wd == .string and !std.mem.eql(u8, wd.string, "/")) try self.allocator.dupe(u8, wd.string) else "/" else "/",
             .ports = ports_slice,
             .volumes = vols_slice,
             .env_vars = envs_slice,

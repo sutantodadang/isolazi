@@ -327,7 +327,8 @@ pub fn runContainer(
     var outer_buf: std.ArrayList(u8) = .empty;
     defer outer_buf.deinit(allocator);
 
-    // Outer script: create overlay dir, write host-visible PID, exec into unshare
+    // Outer script: create overlay dir, write host-visible PID, then run unshare.
+    // For restart policies (always/on-failure), wrap in a loop instead of exec.
     try outer_buf.appendSlice(allocator, "mkdir -p ");
     try outer_buf.appendSlice(allocator, overlay_upper);
     try outer_buf.appendSlice(allocator, " ");
@@ -336,13 +337,33 @@ pub fn runContainer(
     try outer_buf.appendSlice(allocator, overlay_merged);
     try outer_buf.appendSlice(allocator, " && echo $$ > ");
     try outer_buf.appendSlice(allocator, overlay_dir);
-    try outer_buf.appendSlice(allocator, "/pid && exec unshare --mount --uts --ipc --pid --fork ");
-    if (opts.rootless) {
-        try outer_buf.appendSlice(allocator, "--user --map-root-user ");
+    try outer_buf.appendSlice(allocator, "/pid");
+
+    const needs_restart_loop = opts.restart_policy == .always or opts.restart_policy == .on_failure;
+    if (needs_restart_loop) {
+        // Restart loop: re-run unshare on exit, with 1s delay to avoid tight loops
+        try outer_buf.appendSlice(allocator, " && while true; do unshare --mount --uts --ipc --pid --fork ");
+        if (opts.rootless) {
+            try outer_buf.appendSlice(allocator, "--user --map-root-user ");
+        }
+        try outer_buf.appendSlice(allocator, "sh ");
+        try outer_buf.appendSlice(allocator, overlay_dir);
+        try outer_buf.appendSlice(allocator, "/run.sh; EXIT_CODE=$?; ");
+        if (opts.restart_policy == .on_failure) {
+            // on-failure: only restart if exit code != 0
+            try outer_buf.appendSlice(allocator, "[ $EXIT_CODE -eq 0 ] && break; ");
+        }
+        try outer_buf.appendSlice(allocator, "sleep 1; done");
+    } else {
+        // No restart: exec directly into unshare
+        try outer_buf.appendSlice(allocator, " && exec unshare --mount --uts --ipc --pid --fork ");
+        if (opts.rootless) {
+            try outer_buf.appendSlice(allocator, "--user --map-root-user ");
+        }
+        try outer_buf.appendSlice(allocator, "sh ");
+        try outer_buf.appendSlice(allocator, overlay_dir);
+        try outer_buf.appendSlice(allocator, "/run.sh");
     }
-    try outer_buf.appendSlice(allocator, "sh ");
-    try outer_buf.appendSlice(allocator, overlay_dir);
-    try outer_buf.appendSlice(allocator, "/run.sh");
 
     // Inner script: overlay setup, mounts, chroot (runs INSIDE unshare namespace)
     var script_buf: std.ArrayList(u8) = .empty;
@@ -639,7 +660,7 @@ pub fn runContainer(
     }
     const state_envs = state_envs_buf[0..opts.env_vars.len];
 
-    _ = manager.createContainerWithId(&container_id, image_name, cmd_str_buf[0..cmd_str_len], null, opts.restart_policy, state_ports, state_vols, state_envs) catch |err| {
+    _ = manager.createContainerWithId(&container_id, image_name, cmd_str_buf[0..cmd_str_len], null, opts.restart_policy, state_ports, state_vols, state_envs, workdir) catch |err| {
         try stderr.print("Warning: Failed to register container: {}\n", .{err});
     };
 
