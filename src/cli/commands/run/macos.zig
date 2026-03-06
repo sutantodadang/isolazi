@@ -390,7 +390,7 @@ pub fn runContainer(
             &container_id,
             opts.image_name,
             cmd_display[0..cmd_display_len],
-            null,
+            opts.name,
             opts.restart_policy,
             persist_ports.items,
             persist_vols.items,

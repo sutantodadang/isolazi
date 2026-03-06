@@ -21,6 +21,7 @@ pub const RunOptions = struct {
     seccomp_enabled: bool = true, // Default enabled
     seccomp_profile: SeccompProfileOption = .default_container,
     restart_policy: isolazi.Config.RestartPolicy = .no,
+    name: ?[]const u8 = null, // Custom container name
 
     pub const EnvPair = struct {
         key: []const u8,
@@ -96,6 +97,10 @@ pub fn parseRunOptions(allocator: std.mem.Allocator, args: []const []const u8) !
 
         if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--detach")) {
             opts.detach_mode = true;
+        } else if (std.mem.eql(u8, arg, "--name")) {
+            arg_idx += 1;
+            if (arg_idx >= args.len) return error.MissingValue;
+            opts.name = args[arg_idx];
         } else if (std.mem.eql(u8, arg, "-e") or std.mem.eql(u8, arg, "--env")) {
             arg_idx += 1;
             if (arg_idx >= args.len) return error.MissingValue;
@@ -376,6 +381,7 @@ pub fn printUsage(stderr: anytype) void {
     stderr.writeAll("Usage: isolazi run [options] <image> [command...]\n") catch {};
     stderr.writeAll("\nOptions:\n") catch {};
     stderr.writeAll("  -d, --detach              Run in background\n") catch {};
+    stderr.writeAll("  --name <name>             Assign a name to the container\n") catch {};
     stderr.writeAll("  -e, --env KEY=VALUE       Set environment variable\n") catch {};
     stderr.writeAll("  -v, --volume SRC:DST[:ro] Mount a volume\n") catch {};
     stderr.writeAll("  -p, --port HOST:CONTAINER Publish port\n") catch {};

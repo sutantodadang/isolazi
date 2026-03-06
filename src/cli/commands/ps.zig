@@ -38,7 +38,7 @@ pub fn listContainers(
     }
 
     // Print header
-    stdout.writeAll("CONTAINER ID   IMAGE                    COMMAND         STATUS\n") catch {};
+    stdout.writeAll("CONTAINER ID   NAME                     IMAGE                    COMMAND         STATUS\n") catch {};
 
     if (containers.len == 0) {
         if (!show_all) {
@@ -48,12 +48,14 @@ pub fn listContainers(
         }
     } else {
         for (containers) |c| {
-            // Truncate image and command for display
+            // Truncate fields for display
+            const name_display = if (c.name) |n| (if (n.len > 24) n[0..24] else n) else "-";
             const image_display = if (c.image.len > 24) c.image[0..24] else c.image;
             const cmd_display = if (c.command.len > 15) c.command[0..15] else c.command;
 
-            stdout.print("{s}   {s: <24} {s: <15} {s}\n", .{
+            stdout.print("{s}   {s: <24} {s: <24} {s: <15} {s}\n", .{
                 c.shortId(),
+                name_display,
                 image_display,
                 cmd_display,
                 c.state.toString(),
