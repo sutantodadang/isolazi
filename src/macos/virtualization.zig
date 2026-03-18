@@ -901,14 +901,11 @@ pub fn refreshLimaPortForwarding(allocator: std.mem.Allocator) void {
         allocator.free(res.stderr);
     } else |_| {}
 
-    // Also try to signal the ssh tunnel process that handles port forwarding
-    if (std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &[_][]const u8{ "pkill", "-HUP", "-f", "ssh.*lima.*isolazi" },
-    })) |res| {
-        allocator.free(res.stdout);
-        allocator.free(res.stderr);
-    } else |_| {}
+    // Note: Do NOT signal SSH processes (ssh.*lima.*isolazi) here.
+    // That pattern matches ALL Lima SSH sessions including those backing
+    // other running containers' `limactl shell` processes. Sending SIGHUP
+    // to those SSH sessions kills unrelated containers.
+    // The hostagent SIGHUP above is sufficient to trigger port re-scanning.
 }
 
 pub fn isContainerAliveInLima(allocator: std.mem.Allocator, container_id: []const u8) !bool {

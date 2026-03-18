@@ -566,13 +566,13 @@ pub const ContainerManager = struct {
                     alive = self.isPidAliveWSL(pid) catch false;
                 } else {
                     // Unix check using kill(pid, 0)
-                    std.posix.kill(pid, 0) catch |err| {
-                        if (err != error.PermissionDenied) {
-                            alive = false;
-                        } else {
-                            alive = true;
-                        }
-                    };
+                    // Success means process exists and we have permission
+                    if (std.posix.kill(pid, 0)) {
+                        alive = true;
+                    } else |err| {
+                        // PermissionDenied means process exists but we lack permission
+                        alive = (err == error.PermissionDenied);
+                    }
                 }
             }
 
