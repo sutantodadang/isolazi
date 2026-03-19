@@ -589,9 +589,12 @@ pub const ContainerManager = struct {
             }
 
             if (!alive) {
+                // Report as stopped for display, but do NOT persist to disk.
+                // Liveness checks (especially Lima-based ones) can fail transiently
+                // when the VM is under load. Persisting "stopped" from a flaky check
+                // makes the false-positive permanent and prevents future rechecks.
+                // State should only be persisted by explicit commands (stop, rm).
                 container_state = .stopped;
-                // Persist corrected state to disk so it's not stale on next read
-                self.updateState(id_str, .stopped, null, null) catch {};
             }
         }
 
