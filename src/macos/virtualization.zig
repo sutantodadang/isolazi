@@ -429,27 +429,16 @@ pub fn runWithLimaEx(
     switch (status) {
         .Running => {}, // Proceed
         .NotExists => {
-            // Create and start the VM
+            // Create and start the VM (shows progress to user)
+            std.debug.print("Creating Lima VM (this may take a few minutes)...\n", .{});
             _ = try createLimaInstance(allocator);
             return runWithLimaEx(allocator, "", rootfs_path, command, env_vars, volumes, port_mappings, rootless, detach, restart_policy, resource_limits, lsm_config, stdout_path, stderr_path);
         },
 
         .Stopped, .Unknown => {
-            // VM exists but stopped (or unknown), try to start it
-            const start_result = std.process.Child.run(.{
-                .allocator = allocator,
-                .argv = &[_][]const u8{ "limactl", "start", "isolazi" },
-            }) catch return VirtualizationError.VMStartFailed;
-
-            defer allocator.free(start_result.stdout);
-            defer allocator.free(start_result.stderr);
-
-            if (start_result.term.Exited != 0) {
-                // If it failed and status was Unknown, maybe it didn't exist?
-                // But checkLimaStatus handles NotExists separately.
-                // So this is a real start failure.
-                return VirtualizationError.VMStartFailed;
-            }
+            // VM exists but stopped (or unknown), start it with visible progress
+            std.debug.print("Starting Lima VM...\n", .{});
+            try startLimaWithProgress(allocator);
         },
     }
 
@@ -784,9 +773,9 @@ fn createLimaInstance(allocator: std.mem.Allocator) !void {
         \\    arch: "x86_64"
         \\  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
         \\    arch: "aarch64"
-        \\cpus: 2
-        \\memory: "2GiB"
-        \\disk: "10GiB"
+        \\cpus: 4
+        \\memory: "4GiB"
+        \\disk: "20GiB"
         \\mounts:
         \\  - location: "~"
         \\    writable: true
@@ -824,29 +813,38 @@ fn createLimaInstance(allocator: std.mem.Allocator) !void {
     defer file.close();
     try file.writeAll(lima_config);
 
-    // Create Lima instance
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &[_][]const u8{ "limactl", "create", "--name=isolazi", config_path },
-    }) catch return VirtualizationError.VMCreationFailed;
-
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-
-    if (result.term.Exited != 0) {
-        return VirtualizationError.VMCreationFailed;
+    // Create Lima instance with visible output so user sees progress
+    {
+        var child = std.process.Child.init(
+            &[_][]const u8{ "limactl", "create", "--name=isolazi", "--tty=false", config_path },
+            allocator,
+        );
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Inherit;
+        child.stderr_behavior = .Inherit;
+        try child.spawn();
+        const term = try child.wait();
+        if (term.Exited != 0) {
+            return VirtualizationError.VMCreationFailed;
+        }
     }
 
-    // Start the instance
-    const start_result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &[_][]const u8{ "limactl", "start", "isolazi" },
-    }) catch return VirtualizationError.VMStartFailed;
+    // Start the instance with visible output
+    try startLimaWithProgress(allocator);
+}
 
-    defer allocator.free(start_result.stdout);
-    defer allocator.free(start_result.stderr);
-
-    if (start_result.term.Exited != 0) {
+/// Start Lima VM with stdout/stderr inherited so user sees boot progress.
+fn startLimaWithProgress(allocator: std.mem.Allocator) VirtualizationError!void {
+    var child = std.process.Child.init(
+        &[_][]const u8{ "limactl", "start", "isolazi" },
+        allocator,
+    );
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+    child.spawn() catch return VirtualizationError.VMStartFailed;
+    const term = child.wait() catch return VirtualizationError.VMStartFailed;
+    if (term.Exited != 0) {
         return VirtualizationError.VMStartFailed;
     }
 }
@@ -968,22 +966,14 @@ pub fn ensureVMRunning(allocator: std.mem.Allocator) !void {
     switch (status) {
         .Running => return,
         .NotExists => {
-            // Create and start the VM
+            // Create and start the VM (shows progress to user)
+            std.debug.print("Creating Lima VM (this may take a few minutes)...\n", .{});
             try createLimaInstance(allocator);
         },
         .Stopped, .Unknown => {
-            // VM exists but stopped (or unknown), try to start it
-            const start_result = std.process.Child.run(.{
-                .allocator = allocator,
-                .argv = &[_][]const u8{ "limactl", "start", "isolazi" },
-            }) catch return VirtualizationError.VMStartFailed;
-
-            defer allocator.free(start_result.stdout);
-            defer allocator.free(start_result.stderr);
-
-            if (start_result.term.Exited != 0) {
-                return VirtualizationError.VMStartFailed;
-            }
+            // VM exists but stopped (or unknown), start with visible progress
+            std.debug.print("Starting Lima VM...\n", .{});
+            try startLimaWithProgress(allocator);
         },
     }
 }
@@ -1055,19 +1045,6 @@ pub fn startContainer(
     var lima_args: std.ArrayList([]const u8) = .empty;
     defer lima_args.deinit(allocator);
 
-    try lima_args.append(allocator, "limactl");
-    try lima_args.append(allocator, "shell");
-    try lima_args.append(allocator, "isolazi");
-
-    // Environment variables for the container tag - need sudo for mounts
-    try lima_args.append(allocator, "--");
-    try lima_args.append(allocator, "sudo");
-    try lima_args.append(allocator, "env");
-
-    const isolazi_id_env = try std.fmt.allocPrint(allocator, "ISOLAZI_ID={s}", .{container_id});
-    defer allocator.free(isolazi_id_env);
-    try lima_args.append(allocator, isolazi_id_env);
-
     // Track dynamic allocations that need cleanup after run()
     var dynamic_allocs: std.ArrayList([]const u8) = .empty;
     defer {
@@ -1075,15 +1052,15 @@ pub fn startContainer(
         dynamic_allocs.deinit(allocator);
     }
 
+    // Build log path for output capture
+    const log_path = try std.fmt.allocPrint(allocator, "{s}/.isolazi/containers/{s}/stdout.log", .{ home, container_id });
+    try dynamic_allocs.append(allocator, log_path);
+
     if (info.restart_policy == .no) {
         // Simple execution - run in background via sh -c
-        const log_path = try std.fmt.allocPrint(allocator, "{s}/.isolazi/containers/{s}/stdout.log", .{ home, container_id });
-        try dynamic_allocs.append(allocator, log_path);
         const bg_cmd = try std.fmt.allocPrint(allocator, "ISOLAZI_ID={s} sh \"{s}\" >> \"{s}\" 2>&1 &", .{ container_id, run_script_path, log_path });
         try dynamic_allocs.append(allocator, bg_cmd);
 
-        // Clear the existing args and build a simpler command
-        lima_args.clearAndFree(allocator);
         try lima_args.append(allocator, "limactl");
         try lima_args.append(allocator, "shell");
         try lima_args.append(allocator, "isolazi");
@@ -1094,6 +1071,11 @@ pub fn startContainer(
         try lima_args.append(allocator, bg_cmd);
     } else {
         // Use systemd-run for restart policies
+        try lima_args.append(allocator, "limactl");
+        try lima_args.append(allocator, "shell");
+        try lima_args.append(allocator, "isolazi");
+        try lima_args.append(allocator, "--");
+        try lima_args.append(allocator, "sudo");
         try lima_args.append(allocator, "systemd-run");
 
         const unit_name = try std.fmt.allocPrint(allocator, "--unit=isolazi-{s}", .{container_id});
@@ -1117,6 +1099,25 @@ pub fn startContainer(
         try lima_args.append(allocator, "--property=LimitNOFILE=infinity");
         try lima_args.append(allocator, "--property=LimitNPROC=infinity");
 
+        // Pass ISOLAZI_ID to the service process for liveness detection
+        const setenv_arg = try std.fmt.allocPrint(allocator, "--setenv=ISOLAZI_ID={s}", .{container_id});
+        try dynamic_allocs.append(allocator, setenv_arg);
+        try lima_args.append(allocator, setenv_arg);
+
+        // Direct service output to log file
+        const stdout_prop = try std.fmt.allocPrint(allocator, "--property=StandardOutput=append:{s}", .{log_path});
+        try dynamic_allocs.append(allocator, stdout_prop);
+        try lima_args.append(allocator, stdout_prop);
+
+        const stderr_prop = try std.fmt.allocPrint(allocator, "--property=StandardError=append:{s}", .{log_path});
+        try dynamic_allocs.append(allocator, stderr_prop);
+        try lima_args.append(allocator, stderr_prop);
+
+        // Keep unit around after exit for status inspection
+        try lima_args.append(allocator, "--collect");
+
+        // Separator between systemd-run options and the command
+        try lima_args.append(allocator, "--");
         try lima_args.append(allocator, "sh");
         try lima_args.append(allocator, run_script_path);
     }
@@ -1128,6 +1129,15 @@ pub fn startContainer(
     }) catch return VirtualizationError.CommandFailed;
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
+
+    // Check if the command actually succeeded
+    if (result.term.Exited != 0) {
+        std.debug.print("Error: container start failed (exit {d})\n", .{result.term.Exited});
+        if (result.stderr.len > 0) {
+            std.debug.print("{s}\n", .{result.stderr});
+        }
+        return VirtualizationError.CommandFailed;
+    }
 
     // Update container state via ContainerManager
     var manager = @import("../container/state.zig").ContainerManager.init(allocator) catch {
