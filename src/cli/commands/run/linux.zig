@@ -166,7 +166,7 @@ fn runContainerImpl(
     // For postgres, auto-set PGDATA if not provided
     if (is_postgres) {
         var has_pgdata = false;
-        for (run_cmd.env_vars) |env| {
+        for (run_cmd.getEnvVars()) |env| {
             if (std.mem.eql(u8, env.key, "PGDATA")) {
                 has_pgdata = true;
                 break;
@@ -174,7 +174,7 @@ fn runContainerImpl(
         }
         if (!has_pgdata) {
             // Find volume mount for /var/lib/postgresql
-            for (run_cmd.volumes) |vol| {
+            for (run_cmd.getVolumes()) |vol| {
                 if (std.mem.startsWith(u8, vol.container_path, "/var/lib/postgresql")) {
                     var buf: [256]u8 = undefined;
                     const pgdata = std.fmt.bufPrint(&buf, "PGDATA={s}/data", .{vol.container_path}) catch "PGDATA=/var/lib/postgresql/data";

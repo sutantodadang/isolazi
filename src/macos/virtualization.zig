@@ -21,6 +21,47 @@ const std = @import("std");
 const builtin = @import("builtin");
 const config_mod = @import("../config/config.zig");
 
+fn appendShellQuoted(list: *std.ArrayList(u8), allocator: std.mem.Allocator, value: []const u8) !void {
+    try list.append(allocator, '\'');
+    for (value) |c| {
+        if (c == '\'') {
+            try list.appendSlice(allocator, "'\\''");
+        } else {
+            try list.append(allocator, c);
+        }
+    }
+    try list.append(allocator, '\'');
+}
+
+fn appendShellQuotedConcat(list: *std.ArrayList(u8), allocator: std.mem.Allocator, a: []const u8, b: []const u8) !void {
+    try list.append(allocator, '\'');
+    for (a) |c| {
+        if (c == '\'') try list.appendSlice(allocator, "'\\''") else try list.append(allocator, c);
+    }
+    for (b) |c| {
+        if (c == '\'') try list.appendSlice(allocator, "'\\''") else try list.append(allocator, c);
+    }
+    try list.append(allocator, '\'');
+}
+
+fn appendShellQuotedEnv(list: *std.ArrayList(u8), allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {
+    try list.append(allocator, '\'');
+    for (key) |c| {
+        if (c == '\'') try list.appendSlice(allocator, "'\\''") else try list.append(allocator, c);
+    }
+    try list.append(allocator, '=');
+    for (value) |c| {
+        if (c == '\'') try list.appendSlice(allocator, "'\\''") else try list.append(allocator, c);
+    }
+    try list.append(allocator, '\'');
+}
+
+fn appendCommentText(list: *std.ArrayList(u8), allocator: std.mem.Allocator, value: []const u8) !void {
+    for (value) |c| {
+        try list.append(allocator, if (c == '\n' or c == '\r') '_' else c);
+    }
+}
+
 pub const VirtualizationError = error{
     VirtualizationNotAvailable,
     VMCreationFailed,
@@ -67,6 +108,20 @@ pub const ResourceLimitsConfig = struct {
     /// Build command line arguments for isolazi inside the VM
     pub fn toCmdArgs(self: *const ResourceLimitsConfig, allocator: std.mem.Allocator) !std.ArrayList([]const u8) {
         var args: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            var previous_was_value_flag = false;
+            for (args.items) |item| {
+                if (previous_was_value_flag) allocator.free(item);
+                previous_was_value_flag =
+                    std.mem.eql(u8, item, "--memory") or
+                    std.mem.eql(u8, item, "--cpu-quota") or
+                    std.mem.eql(u8, item, "--cpu-period") or
+                    std.mem.eql(u8, item, "--cpu-weight") or
+                    std.mem.eql(u8, item, "--io-weight") or
+                    std.mem.eql(u8, item, "--oom-score-adj");
+            }
+            args.deinit(allocator);
+        }
 
         if (self.memory_max > 0) {
             try args.append(allocator, "--memory");
@@ -187,7 +242,14 @@ pub const LSMConfig = struct {
     /// Caller is responsible for freeing all allocated strings and the ArrayList.
     pub fn toCmdArgs(self: *const LSMConfig, allocator: std.mem.Allocator) !std.ArrayList([]const u8) {
         var args: std.ArrayList([]const u8) = .empty;
-        errdefer args.deinit(allocator);
+        errdefer {
+            var previous_was_mcs = false;
+            for (args.items) |item| {
+                if (previous_was_mcs) allocator.free(item);
+                previous_was_mcs = std.mem.eql(u8, item, "--selinux-mcs");
+            }
+            args.deinit(allocator);
+        }
 
         // AppArmor arguments
         if (self.apparmor_enabled) {
@@ -239,60 +301,68 @@ pub const LSMConfig = struct {
         if (self.apparmor_enabled) {
             // Use aa-exec to run under an AppArmor profile
             try script.appendSlice(allocator, "if command -v aa-exec >/dev/null 2>&1 && [ -f /sys/module/apparmor/parameters/enabled ]; then ");
-            try script.appendSlice(allocator, "AA_EXEC_ARGS=\"");
+            try script.appendSlice(allocator, "AA_EXEC_ARGS=");
 
             // Add profile argument
             if (self.apparmor_profile) |profile| {
-                try script.appendSlice(allocator, "-p ");
-                try script.appendSlice(allocator, profile);
+                const profile_arg = try std.fmt.allocPrint(allocator, "-p {s}", .{profile});
+                defer allocator.free(profile_arg);
+                try appendShellQuoted(script, allocator, profile_arg);
             } else {
-                try script.appendSlice(allocator, "-p isolazi-default");
+                try appendShellQuoted(script, allocator, "-p isolazi-default");
             }
 
             // Add mode-specific arguments
             switch (self.apparmor_mode) {
-                .complain => try script.appendSlice(allocator, " --complain"),
+                .complain => {
+                    try script.appendSlice(allocator, "; AA_EXEC_ARGS=\"$AA_EXEC_ARGS --complain\"");
+                },
                 .unconfined => {
                     // For unconfined mode, don't use aa-exec
-                    try script.appendSlice(allocator, "\"; AA_EXEC_PREFIX=\"\"; ");
+                    try script.appendSlice(allocator, "; AA_EXEC_PREFIX=\"\"; ");
                     try script.appendSlice(allocator, "else AA_EXEC_PREFIX=\"\"; fi; ");
                     return;
                 },
                 .enforce => {}, // Default behavior
             }
 
-            try script.appendSlice(allocator, "\"; AA_EXEC_PREFIX=\"aa-exec $AA_EXEC_ARGS -- \"; ");
+            try script.appendSlice(allocator, "; AA_EXEC_PREFIX=\"aa-exec $AA_EXEC_ARGS -- \"; ");
             try script.appendSlice(allocator, "else AA_EXEC_PREFIX=\"\"; fi; ");
         }
 
         if (self.selinux_enabled) {
             // Use runcon to run with SELinux context
             try script.appendSlice(allocator, "if command -v runcon >/dev/null 2>&1 && [ -d /sys/fs/selinux ]; then ");
-            try script.appendSlice(allocator, "SELINUX_CONTEXT=\"");
+            try script.appendSlice(allocator, "SELINUX_CONTEXT=");
 
             if (self.selinux_context) |context| {
-                try script.appendSlice(allocator, context);
+                try appendShellQuoted(script, allocator, context);
             } else {
                 // Build context from type and MCS
-                try script.appendSlice(allocator, "system_u:system_r:");
-                try script.appendSlice(allocator, self.selinux_type.toCmdString());
-                try script.appendSlice(allocator, ":s0");
+                var context_value: std.ArrayList(u8) = .empty;
+                defer context_value.deinit(allocator);
+
+                try context_value.appendSlice(allocator, "system_u:system_r:");
+                try context_value.appendSlice(allocator, self.selinux_type.toCmdString());
+                try context_value.appendSlice(allocator, ":s0");
 
                 // Add MCS categories if specified
                 if (self.selinux_mcs_category1) |cat1| {
                     var cat1_buf: [16]u8 = undefined;
                     const cat1_str = std.fmt.bufPrint(&cat1_buf, ":c{d}", .{cat1}) catch "";
-                    try script.appendSlice(allocator, cat1_str);
+                    try context_value.appendSlice(allocator, cat1_str);
 
                     if (self.selinux_mcs_category2) |cat2| {
                         var cat2_buf: [16]u8 = undefined;
                         const cat2_str = std.fmt.bufPrint(&cat2_buf, ",c{d}", .{cat2}) catch "";
-                        try script.appendSlice(allocator, cat2_str);
+                        try context_value.appendSlice(allocator, cat2_str);
                     }
                 }
+
+                try appendShellQuoted(script, allocator, context_value.items);
             }
 
-            try script.appendSlice(allocator, "\"; RUNCON_PREFIX=\"runcon $SELINUX_CONTEXT \"; ");
+            try script.appendSlice(allocator, "; RUNCON_PREFIX=\"runcon $SELINUX_CONTEXT \"; ");
             try script.appendSlice(allocator, "else RUNCON_PREFIX=\"\"; fi; ");
         }
     }
@@ -489,30 +559,29 @@ pub fn runWithLimaEx(
 
     // Put the tag at the very beginning to be visible in ps output
     try script.appendSlice(allocator, "# ISOLAZI_ID=");
-    try script.appendSlice(allocator, parent_dir);
+    try appendCommentText(&script, allocator, parent_dir);
     try script.appendSlice(allocator, "\n");
 
     // Mount essential filesystems
     try script.appendSlice(allocator, "mkdir -p ");
-    try script.appendSlice(allocator, rootfs_path);
-    try script.appendSlice(allocator, "/proc ");
-    try script.appendSlice(allocator, rootfs_path);
-    try script.appendSlice(allocator, "/sys ");
-    try script.appendSlice(allocator, rootfs_path);
-    try script.appendSlice(allocator, "/dev && ");
+    try appendShellQuotedConcat(&script, allocator, rootfs_path, "/proc");
+    try script.append(allocator, ' ');
+    try appendShellQuotedConcat(&script, allocator, rootfs_path, "/sys");
+    try script.append(allocator, ' ');
+    try appendShellQuotedConcat(&script, allocator, rootfs_path, "/dev");
+    try script.appendSlice(allocator, " && ");
 
     // Create runtime directories
     try script.appendSlice(allocator, "mkdir -p ");
-    try script.appendSlice(allocator, rootfs_path);
-    try script.appendSlice(allocator, "/run ");
-    try script.appendSlice(allocator, rootfs_path);
-    try script.appendSlice(allocator, "/tmp && ");
+    try appendShellQuotedConcat(&script, allocator, rootfs_path, "/run");
+    try script.append(allocator, ' ');
+    try appendShellQuotedConcat(&script, allocator, rootfs_path, "/tmp");
+    try script.appendSlice(allocator, " && ");
 
     // Create volume directories on host
     for (volumes) |vol| {
         try script.appendSlice(allocator, "mkdir -p ");
-        try script.appendSlice(allocator, rootfs_path);
-        try script.appendSlice(allocator, vol.container_path);
+        try appendShellQuotedConcat(&script, allocator, rootfs_path, vol.container_path);
         try script.appendSlice(allocator, " && ");
     }
 
@@ -557,38 +626,37 @@ pub fn runWithLimaEx(
     try setup_script.appendSlice(allocator, "mount --make-rprivate /\n");
 
     // Mount proc (which unshare --mount-proc mounted to /proc in new ns) to destination
-    try setup_script.appendSlice(allocator, "mount --bind /proc \"");
-    try setup_script.appendSlice(allocator, rootfs_path);
-    try setup_script.appendSlice(allocator, "/proc\"\n");
+    try setup_script.appendSlice(allocator, "mount --bind /proc ");
+    try appendShellQuotedConcat(&setup_script, allocator, rootfs_path, "/proc");
+    try setup_script.append(allocator, '\n');
 
     // Mount sysfs
-    try setup_script.appendSlice(allocator, "mount -t sysfs sysfs \"");
-    try setup_script.appendSlice(allocator, rootfs_path);
-    try setup_script.appendSlice(allocator, "/sys\"\n");
+    try setup_script.appendSlice(allocator, "mount -t sysfs sysfs ");
+    try appendShellQuotedConcat(&setup_script, allocator, rootfs_path, "/sys");
+    try setup_script.append(allocator, '\n');
 
     // Mount dev
-    try setup_script.appendSlice(allocator, "mount --bind /dev \"");
-    try setup_script.appendSlice(allocator, rootfs_path);
-    try setup_script.appendSlice(allocator, "/dev\"\n");
+    try setup_script.appendSlice(allocator, "mount --bind /dev ");
+    try appendShellQuotedConcat(&setup_script, allocator, rootfs_path, "/dev");
+    try setup_script.append(allocator, '\n');
 
     // Mount tmpfs run
-    try setup_script.appendSlice(allocator, "mount -t tmpfs tmpfs \"");
-    try setup_script.appendSlice(allocator, rootfs_path);
-    try setup_script.appendSlice(allocator, "/run\"\n");
+    try setup_script.appendSlice(allocator, "mount -t tmpfs tmpfs ");
+    try appendShellQuotedConcat(&setup_script, allocator, rootfs_path, "/run");
+    try setup_script.append(allocator, '\n');
 
     // Mount tmpfs tmp
-    try setup_script.appendSlice(allocator, "mount -t tmpfs tmpfs \"");
-    try setup_script.appendSlice(allocator, rootfs_path);
-    try setup_script.appendSlice(allocator, "/tmp\"\n");
+    try setup_script.appendSlice(allocator, "mount -t tmpfs tmpfs ");
+    try appendShellQuotedConcat(&setup_script, allocator, rootfs_path, "/tmp");
+    try setup_script.append(allocator, '\n');
 
     // Handle volume mounts
     for (volumes) |vol| {
-        try setup_script.appendSlice(allocator, "mount --bind \"");
-        try setup_script.appendSlice(allocator, vol.host_path);
-        try setup_script.appendSlice(allocator, "\" \"");
-        try setup_script.appendSlice(allocator, rootfs_path);
-        try setup_script.appendSlice(allocator, vol.container_path);
-        try setup_script.appendSlice(allocator, "\"\n");
+        try setup_script.appendSlice(allocator, "mount --bind ");
+        try appendShellQuoted(&setup_script, allocator, vol.host_path);
+        try setup_script.append(allocator, ' ');
+        try appendShellQuotedConcat(&setup_script, allocator, rootfs_path, vol.container_path);
+        try setup_script.append(allocator, '\n');
     }
 
     // Add LSM configuration setup
@@ -599,21 +667,21 @@ pub fn runWithLimaEx(
     }
 
     // Exec chroot with LSM wrappers
-    try setup_script.appendSlice(allocator, "exec $AA_EXEC_PREFIX $RUNCON_PREFIX chroot \"");
-    try setup_script.appendSlice(allocator, rootfs_path);
-    try setup_script.appendSlice(allocator, "\" /usr/bin/env PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/lib/postgresql/17/bin:/usr/lib/postgresql/16/bin:/usr/lib/postgresql/15/bin:/opt/rabbitmq/sbin:/usr/lib/rabbitmq/bin:/opt/erlang/bin ");
+    try setup_script.appendSlice(allocator, "exec $AA_EXEC_PREFIX $RUNCON_PREFIX chroot ");
+    try appendShellQuoted(&setup_script, allocator, rootfs_path);
+    try setup_script.appendSlice(allocator, " /usr/bin/env ");
+    try appendShellQuoted(&setup_script, allocator, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/lib/postgresql/17/bin:/usr/lib/postgresql/16/bin:/usr/lib/postgresql/15/bin:/opt/rabbitmq/sbin:/usr/lib/rabbitmq/bin:/opt/erlang/bin");
+    try setup_script.append(allocator, ' ');
 
     // Add env vars
     for (env_vars) |env| {
-        try setup_script.appendSlice(allocator, env.key);
-        try setup_script.append(allocator, '=');
-        try setup_script.appendSlice(allocator, env.value);
+        try appendShellQuotedEnv(&setup_script, allocator, env.key, env.value);
         try setup_script.append(allocator, ' ');
     }
 
     // Add the command
     for (command) |arg| {
-        try setup_script.appendSlice(allocator, arg);
+        try appendShellQuoted(&setup_script, allocator, arg);
         try setup_script.append(allocator, ' ');
     }
 
@@ -622,9 +690,8 @@ pub fn runWithLimaEx(
     try setup_file.writeAll(setup_script.items);
 
     // Finalize main run script
-    try script.appendSlice(allocator, "unshare --mount --uts --ipc --pid --fork --mount-proc -- /bin/sh \"");
-    try script.appendSlice(allocator, setup_script_path);
-    try script.appendSlice(allocator, "\"");
+    try script.appendSlice(allocator, "unshare --mount --uts --ipc --pid --fork --mount-proc -- /bin/sh ");
+    try appendShellQuoted(&script, allocator, setup_script_path);
 
     // Write script to file
     const run_script_path = try std.fmt.allocPrint(allocator, "{s}/run.sh", .{container_id_dir});

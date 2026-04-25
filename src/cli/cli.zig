@@ -142,6 +142,17 @@ pub const RunCommand = struct {
     uid_maps: []const IdMap = &[_]IdMap{}, // Custom UID mappings
     gid_maps: []const IdMap = &[_]IdMap{}, // Custom GID mappings
 
+    parsed_env_vars: [MAX_ENV_VARS]EnvVar = undefined,
+    parsed_env_vars_count: usize = 0,
+    parsed_volumes: [MAX_VOLUMES]VolumeMount = undefined,
+    parsed_volumes_count: usize = 0,
+    parsed_ports: [MAX_PORTS]PortMap = undefined,
+    parsed_ports_count: usize = 0,
+    parsed_uid_maps: [MAX_ID_MAPPINGS]IdMap = undefined,
+    parsed_uid_maps_count: usize = 0,
+    parsed_gid_maps: [MAX_ID_MAPPINGS]IdMap = undefined,
+    parsed_gid_maps_count: usize = 0,
+
     // Resource limits
     memory_limit: ?[]const u8 = null, // e.g., "512m", "1g"
     memory_swap: ?[]const u8 = null, // Swap limit
@@ -188,6 +199,26 @@ pub const RunCommand = struct {
         unconfined_t, // Unconfined (no SELinux restrictions)
         custom, // Custom context string provided
     };
+
+    pub fn getEnvVars(self: *const RunCommand) []const EnvVar {
+        return if (self.env_vars.len > 0) self.env_vars else self.parsed_env_vars[0..self.parsed_env_vars_count];
+    }
+
+    pub fn getVolumes(self: *const RunCommand) []const VolumeMount {
+        return if (self.volumes.len > 0) self.volumes else self.parsed_volumes[0..self.parsed_volumes_count];
+    }
+
+    pub fn getPorts(self: *const RunCommand) []const PortMap {
+        return if (self.ports.len > 0) self.ports else self.parsed_ports[0..self.parsed_ports_count];
+    }
+
+    pub fn getUidMaps(self: *const RunCommand) []const IdMap {
+        return if (self.uid_maps.len > 0) self.uid_maps else self.parsed_uid_maps[0..self.parsed_uid_maps_count];
+    }
+
+    pub fn getGidMaps(self: *const RunCommand) []const IdMap {
+        return if (self.gid_maps.len > 0) self.gid_maps else self.parsed_gid_maps[0..self.parsed_gid_maps_count];
+    }
 };
 
 /// Arguments for the 'pull' command
@@ -370,21 +401,9 @@ fn parseRunCommand(args: []const []const u8) CliError!Command {
         .args = &[_][]const u8{},
     };
 
-    // Static arrays to store env vars, volumes, ports, and id maps (avoids allocation)
-    var env_vars_buf: [MAX_ENV_VARS]EnvVar = undefined;
-    var env_vars_count: usize = 0;
-    var volumes_buf: [MAX_VOLUMES]VolumeMount = undefined;
-    var volumes_count: usize = 0;
-    var ports_buf: [MAX_PORTS]PortMap = undefined;
-    var ports_count: usize = 0;
-    var uid_maps_buf: [MAX_ID_MAPPINGS]IdMap = undefined;
-    var uid_maps_count: usize = 0;
-    var gid_maps_buf: [MAX_ID_MAPPINGS]IdMap = undefined;
-    var gid_maps_count: usize = 0;
-
     var i: usize = 0;
     var positional_count: usize = 0;
-    var command_args_start: usize = 0;
+    var command_args_start: ?usize = null;
 
     // Parse options and positional arguments
     while (i < args.len) : (i += 1) {
@@ -408,32 +427,32 @@ fn parseRunCommand(args: []const []const u8) CliError!Command {
                 // Environment variable: -e KEY=VALUE
                 i += 1;
                 if (i >= args.len) return CliError.InvalidArgument;
-                if (env_vars_count >= MAX_ENV_VARS) return CliError.TooManyEnvVars;
+                if (run_cmd.parsed_env_vars_count >= MAX_ENV_VARS) return CliError.TooManyEnvVars;
 
                 const env_str = args[i];
                 const env_var = parseEnvVar(env_str) orelse return CliError.InvalidEnvVar;
-                env_vars_buf[env_vars_count] = env_var;
-                env_vars_count += 1;
+                run_cmd.parsed_env_vars[run_cmd.parsed_env_vars_count] = env_var;
+                run_cmd.parsed_env_vars_count += 1;
             } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--volume")) {
                 // Volume mount: -v /host/path:/container/path[:ro]
                 i += 1;
                 if (i >= args.len) return CliError.InvalidArgument;
-                if (volumes_count >= MAX_VOLUMES) return CliError.TooManyMounts;
+                if (run_cmd.parsed_volumes_count >= MAX_VOLUMES) return CliError.TooManyMounts;
 
                 const vol_str = args[i];
                 const volume = parseVolumeMount(vol_str) orelse return CliError.InvalidVolumeMount;
-                volumes_buf[volumes_count] = volume;
-                volumes_count += 1;
+                run_cmd.parsed_volumes[run_cmd.parsed_volumes_count] = volume;
+                run_cmd.parsed_volumes_count += 1;
             } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--port") or std.mem.eql(u8, arg, "--publish")) {
                 // Port mapping: -p host_port:container_port[/protocol]
                 i += 1;
                 if (i >= args.len) return CliError.InvalidArgument;
-                if (ports_count >= MAX_PORTS) return CliError.TooManyPorts;
+                if (run_cmd.parsed_ports_count >= MAX_PORTS) return CliError.TooManyPorts;
 
                 const port_str = args[i];
                 const port_map = parsePortMapping(port_str) orelse return CliError.InvalidPortMapping;
-                ports_buf[ports_count] = port_map;
-                ports_count += 1;
+                run_cmd.parsed_ports[run_cmd.parsed_ports_count] = port_map;
+                run_cmd.parsed_ports_count += 1;
             } else if (std.mem.eql(u8, arg, "--name")) {
                 i += 1;
                 if (i >= args.len) return CliError.InvalidArgument;
@@ -448,22 +467,22 @@ fn parseRunCommand(args: []const []const u8) CliError!Command {
                 // UID mapping: --uid-map container:host:count
                 i += 1;
                 if (i >= args.len) return CliError.InvalidArgument;
-                if (uid_maps_count >= MAX_ID_MAPPINGS) return CliError.InvalidArgument;
+                if (run_cmd.parsed_uid_maps_count >= MAX_ID_MAPPINGS) return CliError.InvalidArgument;
 
                 const map_str = args[i];
                 const uid_map = parseIdMap(map_str) orelse return CliError.InvalidArgument;
-                uid_maps_buf[uid_maps_count] = uid_map;
-                uid_maps_count += 1;
+                run_cmd.parsed_uid_maps[run_cmd.parsed_uid_maps_count] = uid_map;
+                run_cmd.parsed_uid_maps_count += 1;
             } else if (std.mem.eql(u8, arg, "--gid-map") or std.mem.eql(u8, arg, "--gidmap")) {
                 // GID mapping: --gid-map container:host:count
                 i += 1;
                 if (i >= args.len) return CliError.InvalidArgument;
-                if (gid_maps_count >= MAX_ID_MAPPINGS) return CliError.InvalidArgument;
+                if (run_cmd.parsed_gid_maps_count >= MAX_ID_MAPPINGS) return CliError.InvalidArgument;
 
                 const map_str = args[i];
                 const gid_map = parseIdMap(map_str) orelse return CliError.InvalidArgument;
-                gid_maps_buf[gid_maps_count] = gid_map;
-                gid_maps_count += 1;
+                run_cmd.parsed_gid_maps[run_cmd.parsed_gid_maps_count] = gid_map;
+                run_cmd.parsed_gid_maps_count += 1;
             } else if (std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--memory")) {
                 // Memory limit: --memory 512m
                 i += 1;
@@ -682,32 +701,14 @@ fn parseRunCommand(args: []const []const u8) CliError!Command {
         }
     }
 
-    // Store env vars, volumes, and ports in the command
-    // FREEZE FIX: Do not return refs to local stack vars!
-    // if (env_vars_count > 0) {
-    //     run_cmd.env_vars = env_vars_buf[0..env_vars_count];
-    // }
-    // if (volumes_count > 0) {
-    //     run_cmd.volumes = volumes_buf[0..volumes_count];
-    // }
-    // if (ports_count > 0) {
-    //     run_cmd.ports = ports_buf[0..ports_count];
-    // }
-    // if (uid_maps_count > 0) {
-    //     run_cmd.uid_maps = uid_maps_buf[0..uid_maps_count];
-    // }
-    // if (gid_maps_count > 0) {
-    //     run_cmd.gid_maps = gid_maps_buf[0..gid_maps_count];
-    // }
-
     if (positional_count < 1) {
         return CliError.MissingRootfs;
     }
     // Command is now optional - images with default CMD/ENTRYPOINT don't need one
 
     // Set command args (including the command itself as argv[0])
-    if (command_args_start < args.len) {
-        run_cmd.args = args[command_args_start..];
+    if (command_args_start) |start| {
+        run_cmd.args = args[start..];
     }
 
     return Command{ .run = run_cmd };
@@ -1143,6 +1144,12 @@ pub fn buildConfig(run_cmd: *const RunCommand) !Config {
     // Set command
     if (run_cmd.command) |cmd| {
         try cfg.setCommand(cmd);
+        if (run_cmd.args.len == 0) {
+            try cfg.addArg(cmd);
+        }
+    } else {
+        try cfg.setCommand("/bin/sh");
+        try cfg.addArg("/bin/sh");
     }
 
     // Set argv (including argv[0])
@@ -1160,14 +1167,14 @@ pub fn buildConfig(run_cmd: *const RunCommand) !Config {
     }
 
     // Copy environment variables
-    for (run_cmd.env_vars) |env| {
+    for (run_cmd.getEnvVars()) |env| {
         var buf: [4096]u8 = undefined;
         const env_str = std.fmt.bufPrint(&buf, "{s}={s}", .{ env.key, env.value }) catch continue;
         try cfg.addEnv(env_str);
     }
 
     // Copy volume mounts
-    for (run_cmd.volumes) |vol| {
+    for (run_cmd.getVolumes()) |vol| {
         // Ensure host path exists (create directory if missing)
         if (std.fs.cwd().access(vol.host_path, .{})) |_| {} else |err| switch (err) {
             error.FileNotFound => std.fs.cwd().makePath(vol.host_path) catch return err,
@@ -1177,7 +1184,7 @@ pub fn buildConfig(run_cmd: *const RunCommand) !Config {
     }
 
     // Copy port mappings
-    for (run_cmd.ports) |port| {
+    for (run_cmd.getPorts()) |port| {
         const protocol: config_mod.PortMapping.Protocol = if (port.protocol == .tcp) .tcp else .udp;
         try cfg.addPort(port.host_port, port.container_port, protocol);
     }
@@ -1188,17 +1195,17 @@ pub fn buildConfig(run_cmd: *const RunCommand) !Config {
     }
 
     // Copy UID mappings
-    for (run_cmd.uid_maps) |uid_map| {
+    for (run_cmd.getUidMaps()) |uid_map| {
         try cfg.addUidMapping(uid_map.host_id, uid_map.container_id, uid_map.count);
     }
 
     // Copy GID mappings
-    for (run_cmd.gid_maps) |gid_map| {
+    for (run_cmd.getGidMaps()) |gid_map| {
         try cfg.addGidMapping(gid_map.host_id, gid_map.container_id, gid_map.count);
     }
 
     // If uid/gid maps provided but rootless not explicitly set, enable user namespace
-    if (run_cmd.uid_maps.len > 0 or run_cmd.gid_maps.len > 0) {
+    if (run_cmd.getUidMaps().len > 0 or run_cmd.getGidMaps().len > 0) {
         cfg.namespaces.user = true;
     }
 
@@ -1539,6 +1546,54 @@ test "parse run command with options" {
             try std.testing.expectEqualStrings("/bin/sh", run_cmd.command);
             try std.testing.expectEqualStrings("test", run_cmd.hostname.?);
             try std.testing.expectEqualStrings("/app", run_cmd.cwd.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse run command preserves parsed option arrays" {
+    const args = [_][]const u8{
+        "isolazi",   "run",
+        "-e",        "FOO=bar",
+        "-v",        "/host:/container:ro",
+        "-p",        "8080:80/tcp",
+        "--uid-map", "0:1000:1",
+        "--gid-map", "0:1000:1",
+        "/rootfs",   "/bin/sh",
+    };
+    const cmd = try parse(&args);
+
+    switch (cmd) {
+        .run => |run_cmd| {
+            try std.testing.expectEqual(@as(usize, 1), run_cmd.getEnvVars().len);
+            try std.testing.expectEqualStrings("FOO", run_cmd.getEnvVars()[0].key);
+            try std.testing.expectEqualStrings("bar", run_cmd.getEnvVars()[0].value);
+            try std.testing.expectEqual(@as(usize, 1), run_cmd.getVolumes().len);
+            try std.testing.expectEqualStrings("/host", run_cmd.getVolumes()[0].host_path);
+            try std.testing.expectEqualStrings("/container", run_cmd.getVolumes()[0].container_path);
+            try std.testing.expect(run_cmd.getVolumes()[0].read_only);
+            try std.testing.expectEqual(@as(usize, 1), run_cmd.getPorts().len);
+            try std.testing.expectEqual(@as(u16, 8080), run_cmd.getPorts()[0].host_port);
+            try std.testing.expectEqual(@as(u16, 80), run_cmd.getPorts()[0].container_port);
+            try std.testing.expectEqual(@as(usize, 1), run_cmd.getUidMaps().len);
+            try std.testing.expectEqual(@as(u32, 0), run_cmd.getUidMaps()[0].container_id);
+            try std.testing.expectEqual(@as(u32, 1000), run_cmd.getUidMaps()[0].host_id);
+            try std.testing.expectEqual(@as(usize, 1), run_cmd.getGidMaps().len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "buildConfig defaults command when omitted" {
+    const args = [_][]const u8{ "isolazi", "run", "/rootfs" };
+    const cmd = try parse(&args);
+
+    switch (cmd) {
+        .run => |run_cmd| {
+            const cfg = try buildConfig(&run_cmd);
+            try std.testing.expectEqualStrings("/bin/sh", std.mem.sliceTo(cfg.getCommand(), 0));
+            try std.testing.expectEqual(@as(usize, 1), cfg.args_count);
+            try std.testing.expectEqualStrings("/bin/sh", std.mem.sliceTo(&cfg.args[0], 0));
         },
         else => return error.TestUnexpectedResult,
     }
