@@ -317,16 +317,15 @@ pub const LSMConfig = struct {
                 .complain => {
                     try script.appendSlice(allocator, "; AA_EXEC_ARGS=\"$AA_EXEC_ARGS --complain\"");
                 },
-                .unconfined => {
-                    // For unconfined mode, don't use aa-exec
-                    try script.appendSlice(allocator, "; AA_EXEC_PREFIX=\"\"; ");
-                    try script.appendSlice(allocator, "else AA_EXEC_PREFIX=\"\"; fi; ");
-                    return;
-                },
-                .enforce => {}, // Default behavior
+                .unconfined, .enforce => {},
             }
 
-            try script.appendSlice(allocator, "; AA_EXEC_PREFIX=\"aa-exec $AA_EXEC_ARGS -- \"; ");
+            // Set execution prefix based on mode
+            if (self.apparmor_mode == .unconfined) {
+                try script.appendSlice(allocator, "; AA_EXEC_PREFIX=\"\"; ");
+            } else {
+                try script.appendSlice(allocator, "; AA_EXEC_PREFIX=\"aa-exec $AA_EXEC_ARGS -- \"; ");
+            }
             try script.appendSlice(allocator, "else AA_EXEC_PREFIX=\"\"; fi; ");
         }
 

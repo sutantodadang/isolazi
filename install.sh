@@ -199,17 +199,27 @@ validate_archive_entry() {
 validate_archive() {
     local archive="$1"
     local entry=""
+    local listing_file=""
+
+    listing_file=$(mktemp) || error "Failed to create temporary file for archive validation"
+    chmod 600 "$listing_file" || error "Failed to set permissions on temporary file"
+
+    cleanup_validate_archive() {
+        [[ -n "$listing_file" && -f "$listing_file" ]] && rm -f "$listing_file"
+    }
+
+    trap cleanup_validate_archive RETURN
 
     if [[ "$archive" == *.zip ]]; then
         command -v unzip >/dev/null 2>&1 || error "unzip is required to inspect zip archives"
-        while IFS= read -r entry; do
-            validate_archive_entry "$entry" || error "Archive contains unsafe path: $entry"
-        done < <(unzip -Z1 "$archive")
+        unzip -Z1 "$archive" > "$listing_file" || error "Failed to inspect zip archive: $archive"
     else
-        while IFS= read -r entry; do
-            validate_archive_entry "$entry" || error "Archive contains unsafe path: $entry"
-        done < <(tar -tzf "$archive")
+        tar -tzf "$archive" > "$listing_file" || error "Failed to inspect tar archive: $archive"
     fi
+
+    while IFS= read -r entry; do
+        validate_archive_entry "$entry" || error "Archive contains unsafe path: $entry"
+    done < "$listing_file"
 }
 
 # Download and install binary
