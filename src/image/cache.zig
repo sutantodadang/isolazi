@@ -275,22 +275,19 @@ pub const ImageCache = struct {
         errdefer self.allocator.free(rootfs_path);
 
         // Create container directory
-        std.fs.cwd().makePath(rootfs_path) catch {};
+        try std.fs.cwd().makePath(rootfs_path);
 
         // Extract each layer in order
         for (layer_digests) |digest| {
             const layer_path = try self.getBlobPath(digest);
             defer self.allocator.free(layer_path);
 
-            _ = layer.extractLayer(
+            _ = try layer.extractLayer(
                 self.allocator,
                 layer_path,
                 rootfs_path,
                 null,
-            ) catch |err| {
-                std.debug.print("Warning: Layer extraction issue: {}\n", .{err});
-                continue;
-            };
+            );
         }
 
         return rootfs_path;

@@ -98,6 +98,121 @@ function Get-LatestVersion {
     Write-Info "Installing version: $Version"
 }
 
+function Verify-Checksum {
+    param(
+        [string]$ArchivePath,
+        [string]$DownloadUrl,
+        [string]$TmpDir
+    )
+
+    if ($env:ISOLAZI_SKIP_CHECKSUM -eq "1") {
+        Write-Warn "Skipping checksum verification because ISOLAZI_SKIP_CHECKSUM=1"
+        return
+    }
+
+    $assetName = Split-Path $DownloadUrl -Leaf
+    $checksumPath = Join-Path $TmpDir "checksums.txt"
+    $checksumUrls = @(
+        "$DownloadUrl.sha256",
+        "$DownloadUrl.sha256sum",
+        "https://github.com/$Repo/releases/download/$Version/SHA256SUMS",
+        "https://github.com/$Repo/releases/download/$Version/checksums.txt"
+    )
+
+    foreach ($checksumUrl in $checksumUrls) {
+        try {
+            Invoke-WebRequest -Uri $checksumUrl -OutFile $checksumPath -UseBasicParsing
+            $lines = Get-Content -Path $checksumPath -ErrorAction Stop
+            $expected = $null
+
+            foreach ($line in $lines) {
+                if ($line -like "*$assetName*") {
+                    $expected = ($line -split "\s+")[0].ToLowerInvariant()
+                    break
+                }
+            }
+
+            if (-not $expected) {
+                foreach ($line in $lines) {
+                    $trimmed = $line.Trim()
+                    if ($trimmed -match "^[0-9a-fA-F]{64}$") {
+                        $expected = $trimmed.ToLowerInvariant()
+                        break
+                    }
+                }
+            }
+
+            if ($expected) {
+                $actual = (Get-FileHash -Algorithm SHA256 -Path $ArchivePath).Hash.ToLowerInvariant()
+                if ($actual -ne $expected) {
+                    Write-Err "Checksum verification failed for $assetName"
+                }
+                Write-Success "Checksum verified"
+                return
+            }
+        } catch {
+            continue
+        }
+    }
+
+    Write-Err "No checksum found for $assetName. Set ISOLAZI_SKIP_CHECKSUM=1 only if you trust this download."
+}
+
+function Test-SafeArchivePath {
+    param([string]$Entry)
+
+    if ([string]::IsNullOrWhiteSpace($Entry)) { return $true }
+    if ([System.IO.Path]::IsPathRooted($Entry)) { return $false }
+    if ($Entry -match "^[A-Za-z]:") { return $false }
+
+    $parts = $Entry -split "[/\\]+"
+    foreach ($part in $parts) {
+        if ($part -eq "..") { return $false }
+    }
+
+    return $true
+}
+
+function Test-ArchivePaths {
+    param([string]$ArchivePath)
+
+    if ($ArchivePath -match "\.zip$") {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($ArchivePath)
+        try {
+            foreach ($entry in $zip.Entries) {
+                if (-not (Test-SafeArchivePath $entry.FullName)) {
+                    Write-Err "Archive contains unsafe path: $($entry.FullName)"
+                }
+            }
+        } finally {
+            $zip.Dispose()
+        }
+    } else {
+        $entries = & tar -tzf $ArchivePath
+        if ($LASTEXITCODE -ne 0) {
+            Write-Err "Failed to inspect tar archive"
+        }
+        foreach ($entry in $entries) {
+            if (-not (Test-SafeArchivePath $entry)) {
+                Write-Err "Archive contains unsafe path: $entry"
+            }
+        }
+    }
+}
+
+function Test-ExtractedPaths {
+    param([string]$ExtractDir)
+
+    $root = (Resolve-Path $ExtractDir).Path.TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+    Get-ChildItem -Path $ExtractDir -Recurse -Force | ForEach-Object {
+        $resolved = (Resolve-Path $_.FullName).Path
+        if (-not ($resolved -eq $root -or $resolved.StartsWith($root + [System.IO.Path]::DirectorySeparatorChar))) {
+            Write-Err "Archive extracted outside destination: $resolved"
+        }
+    }
+}
+
 function Install-Binary {
     $BinDir = "$InstallDir\bin"
     $Platform = Get-Platform
@@ -149,6 +264,8 @@ function Install-Binary {
         Remove-Item -Path $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
         Write-Err "Failed to download binary. Check releases at: https://github.com/$Repo/releases"
     }
+
+    Verify-Checksum -ArchivePath $archivePath -DownloadUrl $url -TmpDir $tmpDir
     
     Write-Info "Extracting archive..."
     
@@ -159,12 +276,17 @@ function Install-Binary {
     New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
     
     # Extract based on file type
+    Test-ArchivePaths -ArchivePath $archivePath
     if ($archivePath -match "\.zip$") {
         Expand-Archive -Path $archivePath -DestinationPath $extractDir -Force
     } else {
         # For tar.gz, use tar command (available in Windows 10+)
         tar -xzf $archivePath -C $extractDir
+        if ($LASTEXITCODE -ne 0) {
+            Write-Err "Failed to extract tar archive"
+        }
     }
+    Test-ExtractedPaths -ExtractDir $extractDir
     
     # Find the binary
     $binary = Get-ChildItem -Path $extractDir -Filter "isolazi.exe" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1

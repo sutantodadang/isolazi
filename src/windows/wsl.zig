@@ -113,21 +113,7 @@ pub const LSMConfig = struct {
     pub fn toCmdArgs(self: *const LSMConfig, allocator: std.mem.Allocator) !std.ArrayList([]const u8) {
         var args: std.ArrayList([]const u8) = .empty;
         errdefer {
-            // Free any allocated strings on error
-            for (args.items) |item| {
-                // Only free strings we allocated (the formatted ones)
-                if (std.mem.startsWith(u8, item, "c") or std.mem.startsWith(u8, item, "s")) {
-                    // Check if it looks like our allocated MCS string
-                    var is_allocated = false;
-                    for (item) |c| {
-                        if (c == ',') {
-                            is_allocated = true;
-                            break;
-                        }
-                    }
-                    if (is_allocated) allocator.free(item);
-                }
-            }
+            freeAllocatedLsmArgs(allocator, args.items);
             args.deinit(allocator);
         }
 
@@ -171,6 +157,16 @@ pub const LSMConfig = struct {
         return args;
     }
 };
+
+fn freeAllocatedLsmArgs(allocator: std.mem.Allocator, args: []const []const u8) void {
+    var previous_was_mcs = false;
+    for (args) |item| {
+        if (previous_was_mcs) {
+            allocator.free(item);
+        }
+        previous_was_mcs = std.mem.eql(u8, item, "--selinux-mcs");
+    }
+}
 
 /// WSL backend configuration
 pub const WslConfig = struct {
@@ -281,25 +277,21 @@ pub fn execInWsl(
     // Add LSM configuration arguments if provided
     if (config.lsm_config) |lsm| {
         var lsm_args = try lsm.toCmdArgs(allocator);
-        defer lsm_args.deinit(allocator);
+        defer {
+            freeAllocatedLsmArgs(allocator, lsm_args.items);
+            lsm_args.deinit(allocator);
+        }
 
+        var previous_was_mcs = false;
         for (lsm_args.items) |lsm_arg| {
-            // Check if this is a dynamically allocated string (contains comma for MCS)
-            var is_dynamic = false;
-            for (lsm_arg) |c| {
-                if (c == ',') {
-                    is_dynamic = true;
-                    break;
-                }
-            }
-            if (is_dynamic or (lsm_arg.len > 1 and lsm_arg[0] == 'c' and std.ascii.isDigit(lsm_arg[1]))) {
-                // This is an allocated MCS string, need to dupe and track
+            if (previous_was_mcs) {
                 const duped = try allocator.dupe(u8, lsm_arg);
                 try dynamic_allocs.append(allocator, duped);
                 try wsl_args.append(allocator, duped);
             } else {
                 try wsl_args.append(allocator, lsm_arg);
             }
+            previous_was_mcs = std.mem.eql(u8, lsm_arg, "--selinux-mcs");
         }
     }
 

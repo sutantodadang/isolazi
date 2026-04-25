@@ -127,9 +127,105 @@ get_latest_version() {
     info "Installing version: $VERSION"
 }
 
+sha256_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print tolower($1)}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print tolower($1)}'
+    else
+        error "sha256sum or shasum is required to verify downloads"
+    fi
+}
+
+verify_checksum() {
+    local archive="$1"
+    local url="$2"
+    local tmp_dir="$3"
+
+    if [[ "${ISOLAZI_SKIP_CHECKSUM:-}" == "1" ]]; then
+        warning "Skipping checksum verification because ISOLAZI_SKIP_CHECKSUM=1"
+        return 0
+    fi
+
+    local asset_name
+    asset_name="$(basename "$url")"
+    local checksum_file="$tmp_dir/checksums.txt"
+    local checksum_urls=(
+        "${url}.sha256"
+        "${url}.sha256sum"
+        "https://github.com/${REPO}/releases/download/${VERSION}/SHA256SUMS"
+        "https://github.com/${REPO}/releases/download/${VERSION}/checksums.txt"
+    )
+
+    for checksum_url in "${checksum_urls[@]}"; do
+        if curl -fsSL "$checksum_url" -o "$checksum_file" 2>/dev/null; then
+            local expected=""
+            expected="$(grep -F "$asset_name" "$checksum_file" 2>/dev/null | awk '{print tolower($1)}' | head -1)"
+            if [[ -z "$expected" ]]; then
+                expected="$(awk 'NF == 1 && $1 ~ /^[0-9a-fA-F]{64}$/ { print tolower($1); exit }' "$checksum_file")"
+            fi
+
+            if [[ -n "$expected" ]]; then
+                local actual
+                actual="$(sha256_file "$archive")"
+                if [[ "$actual" != "$expected" ]]; then
+                    error "Checksum verification failed for $asset_name"
+                fi
+                success "Checksum verified"
+                return 0
+            fi
+        fi
+    done
+
+    error "No checksum found for $asset_name. Set ISOLAZI_SKIP_CHECKSUM=1 only if you trust this download."
+}
+
+validate_archive_entry() {
+    local entry="$1"
+
+    [[ -z "$entry" ]] && return 0
+    [[ "$entry" == /* || "$entry" == \\* ]] && return 1
+    [[ "$entry" =~ ^[A-Za-z]: ]] && return 1
+
+    local IFS='/\'
+    read -ra parts <<< "$entry"
+    for part in "${parts[@]}"; do
+        [[ "$part" == ".." ]] && return 1
+    done
+
+    return 0
+}
+
+validate_archive() {
+    local archive="$1"
+    local entry=""
+    local listing_file=""
+
+    listing_file=$(mktemp) || error "Failed to create temporary file for archive validation"
+    chmod 600 "$listing_file" || error "Failed to set permissions on temporary file"
+
+    cleanup_validate_archive() {
+        [[ -n "$listing_file" && -f "$listing_file" ]] && rm -f "$listing_file"
+    }
+
+    trap cleanup_validate_archive RETURN
+
+    if [[ "$archive" == *.zip ]]; then
+        command -v unzip >/dev/null 2>&1 || error "unzip is required to inspect zip archives"
+        unzip -Z1 "$archive" > "$listing_file" || error "Failed to inspect zip archive: $archive"
+    else
+        tar -tzf "$archive" > "$listing_file" || error "Failed to inspect tar archive: $archive"
+    fi
+
+    while IFS= read -r entry; do
+        validate_archive_entry "$entry" || error "Archive contains unsafe path: $entry"
+    done < "$listing_file"
+}
+
 # Download and install binary
 download_binary() {
-    local tmp_dir=$(mktemp -d)
+    local tmp_dir
+    tmp_dir=$(mktemp -d) || error "Failed to create temporary directory"
     local archive=""
     local download_url=""
     
@@ -165,14 +261,17 @@ download_binary() {
         rm -rf "$tmp_dir"
         error "Failed to download binary. Please check releases at: https://github.com/${REPO}/releases"
     fi
+
+    verify_checksum "$archive" "$download_url" "$tmp_dir"
     
     info "Extracting archive..."
     mkdir -p "$BIN_DIR"
+    mkdir -p "$tmp_dir/extracted"
+    validate_archive "$archive"
     
     if [[ "$archive" == *.zip ]]; then
         unzip -q "$archive" -d "$tmp_dir/extracted"
     else
-        mkdir -p "$tmp_dir/extracted"
         tar -xzf "$archive" -C "$tmp_dir/extracted"
     fi
     
