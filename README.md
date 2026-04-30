@@ -4,37 +4,114 @@ A minimal container runtime written in Zig, inspired by Docker, Podman, and OCI 
 
 ## Features
 
-- 🐳 **Docker-like CLI** - Familiar commands: `run`, `pull`, `ps`, `stop`, `rm`, `exec`
+ 🐳 **Docker-like CLI** - Familiar commands: `run`, `pull`, `ps`, `stop`, `rm`, `exec`, `compose`
 - 📦 **OCI Image Support** - Pull images from Docker Hub and other registries
 - 🔒 **Process Isolation** - Linux namespaces (PID, mount, UTS, IPC, **network**, **user**, **cgroup**)
 - 🛡️ **Seccomp Filtering** - Block dangerous syscalls with configurable profiles
+- 🔐 **AppArmor/SELinux** - Mandatory Access Control for defense-in-depth security
 - 🌐 **Network Isolation** - veth pairs, bridge networking, NAT, and port forwarding
 - 👤 **Rootless Containers** - User namespace support for unprivileged container execution
 - ⚙️ **Resource Limits** - cgroup v2 support for memory, CPU, and I/O limits
 - 🗂️ **Filesystem Isolation** - Using `pivot_root` or `chroot`
 - 🔧 **Exec into Containers** - Execute commands in running containers using `nsenter`
 - 🪟 **Windows Support** - Run containers via WSL2 backend
-- 🍎 **macOS Support** - Run containers via Apple Virtualization framework
+ 🍎 **macOS Support** - Run containers via Apple Virtualization framework
+ 🧩 **Docker Compose** - Multi-container orchestration with `docker-compose.yml` support
 - ⚡ **Fast & Lightweight** - Written in Zig with minimal dependencies
+
+## Current Status (February 23, 2026)
+
+ ✅ **Core commands**: `run`, `build`, `pull`, `images`, `ps`, `create`, `start`, `stop`, `rm`, `exec`, `logs`, `prune`, `update`, `compose`
+- ✅ **Image Builder**: Build images from Isolazifile/Dockerfile (`FROM`, `RUN`, `COPY`, `ADD`, `ENV`, `WORKDIR`, `ARG`, `CMD`, `ENTRYPOINT`)
+- ✅ **Prune behavior**: `prune` removes stopped containers and unused images; `prune -f/--force` removes all containers
+- ✅ **Rootless mode**: `--rootless` with optional `--uid-map`/`--gid-map`
+- ✅ **Networking**: bridge + veth, NAT, port publishing (`-p`)
+- ✅ **Security**: seccomp filtering, AppArmor/SELinux toggles, user namespaces
+- ✅ **Resource limits**: cgroup v2 memory/CPU/I/O/OOM controls
+- ✅ **Platforms**: Linux (native), Windows (WSL2), macOS (Linux VM via Lima/vfkit)
+ ✅ **Cross-builds**: targets validated for `x86_64-windows`, `x86_64-linux`, `x86_64-macos`, `aarch64-macos`
+ ✅ **Docker Compose**: `compose up`, `down`, `ps`, `logs`, `stop`, `restart`, `pull`, `config` with env var substitution and dependency ordering
 
 ## Installation
 
+### Quick Install (Recommended)
+
+**macOS / Linux:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/sutantodadang/isolazi/main/install.sh | bash
+```
+
+Or clone and run locally:
+```bash
+git clone https://github.com/sutantodadang/isolazi.git
+cd isolazi
+./install.sh
+```
+
+**Windows (PowerShell as Administrator):**
+```powershell
+irm https://raw.githubusercontent.com/sutantodadang/isolazi/main/install.ps1 | iex
+```
+
+Or clone and run locally:
+```powershell
+git clone https://github.com/sutantodadang/isolazi.git
+cd isolazi
+.\install.ps1
+```
+
+The installer will:
+- ✅ Download pre-built binary from GitHub releases
+- ✅ Auto-detect your platform (macOS/Linux, x86_64/arm64)
+- ✅ Install the binary to `~/.isolazi/bin`
+- ✅ Add to your PATH (supports zsh, bash, fish, PowerShell)
+
+**Install specific version:**
+```bash
+# macOS / Linux
+ISOLAZI_VERSION=v0.1.11 curl -fsSL https://raw.githubusercontent.com/sutantodadang/isolazi/main/install.sh | bash
+
+# Windows
+.\install.ps1 -Version v0.1.11
+```
+
+**Uninstall:**
+```bash
+# macOS / Linux
+./install.sh --uninstall
+
+# Windows
+.\install.ps1 -Uninstall
+```
+
 ### Prerequisites
 
-- [Zig](https://ziglang.org/download/) 0.15.2 or later
+- [Zig](https://ziglang.org/download/) 0.15.2 or later (auto-installed by script)
 - Linux kernel with namespace support (for native execution)
 - WSL2 (for Windows)
-- macOS 12.0+ with vfkit or Lima (for macOS)
+- macOS 12.0+ with Lima (for macOS)
 
-### Build from Source
+### Manual Build from Source
 
 ```bash
-git clone https://github.com/nicefacer/isolazi.git
+git clone https://github.com/sutantodadang/isolazi.git
 cd isolazi
 zig build -Doptimize=ReleaseFast
 ```
 
 The binary will be available at `zig-out/bin/isolazi`.
+
+To manually add to PATH:
+```bash
+# Bash
+echo 'export PATH="$PATH:$HOME/.isolazi/bin"' >> ~/.bashrc
+
+# Zsh
+echo 'export PATH="$PATH:$HOME/.isolazi/bin"' >> ~/.zshrc
+
+# Fish
+echo 'set -gx PATH $PATH $HOME/.isolazi/bin' >> ~/.config/fish/config.fish
+```
 
 ## Quick Start
 
@@ -43,6 +120,27 @@ The binary will be available at `zig-out/bin/isolazi`.
 ```bash
 isolazi pull alpine:latest
 ```
+
+### Build an Image
+
+Create an `Isolazifile` (or `Dockerfile`):
+```dockerfile
+FROM alpine:latest
+RUN echo "Hello from Isolazi Build" > /message.txt
+CMD cat /message.txt
+```
+
+Build the image:
+```bash
+isolazi build -t my-image:v1 .
+```
+
+The image will be available locally:
+```bash
+isolazi images
+```
+
+See [docs/BUILD.md](docs/BUILD.md) for full documentation on supported instructions and options.
 
 ### Run a Container
 
@@ -148,6 +246,16 @@ isolazi inspect myapp
 
 # Clean up stopped containers and unused images
 isolazi prune
+
+# Force remove all containers and unused images
+isolazi prune -f
+```
+
+### Update Isolazi
+
+```bash
+# Update to the latest version
+isolazi update
 ```
 
 ### Container Logs
@@ -208,6 +316,79 @@ isolazi pull docker.io/library/nginx:latest
 isolazi pull ghcr.io/owner/repo:tag
 ```
 
+### Docker Compose
+
+isolazi supports multi-container orchestration using `docker-compose.yml` files.
+
+```yaml
+# docker-compose.yml
+version: '3'
+services:
+  web:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+  api:
+    image: node:18-alpine
+    environment:
+      - DATABASE_URL=postgres://db:5432/myapp
+    depends_on:
+      - db
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: myapp
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data:/var/lib/postgresql/data
+```
+
+```bash
+# Start all services (respects depends_on order)
+isolazi compose up
+
+# Start in detached mode
+isolazi compose up -d
+
+# Use a specific compose file
+isolazi compose -f ./path/to/docker-compose.yml up -d
+
+# View running services
+isolazi compose ps
+
+# View service logs
+isolazi compose logs
+isolazi compose logs -f          # Follow log output
+isolazi compose logs -n 50       # Last 50 lines
+
+# Stop all services
+isolazi compose stop
+
+# Restart all services
+isolazi compose restart
+
+# Stop and remove all containers
+isolazi compose down
+
+# Pull latest images for all services
+isolazi compose pull
+
+# Validate and display compose configuration
+isolazi compose config
+```
+
+**Supported `docker-compose.yml` features:**
+- Service definitions with `image`, `ports`, `environment`, `volumes`, `depends_on`
+- Environment variables as list (`- KEY=VALUE`) or map (`KEY: VALUE`)
+- Variable substitution: `$VAR`, `${VAR}`, `${VAR:-default}`
+- `.env` file loading
+- Topological dependency ordering with cycle detection
+- `command` and `working_dir` overrides
+
 ## Usage
 
 ```
@@ -215,6 +396,7 @@ isolazi <COMMAND> [OPTIONS]
 
 COMMANDS:
     run [-d] <image> [command]       Run a command in a new container
+    build [OPTIONS] <path>           Build an image from an Isolazifile
     exec [OPTIONS] <container> <cmd> Execute a command in a running container
     logs [-f] <container>            Display container logs
     create [--name NAME] <image>     Create a container without starting
@@ -225,9 +407,18 @@ COMMANDS:
     inspect <container>              Display container details
     pull <image>                     Pull an image from a registry
     images                           List cached images
-    prune                            Remove stopped containers and unused images
+    prune [-f]                       Remove stopped containers and unused images
+    update                           Update isolazi to the latest version
     version                          Print version information
     help                             Print this help message
+    compose <subcommand> [OPTIONS]    Multi-container orchestration
+
+OPTIONS for 'build':
+    -f, --file <path>         Name of the Isolazifile (default: 'Isolazifile')
+    -t, --tag <name>          Name and optionally a tag in the 'name:tag' format
+    --build-arg <arg>         Set build-time variables
+    --no-cache                Do not use cache when building the image
+    -q, --quiet               Suppress the build output and print image ID on success
 
 OPTIONS for 'run':
     -d, --detach              Run container in background
@@ -254,6 +445,16 @@ OPTIONS for 'run':
     Security Options:
     --seccomp <profile>       Seccomp profile: default, minimal, strict, disabled
     --no-seccomp              Disable seccomp filtering (less secure)
+    --apparmor                Enable AppArmor with default profile (isolazi-default)
+    --apparmor=<profile>      Enable AppArmor with custom profile
+    --apparmor-mode <mode>    AppArmor mode: enforce, complain, unconfined
+    --no-apparmor             Disable AppArmor restrictions
+    --selinux [context]       Enable SELinux with optional context
+    --selinux-type <type>     SELinux type: container_t, container_net_t, container_file_t, spc_t
+    --selinux-mcs <cats>      SELinux MCS categories (e.g., c1,c2)
+    --no-selinux              Disable SELinux labeling
+    --security-opt <opt>      Security option (Docker-compatible): apparmor=profile, label=context
+    --privileged              Disable all security features (NOT recommended)
 
 OPTIONS for 'exec':
     -i, --interactive         Keep STDIN open
@@ -275,6 +476,22 @@ OPTIONS for 'ps':
 
 OPTIONS for 'rm':
     -f, --force          Force remove running container
+
+OPTIONS for 'prune':
+    -f, --force          Remove all containers (including running)
+
+OPTIONS for 'compose':
+    -f, --file <path>         Compose file (default: 'docker-compose.yml')
+
+    SUBCOMMANDS:
+    up [-d]                   Create and start all services
+    down                      Stop and remove all service containers
+    ps                        List running service containers
+    logs [-f] [-n N]          View service logs
+    stop                      Stop all running services
+    restart                   Restart all services
+    pull                      Pull images for all services
+    config                    Validate and display compose configuration
 ```
 
 ## Image References
@@ -296,6 +513,7 @@ isolazi/
 │   ├── main.zig          # CLI entry point
 │   ├── root.zig          # Module exports
 │   ├── cli/              # Command-line interface
+│   │   ├── compose.zig  # Docker Compose orchestration
 │   ├── config/           # Container configuration
 │   ├── container/        # Container state management
 │   ├── image/            # OCI image handling
@@ -305,15 +523,17 @@ isolazi/
 │   │   └── registry.zig  # Registry client
 │   ├── runtime/          # Container runtime (Linux)
 │   │   └── container.zig # Container execution and exec support
-│   ├── linux/            # Linux-specific (namespaces, networking)
+│   ├── linux/            # Linux-specific (namespaces, networking, security)
 │   │   ├── syscalls.zig  # Low-level Linux syscall wrappers (setns, nsenter)
 │   │   ├── network.zig   # Container networking (veth, bridge, NAT)
 │   │   ├── userns.zig    # User namespace for rootless containers
 │   │   ├── cgroup.zig    # cgroup v2 resource limits
-│   │   └── seccomp.zig   # Seccomp syscall filtering
+│   │   ├── seccomp.zig   # Seccomp syscall filtering
+│   │   ├── apparmor.zig  # AppArmor MAC profile management
+│   │   └── selinux.zig   # SELinux context and labeling
 │   ├── fs/               # Filesystem operations
-│   ├── windows/          # WSL2 backend
-│   └── macos/            # Apple Virtualization backend
+│   ├── windows/          # WSL2 backend (LSM passthrough)
+│   └── macos/            # Lima VM backend (LSM passthrough)
 ├── build.zig
 └── build.zig.zon
 ```
@@ -368,15 +588,127 @@ isolazi run --no-seccomp alpine /bin/sh
 3. Filter is installed via `seccomp(SECCOMP_SET_MODE_FILTER)`
 4. Container process and all children are restricted
 
+### AppArmor (Linux Security Module)
+
+AppArmor provides Mandatory Access Control (MAC) to restrict what a container can do. It's particularly effective at preventing file access and capability-based attacks.
+
+**AppArmor Modes:**
+
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| `enforce` | Actively blocks policy violations (default) | Production containers |
+| `complain` | Logs violations without blocking | Testing and debugging |
+| `unconfined` | No restrictions | When AppArmor isn't needed |
+
+**Default Profile Restrictions:**
+- Blocks access to `/proc/kcore`, `/proc/kmem`, `/proc/sysrq-trigger`
+- Blocks `/sys/firmware/**` to prevent firmware tampering
+- Blocks container runtime sockets (`/var/run/docker.sock`, etc.)
+- Denies `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE`, `CAP_SYS_MODULE`
+- Denies raw network access and kernel keyring access
+
+**Usage Examples:**
+
+```bash
+# Enable AppArmor with default profile
+isolazi run --apparmor alpine /bin/sh
+
+# Use a custom AppArmor profile
+isolazi run --apparmor=my-profile alpine /bin/sh
+
+# AppArmor in complain mode (log only)
+isolazi run --apparmor --apparmor-mode complain alpine /bin/sh
+
+# Disable AppArmor
+isolazi run --no-apparmor alpine /bin/sh
+
+# Docker-compatible security option
+isolazi run --security-opt apparmor=my-profile alpine /bin/sh
+```
+
+**Platform Support:**
+- **Linux**: Native AppArmor support (requires AppArmor enabled in kernel)
+- **Windows (WSL2)**: Passed through to Linux isolazi inside WSL
+- **macOS (Lima)**: Passed through to Linux VM (if AppArmor is available)
+
+### SELinux (Security-Enhanced Linux)
+
+SELinux provides Type Enforcement (TE) and Multi-Category Security (MCS) for fine-grained access control between containers.
+
+**SELinux Types:**
+
+| Type | Description | Use Case |
+|------|-------------|----------|
+| `container_t` | Standard container type (default) | Most containers |
+| `container_net_t` | Container with network access | Network services |
+| `container_file_t` | Container with file access | Data processing |
+| `spc_t` | Super Privileged Container | System administration |
+
+**MCS Categories:**
+MCS categories (c0-c1023) provide isolation between containers. Each container gets unique categories, preventing one container from accessing another's files.
+
+**Usage Examples:**
+
+```bash
+# Enable SELinux with default context
+isolazi run --selinux alpine /bin/sh
+
+# Use a custom SELinux context
+isolazi run --selinux system_u:system_r:container_t:s0 alpine /bin/sh
+
+# SELinux with specific type
+isolazi run --selinux --selinux-type container_net_t alpine /bin/sh
+
+# SELinux with MCS categories for isolation
+isolazi run --selinux --selinux-mcs c100,c200 alpine /bin/sh
+
+# Disable SELinux
+isolazi run --no-selinux alpine /bin/sh
+
+# Docker-compatible security option
+isolazi run --security-opt label=system_u:system_r:container_t:s0:c100,c200 alpine /bin/sh
+```
+
+**Platform Support:**
+- **Linux**: Native SELinux support (requires SELinux enabled in kernel)
+- **Windows (WSL2)**: Passed through to Linux isolazi inside WSL
+- **macOS (Lima)**: Passed through to Linux VM (if SELinux is available)
+
+### Combining Security Features
+
+For maximum security, combine multiple security layers:
+
+```bash
+# Full security stack: seccomp + AppArmor + SELinux + resource limits
+isolazi run --seccomp strict \
+            --apparmor \
+            --selinux --selinux-mcs c100,c200 \
+            --memory 512m --cpus 1 \
+            alpine /bin/sh
+
+# Production-ready secure container
+isolazi run -d -p 8080:80 \
+            --seccomp default \
+            --apparmor=my-nginx-profile \
+            --selinux --selinux-type container_net_t \
+            --memory 256m --cpus 0.5 \
+            nginx
+
+# Disable all security for debugging (NOT recommended for production)
+isolazi run --privileged alpine /bin/sh
+```
+
 ### Security Layers
 
 Isolazi provides multiple security layers:
 
 1. **Namespaces** - Process, mount, network, UTS, IPC, user, cgroup isolation
 2. **Seccomp** - Syscall filtering to block dangerous operations
-3. **Pivot Root** - Complete filesystem isolation
-4. **User Namespace** - Run as non-root on host (rootless containers)
-5. **Cgroups** - Resource limits to prevent DoS
+3. **AppArmor** - Mandatory Access Control for file and capability restrictions
+4. **SELinux** - Type Enforcement and MCS for inter-container isolation
+5. **Pivot Root** - Complete filesystem isolation
+6. **User Namespace** - Run as non-root on host (rootless containers)
+7. **Cgroups** - Resource limits to prevent DoS
 
 ## Network Architecture
 
@@ -407,7 +739,7 @@ Containers use network namespace isolation with bridge networking:
 |----------|--------|-------|
 | Linux | ✅ Native | Full namespace isolation |
 | Windows | ✅ WSL2 | Containers run in WSL2 |
-| macOS | ✅ Virtualization | Containers run in Linux VM |
+| macOS | ✅ Lima | Containers run in Linux VM |
 
 ### Windows (WSL2)
 
@@ -417,16 +749,12 @@ On Windows, isolazi uses WSL2 as the container backend:
 2. Containers are executed inside WSL2 using `unshare` and `chroot`
 3. Requires WSL2 to be installed (`wsl --install`)
 
-### macOS (Apple Virtualization)
-
-On macOS, isolazi uses Apple's Virtualization framework to run a lightweight Linux VM:
+On macOS, isolazi uses [Lima](https://github.com/lima-vm/lima) to run a lightweight Linux VM:
 
 1. Images are pulled natively on macOS
-2. Containers are executed inside a Linux VM using VirtioFS for filesystem sharing
+2. Containers are executed inside a Linux VM with automatic file sharing
 3. Requires macOS 12.0 (Monterey) or later
-4. Needs a hypervisor backend:
-   - **vfkit** (recommended): `brew install vfkit` - Uses native Virtualization.framework
-   - **Lima**: `brew install lima` - Easy-to-use Linux VM manager with automatic file sharing
+4. Needs Lima installed: `brew install lima`
 
 #### macOS VM Management
 
@@ -440,22 +768,12 @@ isolazi vm info
 
 #### macOS Setup
 
-1. Install a hypervisor:
+1. Install Lima:
    ```bash
-   # Recommended: vfkit (native, fast, requires manual kernel setup)
-   brew install vfkit
-   
-   # Alternative: Lima (easier setup, auto-manages VM)
    brew install lima
    ```
 
-2. For vfkit users - download Linux kernel:
-   ```bash
-   mkdir -p ~/Library/Application\ Support/isolazi/vm
-   # Place your vmlinuz kernel file there
-   ```
-
-3. Lima users don't need manual kernel setup - Lima automatically downloads and manages the Linux VM.
+2. Lima automatically downloads and manages the Linux VM for isolazi on the first run.
 
 ## Data Storage
 
@@ -478,7 +796,8 @@ isolazi stores data in `~/.isolazi/`:
 - ✅ Network namespace isolation - **Implemented**
 - ✅ Cgroup v2 resource limits - **Implemented**
 - ✅ Seccomp syscall filtering - **Implemented**
-- AppArmor/SELinux profiles (not yet implemented)
+- ✅ AppArmor profiles - **Implemented**
+- ✅ SELinux labeling - **Implemented**
 
 ### Resource Limits (cgroup v2)
 
@@ -524,7 +843,7 @@ isolazi run --rootless --uid-map 0:1000:1 --gid-map 0:1000:1 alpine id
 - No root privileges required on the host
 - Container root (UID 0) is mapped to your unprivileged user
 - Improved security isolation
-- Works on Linux, Windows (WSL2), and macOS (Lima/vfkit)
+- Works on Linux, Windows (WSL2), and macOS (Lima)
 
 ## Requirements
 
@@ -539,8 +858,34 @@ isolazi run --rootless --uid-map 0:1000:1 --gid-map 0:1000:1 alpine id
 
 ### macOS
 - macOS 12.0 (Monterey) or later
-- vfkit or Lima installed
+- Lima installed
 - Network access for pulling images
+
+## Benchmarking
+
+isolazi includes a comprehensive benchmark suite for measuring container performance:
+
+```bash
+# Build the benchmark tool
+zig build
+
+# Run all benchmarks
+./zig-out/bin/isolazi-bench all --rootfs /path/to/rootfs --layer /path/to/layer.tar.gz
+
+# Run specific benchmarks
+./zig-out/bin/isolazi-bench container-start --rootfs /path/to/rootfs
+./zig-out/bin/isolazi-bench layer --layer /path/to/layer.tar.gz
+
+# Export results to JSON
+./zig-out/bin/isolazi-bench all -o results.json
+```
+
+**Benchmark Types:**
+- **Cold Container Start** - Time from creation to first process instruction
+- **Memory & CPU Overhead** - Resource consumption of idle containers
+- **Layer Extraction** - OCI image layer decompression speed
+
+See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for detailed documentation.
 
 ## Contributing
 

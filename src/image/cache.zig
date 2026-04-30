@@ -31,6 +31,7 @@ pub const CacheError = error{
     DiskFull,
     AccessDenied,
     OutOfMemory,
+    IoError,
 };
 
 /// Info about a cached image (for listing)
@@ -38,11 +39,14 @@ pub const CachedImageInfo = struct {
     registry: []const u8,
     repository: []const u8,
     tag: []const u8,
+    size: u64,
+    image_id: []const u8,
 
     pub fn deinit(self: *CachedImageInfo, allocator: std.mem.Allocator) void {
         allocator.free(self.registry);
         allocator.free(self.repository);
         allocator.free(self.tag);
+        allocator.free(self.image_id);
     }
 };
 
@@ -99,12 +103,13 @@ pub const ImageCache = struct {
             "/images/blobs/sha256",
             "/images/manifests",
             "/containers",
+            "/build-cache",
         };
 
         for (dirs) |dir| {
-            const full_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ base_path, dir });
-            defer allocator.free(full_path);
-            std.fs.cwd().makePath(full_path) catch |e| switch (e) {
+            const dir_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ base_path, dir });
+            defer allocator.free(dir_path);
+            std.fs.cwd().makePath(dir_path) catch |e| switch (e) {
                 error.PathAlreadyExists => {},
                 else => return CacheError.AccessDenied,
             };
@@ -118,6 +123,32 @@ pub const ImageCache = struct {
 
     pub fn deinit(self: *Self) void {
         self.allocator.free(self.base_path);
+    }
+
+    /// Get a cached layer digest for a given build key
+    pub fn getBuildCache(self: *Self, key: []const u8) CacheError!?[]const u8 {
+        const cache_path = std.fmt.allocPrint(self.allocator, "{s}/build-cache/{s}", .{ self.base_path, key }) catch return CacheError.OutOfMemory;
+        defer self.allocator.free(cache_path);
+
+        const file = std.fs.cwd().openFile(cache_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return CacheError.AccessDenied,
+        };
+        defer file.close();
+
+        const digest = file.readToEndAlloc(self.allocator, 1024) catch return CacheError.IoError;
+        return digest;
+    }
+
+    /// Store a layer digest in the build cache
+    pub fn putBuildCache(self: *Self, key: []const u8, digest: []const u8) CacheError!void {
+        const cache_path = std.fmt.allocPrint(self.allocator, "{s}/build-cache/{s}", .{ self.base_path, key }) catch return CacheError.OutOfMemory;
+        defer self.allocator.free(cache_path);
+
+        const file = std.fs.cwd().createFile(cache_path, .{}) catch return CacheError.IoError;
+        defer file.close();
+
+        file.writeAll(digest) catch return CacheError.IoError;
     }
 
     /// Get the path for a blob by its digest
@@ -144,9 +175,9 @@ pub const ImageCache = struct {
         const blob_path = try self.getBlobPath(digest);
         defer self.allocator.free(blob_path);
 
-        const file = try std.fs.cwd().createFile(blob_path, .{});
+        const file = std.fs.cwd().createFile(blob_path, .{}) catch return CacheError.AccessDenied;
         defer file.close();
-        try file.writeAll(data);
+        file.writeAll(data) catch return CacheError.AccessDenied;
     }
 
     /// Store a blob from a file (for large blobs)
@@ -154,7 +185,7 @@ pub const ImageCache = struct {
         const blob_path = try self.getBlobPath(digest);
         defer self.allocator.free(blob_path);
 
-        try std.fs.cwd().copyFile(source_path, std.fs.cwd(), blob_path, .{});
+        std.fs.cwd().copyFile(source_path, std.fs.cwd(), blob_path, .{}) catch return CacheError.AccessDenied;
     }
 
     /// Read a blob from cache
@@ -201,9 +232,9 @@ pub const ImageCache = struct {
             std.fs.cwd().makePath(parent) catch {};
         }
 
-        const file = try std.fs.cwd().createFile(manifest_path, .{});
+        const file = std.fs.cwd().createFile(manifest_path, .{}) catch return CacheError.AccessDenied;
         defer file.close();
-        try file.writeAll(manifest_json);
+        file.writeAll(manifest_json) catch return CacheError.AccessDenied;
     }
 
     /// Read a cached manifest
@@ -244,22 +275,19 @@ pub const ImageCache = struct {
         errdefer self.allocator.free(rootfs_path);
 
         // Create container directory
-        std.fs.cwd().makePath(rootfs_path) catch {};
+        try std.fs.cwd().makePath(rootfs_path);
 
         // Extract each layer in order
         for (layer_digests) |digest| {
             const layer_path = try self.getBlobPath(digest);
             defer self.allocator.free(layer_path);
 
-            _ = layer.extractLayer(
+            _ = try layer.extractLayer(
                 self.allocator,
                 layer_path,
                 rootfs_path,
                 null,
-            ) catch |err| {
-                std.debug.print("Warning: Layer extraction issue: {}\n", .{err});
-                continue;
-            };
+            );
         }
 
         return rootfs_path;
@@ -316,9 +344,7 @@ pub const ImageCache = struct {
         const blobs_path = try std.fmt.allocPrint(self.allocator, "{s}/images/blobs/sha256", .{self.base_path});
         defer self.allocator.free(blobs_path);
 
-        var blobs_dir = std.fs.cwd().openDir(blobs_path, .{ .iterate = true }) catch {
-            return removed;
-        };
+        var blobs_dir = std.fs.cwd().openDir(blobs_path, .{ .iterate = true }) catch return removed;
         defer blobs_dir.close();
 
         var blob_iter = blobs_dir.iterate();
@@ -339,9 +365,7 @@ pub const ImageCache = struct {
         const containers_path = try std.fmt.allocPrint(self.allocator, "{s}/containers", .{self.base_path});
         defer self.allocator.free(containers_path);
 
-        var containers_dir = std.fs.cwd().openDir(containers_path, .{ .iterate = true }) catch {
-            return removed;
-        };
+        var containers_dir = std.fs.cwd().openDir(containers_path, .{ .iterate = true }) catch return removed;
         defer containers_dir.close();
 
         var iter = containers_dir.iterate();
@@ -370,9 +394,7 @@ pub const ImageCache = struct {
         const manifests_path = try std.fmt.allocPrint(allocator, "{s}/images/manifests", .{self.base_path});
         defer allocator.free(manifests_path);
 
-        var manifests_dir = std.fs.cwd().openDir(manifests_path, .{ .iterate = true }) catch {
-            return images.toOwnedSlice(allocator);
-        };
+        var manifests_dir = std.fs.cwd().openDir(manifests_path, .{ .iterate = true }) catch return images.toOwnedSlice(allocator);
         defer manifests_dir.close();
 
         // Iterate registries
@@ -415,11 +437,67 @@ pub const ImageCache = struct {
                         if (repo_len >= repo_name.len) break;
                     }
 
+                    // Open manifest to get size and ID
+                    const tag_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ repo_path, tag_entry.name });
+                    defer allocator.free(tag_path);
+
+                    var size: u64 = 0;
+                    var image_id: []const u8 = try allocator.dupe(u8, "unknown");
+
+                    if (std.fs.cwd().openFile(tag_path, .{})) |manifest_file| {
+                        defer manifest_file.close();
+                        if (manifest_file.readToEndAlloc(allocator, 10 * 1024 * 1024)) |content| {
+                            defer allocator.free(content);
+
+                            if (std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch null) |parsed| {
+                                defer parsed.deinit();
+                                const root = parsed.value;
+
+                                if (root == .object) {
+                                    // Get config size and ID
+                                    if (root.object.get("config")) |config| {
+                                        if (config == .object) {
+                                            if (config.object.get("size")) |s| {
+                                                if (s == .integer) size += @intCast(s.integer);
+                                            }
+                                            if (config.object.get("digest")) |d| {
+                                                if (d == .string) {
+                                                    allocator.free(image_id); // free "unknown"
+                                                    if (d.string.len > 19) {
+                                                        // Shorten ID (sha256:123456789012) -> 123456789012
+                                                        image_id = try allocator.dupe(u8, d.string[7..19]);
+                                                    } else {
+                                                        image_id = try allocator.dupe(u8, d.string);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Get layers size
+                                    if (root.object.get("layers")) |layers| {
+                                        if (layers == .array) {
+                                            for (layers.array.items) |layer_item| {
+                                                if (layer_item == .object) {
+                                                    if (layer_item.object.get("size")) |s| {
+                                                        if (s == .integer) size += @intCast(s.integer);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else |_| {}
+                    } else |_| {}
+
                     // Create owned strings for the image info
                     const info = CachedImageInfo{
                         .registry = try allocator.dupe(u8, registry_entry.name),
                         .repository = try allocator.dupe(u8, repo_name[0..repo_len]),
                         .tag = try allocator.dupe(u8, tag_name),
+                        .size = size,
+                        .image_id = image_id,
                     };
                     try images.append(allocator, info);
                 }
@@ -441,9 +519,7 @@ pub const ImageCache = struct {
         const blobs_path = try std.fmt.allocPrint(self.allocator, "{s}/images/blobs/sha256", .{self.base_path});
         defer self.allocator.free(blobs_path);
 
-        var blobs_dir = std.fs.cwd().openDir(blobs_path, .{ .iterate = true }) catch {
-            return stats;
-        };
+        var blobs_dir = std.fs.cwd().openDir(blobs_path, .{ .iterate = true }) catch return stats;
         defer blobs_dir.close();
 
         var blob_iter = blobs_dir.iterate();

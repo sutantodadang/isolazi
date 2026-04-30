@@ -19,6 +19,48 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const config_mod = @import("../config/config.zig");
+
+fn appendShellQuoted(list: *std.ArrayList(u8), allocator: std.mem.Allocator, value: []const u8) !void {
+    try list.append(allocator, '\'');
+    for (value) |c| {
+        if (c == '\'') {
+            try list.appendSlice(allocator, "'\\''");
+        } else {
+            try list.append(allocator, c);
+        }
+    }
+    try list.append(allocator, '\'');
+}
+
+fn appendShellQuotedConcat(list: *std.ArrayList(u8), allocator: std.mem.Allocator, a: []const u8, b: []const u8) !void {
+    try list.append(allocator, '\'');
+    for (a) |c| {
+        if (c == '\'') try list.appendSlice(allocator, "'\\''") else try list.append(allocator, c);
+    }
+    for (b) |c| {
+        if (c == '\'') try list.appendSlice(allocator, "'\\''") else try list.append(allocator, c);
+    }
+    try list.append(allocator, '\'');
+}
+
+fn appendShellQuotedEnv(list: *std.ArrayList(u8), allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {
+    try list.append(allocator, '\'');
+    for (key) |c| {
+        if (c == '\'') try list.appendSlice(allocator, "'\\''") else try list.append(allocator, c);
+    }
+    try list.append(allocator, '=');
+    for (value) |c| {
+        if (c == '\'') try list.appendSlice(allocator, "'\\''") else try list.append(allocator, c);
+    }
+    try list.append(allocator, '\'');
+}
+
+fn appendCommentText(list: *std.ArrayList(u8), allocator: std.mem.Allocator, value: []const u8) !void {
+    for (value) |c| {
+        try list.append(allocator, if (c == '\n' or c == '\r') '_' else c);
+    }
+}
 
 pub const VirtualizationError = error{
     VirtualizationNotAvailable,
@@ -33,61 +75,6 @@ pub const VirtualizationError = error{
     OutOfMemory,
     CommandFailed,
     Timeout,
-};
-
-/// VM configuration options
-pub const VMConfig = struct {
-    /// Number of CPU cores (default: 2)
-    cpu_count: u32 = 2,
-    /// Memory size in bytes (default: 2GB)
-    memory_size: u64 = 2 * 1024 * 1024 * 1024,
-    /// Path to Linux kernel (vmlinuz)
-    kernel_path: ?[]const u8 = null,
-    /// Path to initramfs
-    initramfs_path: ?[]const u8 = null,
-    /// Kernel command line arguments
-    kernel_cmdline: []const u8 = "console=hvc0",
-    /// Path to root disk image (optional)
-    disk_image_path: ?[]const u8 = null,
-    /// Enable Rosetta for x86_64 translation (Apple Silicon only)
-    enable_rosetta: bool = false,
-    /// Share directories with the VM
-    shared_directories: []const SharedDirectory = &.{},
-    /// Network mode
-    network_mode: NetworkMode = .nat,
-
-    // Resource limits (maps to cgroup-like behavior in VM)
-    /// Memory limit for the container (0 = use vm memory_size)
-    container_memory_limit: u64 = 0,
-    /// CPU limit as number of cores (0 = use all vm cpu_count)
-    container_cpu_limit: f64 = 0,
-    /// CPU weight (1-10000, default 100)
-    cpu_weight: u32 = 100,
-    /// I/O weight (1-10000, default 100)
-    io_weight: u32 = 100,
-    /// OOM score adjustment (-1000 to 1000)
-    oom_score_adj: i16 = 0,
-
-    /// Create a VMConfig from resource limits
-    pub fn withResourceLimits(memory_limit: u64, cpu_limit: f64) VMConfig {
-        var config = VMConfig{};
-
-        // Set VM memory to container limit (with minimum 256MB overhead for kernel/init)
-        if (memory_limit > 0) {
-            const min_vm_memory = 256 * 1024 * 1024; // 256MB minimum
-            config.memory_size = memory_limit + min_vm_memory;
-            config.container_memory_limit = memory_limit;
-        }
-
-        // Set VM CPU count based on CPU limit (round up to nearest integer)
-        if (cpu_limit > 0) {
-            const cpu_count: u32 = @intFromFloat(@ceil(cpu_limit));
-            config.cpu_count = @max(cpu_count, 1);
-            config.container_cpu_limit = cpu_limit;
-        }
-
-        return config;
-    }
 };
 
 /// Resource limits configuration for macOS (passed to Linux VM)
@@ -121,6 +108,20 @@ pub const ResourceLimitsConfig = struct {
     /// Build command line arguments for isolazi inside the VM
     pub fn toCmdArgs(self: *const ResourceLimitsConfig, allocator: std.mem.Allocator) !std.ArrayList([]const u8) {
         var args: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            var previous_was_value_flag = false;
+            for (args.items) |item| {
+                if (previous_was_value_flag) allocator.free(item);
+                previous_was_value_flag =
+                    std.mem.eql(u8, item, "--memory") or
+                    std.mem.eql(u8, item, "--cpu-quota") or
+                    std.mem.eql(u8, item, "--cpu-period") or
+                    std.mem.eql(u8, item, "--cpu-weight") or
+                    std.mem.eql(u8, item, "--io-weight") or
+                    std.mem.eql(u8, item, "--oom-score-adj");
+            }
+            args.deinit(allocator);
+        }
 
         if (self.memory_max > 0) {
             try args.append(allocator, "--memory");
@@ -164,112 +165,205 @@ pub const ResourceLimitsConfig = struct {
     }
 };
 
-/// Shared directory configuration for VirtioFS
-pub const SharedDirectory = struct {
-    /// Host path to share
-    host_path: []const u8,
-    /// Mount tag in the guest
-    mount_tag: []const u8,
-    /// Read-only mount
-    read_only: bool = false,
-};
+/// AppArmor enforcement mode for macOS VM passthrough
+pub const AppArmorMode = enum {
+    /// No AppArmor restrictions
+    unconfined,
+    /// Log violations but don't enforce
+    complain,
+    /// Full enforcement (default)
+    enforce,
 
-/// Network configuration mode
-pub const NetworkMode = enum {
-    /// NAT networking (default)
-    nat,
-    /// Bridged networking (requires permission)
-    bridged,
-    /// No network
-    none,
-};
-
-/// VM state
-pub const VMState = enum {
-    stopped,
-    starting,
-    running,
-    pausing,
-    paused,
-    stopping,
-    error_state,
-};
-
-/// Virtual Machine handle
-pub const VirtualMachine = struct {
-    allocator: std.mem.Allocator,
-    config: VMConfig,
-    state: VMState,
-    /// Socket path for VM communication
-    socket_path: ?[]const u8,
-    /// PID of the VM process (when using helper tool)
-    vm_pid: ?std.process.Child.Id,
-
-    const Self = @This();
-
-    pub fn init(allocator: std.mem.Allocator, config: VMConfig) !Self {
-        return Self{
-            .allocator = allocator,
-            .config = config,
-            .state = .stopped,
-            .socket_path = null,
-            .vm_pid = null,
+    /// Convert to CLI argument string
+    pub fn toCmdString(self: AppArmorMode) []const u8 {
+        return switch (self) {
+            .unconfined => "unconfined",
+            .complain => "complain",
+            .enforce => "enforce",
         };
     }
+};
 
-    pub fn deinit(self: *Self) void {
-        if (self.socket_path) |path| {
-            self.allocator.free(path);
-        }
-        self.* = undefined;
+/// SELinux type for container processes in VM
+pub const SELinuxType = enum {
+    /// Standard container type
+    container_t,
+    /// Container with network access
+    container_net_t,
+    /// Container with file access
+    container_file_t,
+    /// Privileged container (use with caution)
+    spc_t,
+    /// Custom type (use selinux_context instead)
+    custom,
+
+    /// Convert to CLI argument string
+    pub fn toCmdString(self: SELinuxType) []const u8 {
+        return switch (self) {
+            .container_t => "container_t",
+            .container_net_t => "container_net_t",
+            .container_file_t => "container_file_t",
+            .spc_t => "spc_t",
+            .custom => "custom",
+        };
+    }
+};
+
+/// Linux Security Module (LSM) configuration for macOS VM passthrough.
+/// These settings are passed through to the Linux isolazi binary running
+/// inside the Lima or vfkit virtual machine.
+pub const LSMConfig = struct {
+    // AppArmor settings
+    /// Enable AppArmor confinement
+    apparmor_enabled: bool = false,
+    /// AppArmor profile name (null = use default "isolazi-default")
+    apparmor_profile: ?[]const u8 = null,
+    /// AppArmor enforcement mode
+    apparmor_mode: AppArmorMode = .enforce,
+
+    // SELinux settings
+    /// Enable SELinux labeling
+    selinux_enabled: bool = false,
+    /// Custom SELinux context string (format: user:role:type:level)
+    selinux_context: ?[]const u8 = null,
+    /// SELinux type for container process
+    selinux_type: SELinuxType = .container_t,
+    /// MCS category 1 for container isolation (null = auto-assign)
+    selinux_mcs_category1: ?u16 = null,
+    /// MCS category 2 for container isolation (null = auto-assign)
+    selinux_mcs_category2: ?u16 = null,
+
+    /// Check if any LSM is enabled
+    pub fn hasLSMEnabled(self: *const LSMConfig) bool {
+        return self.apparmor_enabled or self.selinux_enabled;
     }
 
-    /// Start the virtual machine
-    pub fn start(self: *Self) VirtualizationError!void {
-        if (self.state != .stopped) {
-            return VirtualizationError.VMStartFailed;
+    /// Build command line arguments for isolazi inside the VM.
+    /// Caller is responsible for freeing all allocated strings and the ArrayList.
+    pub fn toCmdArgs(self: *const LSMConfig, allocator: std.mem.Allocator) !std.ArrayList([]const u8) {
+        var args: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            var previous_was_mcs = false;
+            for (args.items) |item| {
+                if (previous_was_mcs) allocator.free(item);
+                previous_was_mcs = std.mem.eql(u8, item, "--selinux-mcs");
+            }
+            args.deinit(allocator);
         }
 
-        self.state = .starting;
+        // AppArmor arguments
+        if (self.apparmor_enabled) {
+            try args.append(allocator, "--apparmor");
+            if (self.apparmor_profile) |profile| {
+                try args.append(allocator, profile);
+            }
 
-        // Validate configuration
-        if (self.config.kernel_path == null) {
-            self.state = .error_state;
-            return VirtualizationError.KernelNotFound;
+            try args.append(allocator, "--apparmor-mode");
+            try args.append(allocator, self.apparmor_mode.toCmdString());
         }
 
-        // In a real implementation, this would use Objective-C runtime
-        // to interact with Virtualization.framework. For now, we use
-        // a helper tool approach similar to vfkit/lima.
-        self.state = .running;
+        // SELinux arguments
+        if (self.selinux_enabled) {
+            try args.append(allocator, "--selinux");
+
+            if (self.selinux_context) |context| {
+                // Use custom context if provided
+                try args.append(allocator, context);
+            } else {
+                // Build context from type and MCS categories
+                try args.append(allocator, "--selinux-type");
+                try args.append(allocator, self.selinux_type.toCmdString());
+
+                // Add MCS categories if specified
+                if (self.selinux_mcs_category1) |cat1| {
+                    try args.append(allocator, "--selinux-mcs");
+                    if (self.selinux_mcs_category2) |cat2| {
+                        const mcs_str = try std.fmt.allocPrint(allocator, "c{d},c{d}", .{ cat1, cat2 });
+                        try args.append(allocator, mcs_str);
+                    } else {
+                        const mcs_str = try std.fmt.allocPrint(allocator, "c{d}", .{cat1});
+                        try args.append(allocator, mcs_str);
+                    }
+                }
+            }
+        }
+
+        return args;
     }
 
-    /// Stop the virtual machine
-    pub fn stop(self: *Self) VirtualizationError!void {
-        if (self.state != .running and self.state != .paused) {
-            return VirtualizationError.VMStopFailed;
+    /// Build shell script snippet for applying LSM configuration.
+    /// This generates the necessary commands for the Lima shell script.
+    pub fn toShellScript(self: *const LSMConfig, script: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+        // Note: In Lima, we use direct unshare/chroot rather than calling isolazi binary,
+        // so we need to apply LSM using shell commands if available.
+        // This uses aa-exec for AppArmor and runcon for SELinux.
+
+        if (self.apparmor_enabled) {
+            // Use aa-exec to run under an AppArmor profile
+            try script.appendSlice(allocator, "if command -v aa-exec >/dev/null 2>&1 && [ -f /sys/module/apparmor/parameters/enabled ]; then ");
+            try script.appendSlice(allocator, "AA_EXEC_ARGS=");
+
+            // Add profile argument
+            if (self.apparmor_profile) |profile| {
+                const profile_arg = try std.fmt.allocPrint(allocator, "-p {s}", .{profile});
+                defer allocator.free(profile_arg);
+                try appendShellQuoted(script, allocator, profile_arg);
+            } else {
+                try appendShellQuoted(script, allocator, "-p isolazi-default");
+            }
+
+            // Add mode-specific arguments
+            switch (self.apparmor_mode) {
+                .complain => {
+                    try script.appendSlice(allocator, "; AA_EXEC_ARGS=\"$AA_EXEC_ARGS --complain\"");
+                },
+                .unconfined, .enforce => {},
+            }
+
+            // Set execution prefix based on mode
+            if (self.apparmor_mode == .unconfined) {
+                try script.appendSlice(allocator, "; AA_EXEC_PREFIX=\"\"; ");
+            } else {
+                try script.appendSlice(allocator, "; AA_EXEC_PREFIX=\"aa-exec $AA_EXEC_ARGS -- \"; ");
+            }
+            try script.appendSlice(allocator, "else AA_EXEC_PREFIX=\"\"; fi; ");
         }
 
-        self.state = .stopping;
+        if (self.selinux_enabled) {
+            // Use runcon to run with SELinux context
+            try script.appendSlice(allocator, "if command -v runcon >/dev/null 2>&1 && [ -d /sys/fs/selinux ]; then ");
+            try script.appendSlice(allocator, "SELINUX_CONTEXT=");
 
-        // Send shutdown signal to VM
-        if (self.vm_pid) |pid| {
-            _ = std.posix.kill(pid, std.posix.SIG.TERM) catch {};
+            if (self.selinux_context) |context| {
+                try appendShellQuoted(script, allocator, context);
+            } else {
+                // Build context from type and MCS
+                var context_value: std.ArrayList(u8) = .empty;
+                defer context_value.deinit(allocator);
+
+                try context_value.appendSlice(allocator, "system_u:system_r:");
+                try context_value.appendSlice(allocator, self.selinux_type.toCmdString());
+                try context_value.appendSlice(allocator, ":s0");
+
+                // Add MCS categories if specified
+                if (self.selinux_mcs_category1) |cat1| {
+                    var cat1_buf: [16]u8 = undefined;
+                    const cat1_str = std.fmt.bufPrint(&cat1_buf, ":c{d}", .{cat1}) catch "";
+                    try context_value.appendSlice(allocator, cat1_str);
+
+                    if (self.selinux_mcs_category2) |cat2| {
+                        var cat2_buf: [16]u8 = undefined;
+                        const cat2_str = std.fmt.bufPrint(&cat2_buf, ",c{d}", .{cat2}) catch "";
+                        try context_value.appendSlice(allocator, cat2_str);
+                    }
+                }
+
+                try appendShellQuoted(script, allocator, context_value.items);
+            }
+
+            try script.appendSlice(allocator, "; RUNCON_PREFIX=\"runcon $SELINUX_CONTEXT \"; ");
+            try script.appendSlice(allocator, "else RUNCON_PREFIX=\"\"; fi; ");
         }
-
-        self.state = .stopped;
-    }
-
-    /// Execute a command in the VM
-    pub fn exec(self: *Self, args: []const []const u8) VirtualizationError!u8 {
-        if (self.state != .running) {
-            return VirtualizationError.CommandFailed;
-        }
-
-        // In a full implementation, this would use vsock or SSH to
-        // communicate with the guest. For now, we simulate success.
-        _ = args;
-        return 0;
     }
 };
 
@@ -316,448 +410,29 @@ pub fn getDataDir(allocator: std.mem.Allocator) ![]const u8 {
     );
 }
 
-/// Get the path to the Linux VM assets
-pub fn getVMAssetsDir(allocator: std.mem.Allocator) ![]const u8 {
-    const data_dir = try getDataDir(allocator);
-    defer allocator.free(data_dir);
-    return try std.fmt.allocPrint(allocator, "{s}/vm", .{data_dir});
-}
-
-/// Create a Linux VM configuration suitable for container execution.
-/// This sets up a minimal Linux environment with VirtioFS for sharing
-/// the container rootfs.
-pub fn createLinuxVM(allocator: std.mem.Allocator, config: VMConfig) !VirtualMachine {
-    // Validate that virtualization is available
-    if (!isVirtualizationAvailable(allocator)) {
-        return VirtualizationError.VirtualizationNotAvailable;
-    }
-
-    // Create VM with config
-    return VirtualMachine.init(allocator, config);
-}
-
-/// Run a command inside a Linux VM.
-/// This is the main entry point for macOS container execution.
-///
-/// The flow is:
-/// 1. Start/reuse a Linux VM
-/// 2. Share the container rootfs via VirtioFS
-/// 3. Execute the container command using isolazi inside the VM
-/// 4. Return the exit code
-pub fn runInVM(
-    allocator: std.mem.Allocator,
-    rootfs_path: []const u8,
-    command: []const []const u8,
-    config: VMConfig,
-) !u8 {
-    // For a full implementation, we would:
-    // 1. Check if a VM is already running (persistent VM approach)
-    // 2. Start VM if needed
-    // 3. Share rootfs via VirtioFS
-    // 4. Execute command via vsock/SSH
-    // 5. Return exit code
-
-    // For now, we use a simpler approach similar to lima/colima:
-    // Use a helper tool that manages the VM lifecycle
-
-    var vm = try createLinuxVM(allocator, config);
-    defer vm.deinit();
-
-    // Share the rootfs directory
-    const shared_dirs = [_]SharedDirectory{
-        .{
-            .host_path = rootfs_path,
-            .mount_tag = "rootfs",
-            .read_only = false,
-        },
-    };
-
-    var vm_config = config;
-    vm_config.shared_directories = &shared_dirs;
-
-    try vm.start();
-    defer vm.stop() catch {};
-
-    return vm.exec(command);
-}
-
-/// Convert a macOS path to a format usable inside the VM.
-/// For VirtioFS mounts, paths are typically mounted under /mnt/<tag>.
-pub fn convertMacOSPath(
-    allocator: std.mem.Allocator,
-    _: []const u8, // host_path - reserved for future use
-    mount_tag: []const u8,
-) ![]const u8 {
-    // VirtioFS mounts appear at /mnt/<tag> or /Volumes/<tag> in the guest
-    return try std.fmt.allocPrint(allocator, "/mnt/{s}", .{mount_tag});
-}
-
-/// Download a file from a URL using curl
-fn downloadFile(allocator: std.mem.Allocator, url: []const u8, dest_path: []const u8) !void {
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &[_][]const u8{
-            "curl",
-            "-fSL",
-            "--progress-bar",
-            "-o",
-            dest_path,
-            url,
-        },
-    }) catch return VirtualizationError.CommandFailed;
-
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-
-    if (result.term.Exited != 0) {
-        return VirtualizationError.CommandFailed;
-    }
-}
-
-/// Create a minimal initramfs that mounts virtio-fs rootfs and switches to it.
-/// This creates a cpio archive with busybox-based init.
-fn createMinimalInitramfs(allocator: std.mem.Allocator, initramfs_path: []const u8) !void {
-    const assets_dir = std.fs.path.dirname(initramfs_path) orelse return VirtualizationError.ConfigurationInvalid;
-
-    // Create initramfs build directory
-    const build_dir = try std.fmt.allocPrint(allocator, "{s}/initramfs-build", .{assets_dir});
-    defer allocator.free(build_dir);
-
-    // Remove old build dir if exists
-    std.fs.deleteTreeAbsolute(build_dir) catch {};
-
-    // Create directory structure
-    const dirs = [_][]const u8{
-        "",
-        "/bin",
-        "/sbin",
-        "/etc",
-        "/proc",
-        "/sys",
-        "/dev",
-        "/mnt",
-        "/mnt/rootfs",
-        "/lib",
-        "/lib64",
-    };
-
-    for (dirs) |dir| {
-        const full_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ build_dir, dir });
-        defer allocator.free(full_path);
-        std.fs.makeDirAbsolute(full_path) catch |err| {
-            if (err != error.PathAlreadyExists) return err;
-        };
-    }
-
-    // Create init script that mounts virtio-fs and switches root
-    const init_script =
-        \\#!/bin/sh
-        \\# Minimal init for isolazi VM
-        \\
-        \\# Mount essential filesystems
-        \\mount -t proc proc /proc
-        \\mount -t sysfs sys /sys
-        \\mount -t devtmpfs dev /dev
-        \\
-        \\# Mount virtio-fs rootfs
-        \\mount -t virtiofs rootfs /mnt/rootfs
-        \\
-        \\# Switch root to the container rootfs
-        \\exec switch_root /mnt/rootfs /sbin/init "$@"
-    ;
-
-    const init_path = try std.fmt.allocPrint(allocator, "{s}/init", .{build_dir});
-    defer allocator.free(init_path);
-
-    const init_file = try std.fs.createFileAbsolute(init_path, .{});
-    defer init_file.close();
-    try init_file.writeAll(init_script);
-
-    // Make init executable
-    _ = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &[_][]const u8{ "chmod", "+x", init_path },
-    }) catch {};
-
-    // Download busybox static binary for arm64
-    const busybox_path = try std.fmt.allocPrint(allocator, "{s}/bin/busybox", .{build_dir});
-    defer allocator.free(busybox_path);
-
-    // Use busybox from Alpine Linux (static arm64 build)
-    const busybox_url = "https://busybox.net/downloads/binaries/1.35.0-arm64-linux-musl/busybox";
-
-    std.debug.print("Downloading busybox for initramfs...\n", .{});
-    try downloadFile(allocator, busybox_url, busybox_path);
-
-    // Make busybox executable
-    _ = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &[_][]const u8{ "chmod", "+x", busybox_path },
-    }) catch {};
-
-    // Create busybox symlinks
-    const busybox_cmds = [_][]const u8{
-        "sh",
-        "mount",
-        "umount",
-        "switch_root",
-        "cat",
-        "ls",
-        "mkdir",
-        "mknod",
-        "sleep",
-    };
-
-    for (busybox_cmds) |cmd| {
-        const link_path = try std.fmt.allocPrint(allocator, "{s}/bin/{s}", .{ build_dir, cmd });
-        defer allocator.free(link_path);
-
-        // Create symlink: ln -sf busybox <cmd>
-        _ = std.process.Child.run(.{
-            .allocator = allocator,
-            .argv = &[_][]const u8{ "ln", "-sf", "busybox", link_path },
-        }) catch {};
-    }
-
-    // Also link to /sbin
-    const sbin_cmds = [_][]const u8{ "init", "switch_root" };
-    for (sbin_cmds) |cmd| {
-        const link_path = try std.fmt.allocPrint(allocator, "{s}/sbin/{s}", .{ build_dir, cmd });
-        defer allocator.free(link_path);
-
-        _ = std.process.Child.run(.{
-            .allocator = allocator,
-            .argv = &[_][]const u8{ "ln", "-sf", "../bin/busybox", link_path },
-        }) catch {};
-    }
-
-    // Create initramfs cpio archive
-    // (cd build_dir && find . | cpio -o -H newc | gzip > initramfs)
-    std.debug.print("Creating initramfs cpio archive...\n", .{});
-
-    const script_path = try std.fmt.allocPrint(allocator, "{s}/create-initramfs.sh", .{assets_dir});
-    defer allocator.free(script_path);
-
-    const create_script = try std.fmt.allocPrint(
-        allocator,
-        \\#!/bin/sh
-        \\cd "{s}" && find . | cpio -o -H newc 2>/dev/null | gzip > "{s}"
-    ,
-        .{ build_dir, initramfs_path },
-    );
-    defer allocator.free(create_script);
-
-    const script_file = try std.fs.createFileAbsolute(script_path, .{});
-    defer script_file.close();
-    try script_file.writeAll(create_script);
-
-    _ = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &[_][]const u8{ "chmod", "+x", script_path },
-    }) catch {};
-
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &[_][]const u8{ "sh", script_path },
-    }) catch return VirtualizationError.CommandFailed;
-
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-
-    if (result.term.Exited != 0) {
-        return VirtualizationError.CommandFailed;
-    }
-
-    // Clean up build directory
-    std.fs.deleteTreeAbsolute(build_dir) catch {};
-    std.fs.deleteFileAbsolute(script_path) catch {};
-
-    std.debug.print("Initramfs created at: {s}\n", .{initramfs_path});
-}
-
-/// Download and setup the Linux VM assets if not present.
-/// This downloads a minimal Linux kernel from gokrazy/kernel.arm64.
-/// For ARM64 macOS (Apple Silicon), we use the arm64 kernel.
-pub fn ensureVMAssets(allocator: std.mem.Allocator) !struct {
-    kernel_path: []const u8,
-    initramfs_path: ?[]const u8,
-} {
-    const assets_dir = try getVMAssetsDir(allocator);
-    defer allocator.free(assets_dir);
-
-    // Create assets directory if it doesn't exist
-    std.fs.makeDirAbsolute(assets_dir) catch |err| {
-        if (err != error.PathAlreadyExists) {
-            return err;
-        }
-    };
-
-    const kernel_path = try std.fmt.allocPrint(allocator, "{s}/vmlinuz", .{assets_dir});
-    errdefer allocator.free(kernel_path);
-
-    const initramfs_path = try std.fmt.allocPrint(allocator, "{s}/initramfs.cpio.gz", .{assets_dir});
-    errdefer allocator.free(initramfs_path);
-
-    // Check if kernel exists, if not download it
-    const kernel_exists = blk: {
-        std.fs.accessAbsolute(kernel_path, .{}) catch break :blk false;
-        break :blk true;
-    };
-
-    if (!kernel_exists) {
-        // Download kernel from gokrazy/kernel.arm64 repository
-        // The vmlinuz file is available directly in the repo
-        const kernel_url = "https://raw.githubusercontent.com/gokrazy/kernel.arm64/main/vmlinuz";
-
-        std.debug.print("Downloading Linux kernel from gokrazy/kernel.arm64...\n", .{});
-        // Don't manually free here - errdefer will handle cleanup on error
-        downloadFile(allocator, kernel_url, kernel_path) catch {
-            return VirtualizationError.KernelNotFound;
-        };
-        std.debug.print("Kernel downloaded to: {s}\n", .{kernel_path});
-    }
-
-    // Check if initramfs exists, if not create it
-    const initramfs_exists = blk: {
-        std.fs.accessAbsolute(initramfs_path, .{}) catch break :blk false;
-        break :blk true;
-    };
-
-    if (!initramfs_exists) {
-        // Don't manually free here - errdefer will handle cleanup on error
-        createMinimalInitramfs(allocator, initramfs_path) catch {
-            return VirtualizationError.InitramfsNotFound;
-        };
-    }
-
-    return .{
-        .kernel_path = kernel_path,
-        .initramfs_path = initramfs_path,
-    };
-}
-
-/// Create a helper script to manage VM lifecycle.
-/// This can be used when direct Virtualization.framework access isn't available.
-pub fn createVMHelperScript(allocator: std.mem.Allocator) ![]const u8 {
-    const script_content =
-        \\#!/bin/bash
-        \\# Isolazi VM Helper for macOS
-        \\# Uses vfkit or QEMU as the hypervisor backend
-        \\
-        \\set -e
-        \\
-        \\ISOLAZI_DIR="${HOME}/Library/Application Support/isolazi"
-        \\VM_DIR="${ISOLAZI_DIR}/vm"
-        \\SOCKET_PATH="${VM_DIR}/vm.sock"
-        \\
-        \\start_vm() {
-        \\    local kernel="$1"
-        \\    local initramfs="$2"
-        \\    local rootfs="$3"
-        \\    
-        \\    # Check for vfkit (preferred on Apple Silicon)
-        \\    if command -v vfkit &> /dev/null; then
-        \\        vfkit \
-        \\            --bootloader "linux,kernel=$kernel,initrd=$initramfs,cmdline=\"console=hvc0 root=/dev/vda\"" \
-        \\            --cpus 2 \
-        \\            --memory 2048 \
-        \\            --device "virtio-fs,sharedDir=$rootfs,mountTag=rootfs" \
-        \\            --device "virtio-vsock,port=2222,socketURL=$SOCKET_PATH" \
-        \\            --device virtio-serial,stdio &
-        \\    elif command -v limactl &> /dev/null; then
-        \\        # Fallback to Lima
-        \\        limactl start isolazi 2>/dev/null || true
-        \\        limactl shell isolazi -- \
-        \\            sudo unshare --mount --uts --ipc --pid --fork --mount-proc \
-        \\            chroot "$rootfs" "$@" &
-        \\    else
-        \\        echo "Error: No hypervisor found. Install vfkit or lima." >&2
-        \\        exit 1
-        \\    fi
-        \\}
-        \\
-        \\stop_vm() {
-        \\    # Send shutdown command via vsock or kill process
-        \\    if [ -f "${VM_DIR}/vm.pid" ]; then
-        \\        kill "$(cat ${VM_DIR}/vm.pid)" 2>/dev/null || true
-        \\        rm -f "${VM_DIR}/vm.pid"
-        \\    fi
-        \\}
-        \\
-        \\case "$1" in
-        \\    start)
-        \\        start_vm "$2" "$3" "$4"
-        \\        ;;
-        \\    stop)
-        \\        stop_vm
-        \\        ;;
-        \\    *)
-        \\        echo "Usage: $0 {start|stop} [args...]"
-        \\        exit 1
-        \\        ;;
-        \\esac
-    ;
-
-    const data_dir = try getDataDir(allocator);
-    defer allocator.free(data_dir);
-
-    const script_path = try std.fmt.allocPrint(allocator, "{s}/vm-helper.sh", .{data_dir});
-    errdefer allocator.free(script_path);
-
-    // Create directory if needed
-    std.fs.makeDirAbsolute(data_dir) catch |err| {
-        if (err != error.PathAlreadyExists) {
-            return err;
-        }
-    };
-
-    // Write script
-    const file = try std.fs.createFileAbsolute(script_path, .{});
-    defer file.close();
-    try file.writeAll(script_content);
-
-    // Make executable (chmod +x)
-    // On POSIX systems, we'd use fchmod here
-    _ = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &[_][]const u8{ "chmod", "+x", script_path },
-    }) catch {};
-
-    return script_path;
-}
-
-/// Check if a hypervisor backend is available (vfkit, lima)
-pub fn findHypervisor(allocator: std.mem.Allocator) ?[]const u8 {
-    // Check for vfkit first (native macOS, uses Virtualization.framework)
-    const vfkit_result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &[_][]const u8{ "which", "vfkit" },
-    }) catch return null;
-
-    defer allocator.free(vfkit_result.stdout);
-    defer allocator.free(vfkit_result.stderr);
-
-    if (vfkit_result.term.Exited == 0 and vfkit_result.stdout.len > 0) {
-        return "vfkit";
-    }
-
-    // Check for lima (limactl)
+/// Check if Lima is installed and likely to work.
+pub fn isLimaInstalled(allocator: std.mem.Allocator) bool {
     const lima_result = std.process.Child.run(.{
         .allocator = allocator,
         .argv = &[_][]const u8{ "which", "limactl" },
-    }) catch return null;
+    }) catch return false;
 
     defer allocator.free(lima_result.stdout);
     defer allocator.free(lima_result.stderr);
 
     if (lima_result.term.Exited == 0 and lima_result.stdout.len > 0) {
-        return "lima";
+        return true;
     }
 
-    return null;
+    return false;
 }
 
 /// Environment variable pair
+pub const RunResult = struct {
+    exit_code: u8,
+    pid: ?std.process.Child.Id = null,
+};
+
 pub const EnvPair = struct {
     key: []const u8,
     value: []const u8,
@@ -781,152 +456,6 @@ pub const PortMapping = struct {
     };
 };
 
-/// Run using vfkit (Apple Virtualization.framework wrapper)
-pub fn runWithVfkit(
-    allocator: std.mem.Allocator,
-    kernel_path: []const u8,
-    initramfs_path: ?[]const u8,
-    rootfs_path: []const u8,
-    command: []const []const u8,
-    env_vars: []const EnvPair,
-    volumes: []const VolumePair,
-    port_mappings: []const PortMapping,
-    rootless: bool,
-) !u8 {
-    // Note: vfkit runs a full VM where the container runs as root inside the VM
-    // The rootless flag is accepted for API consistency but doesn't change VM behavior
-    // as the VM itself provides isolation
-    _ = rootless;
-    // Build vfkit command
-    var vfkit_args: std.ArrayList([]const u8) = .empty;
-    defer vfkit_args.deinit(allocator);
-
-    try vfkit_args.append(allocator, "vfkit");
-    try vfkit_args.append(allocator, "--cpus");
-    try vfkit_args.append(allocator, "2");
-    try vfkit_args.append(allocator, "--memory");
-    try vfkit_args.append(allocator, "2048");
-
-    // Track allocations for cleanup
-    var allocs_to_free: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (allocs_to_free.items) |a| allocator.free(a);
-        allocs_to_free.deinit(allocator);
-    }
-
-    // Build kernel cmdline with init script that sets clean environment
-    var cmdline_parts: std.ArrayList(u8) = .empty;
-    defer cmdline_parts.deinit(allocator);
-
-    try cmdline_parts.appendSlice(allocator, "console=hvc0 ");
-
-    // Use init script that sets up clean environment
-    // The init will use env -i to clear inherited environment
-    try cmdline_parts.appendSlice(allocator, "init=/bin/sh -- -c 'exec env -i ");
-
-    // Set minimal required environment
-    try cmdline_parts.appendSlice(allocator, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ");
-    try cmdline_parts.appendSlice(allocator, "HOME=/root ");
-    try cmdline_parts.appendSlice(allocator, "TERM=xterm ");
-    try cmdline_parts.appendSlice(allocator, "LANG=C.UTF-8 ");
-
-    // Add user environment variables (these override defaults)
-    for (env_vars) |env| {
-        try cmdline_parts.appendSlice(allocator, env.key);
-        try cmdline_parts.append(allocator, '=');
-        try cmdline_parts.appendSlice(allocator, env.value);
-        try cmdline_parts.append(allocator, ' ');
-    }
-
-    // Add the command
-    for (command) |arg| {
-        try cmdline_parts.appendSlice(allocator, arg);
-        try cmdline_parts.append(allocator, ' ');
-    }
-    try cmdline_parts.append(allocator, '\'');
-
-    // Add bootloader configuration (new vfkit format)
-    // Format: --bootloader linux,kernel=path,initrd=path,cmdline="..."
-    // Note: cmdline must be quoted and inner quotes escaped
-    const bootloader_arg = if (initramfs_path) |initrd|
-        try std.fmt.allocPrint(
-            allocator,
-            "linux,kernel={s},initrd={s},cmdline=\"{s}\"",
-            .{ kernel_path, initrd, cmdline_parts.items },
-        )
-    else
-        try std.fmt.allocPrint(
-            allocator,
-            "linux,kernel={s},cmdline=\"{s}\"",
-            .{ kernel_path, cmdline_parts.items },
-        );
-    try allocs_to_free.append(allocator, bootloader_arg);
-    try vfkit_args.append(allocator, "--bootloader");
-    try vfkit_args.append(allocator, bootloader_arg);
-
-    // Add VirtioFS for rootfs sharing using --device virtio-fs format
-    // Format: --device virtio-fs,sharedDir=/path,mountTag=tag
-    const virtfs_arg = try std.fmt.allocPrint(
-        allocator,
-        "virtio-fs,sharedDir={s},mountTag=rootfs",
-        .{rootfs_path},
-    );
-    try allocs_to_free.append(allocator, virtfs_arg);
-    try vfkit_args.append(allocator, "--device");
-    try vfkit_args.append(allocator, virtfs_arg);
-
-    // Add additional VirtioFS mounts for volumes
-    for (volumes, 0..) |vol, i| {
-        const vol_arg = try std.fmt.allocPrint(
-            allocator,
-            "virtio-fs,sharedDir={s},mountTag=vol{d}",
-            .{ vol.host_path, i },
-        );
-        try allocs_to_free.append(allocator, vol_arg);
-        try vfkit_args.append(allocator, "--device");
-        try vfkit_args.append(allocator, vol_arg);
-    }
-
-    // Add virtio-net device with NAT networking
-    // Format: --device virtio-net,nat,unixSocketPath=/path/to/socket
-    // or simpler: --device virtio-net,nat for basic NAT
-    try vfkit_args.append(allocator, "--device");
-    try vfkit_args.append(allocator, "virtio-net,nat");
-
-    // Add port forwarding rules if any ports are mapped
-    // vfkit uses --publish flag for port forwarding: --publish HOST:CONTAINER/PROTOCOL
-    for (port_mappings) |port| {
-        const proto_str: []const u8 = if (port.protocol == .udp) "udp" else "tcp";
-        const publish_arg = try std.fmt.allocPrint(
-            allocator,
-            "{d}:{d}/{s}",
-            .{ port.host_port, port.container_port, proto_str },
-        );
-        try allocs_to_free.append(allocator, publish_arg);
-        try vfkit_args.append(allocator, "--publish");
-        try vfkit_args.append(allocator, publish_arg);
-    }
-
-    // Add serial console device for output
-    try vfkit_args.append(allocator, "--device");
-    try vfkit_args.append(allocator, "virtio-serial,stdio");
-
-    // Execute vfkit
-    var child = std.process.Child.init(vfkit_args.items, allocator);
-    child.stdin_behavior = .Inherit;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-
-    try child.spawn();
-    const term = try child.wait();
-
-    return switch (term) {
-        .Exited => |code| code,
-        .Signal => |sig| @truncate(128 +% sig),
-        else => 1,
-    };
-}
-
 /// Run using Lima (Linux virtual machines on macOS)
 /// Lima provides a seamless Linux VM experience with automatic file sharing.
 /// Resource limits are applied inside the Linux VM using cgroup v2.
@@ -939,11 +468,15 @@ pub fn runWithLima(
     volumes: []const VolumePair,
     port_mappings: []const PortMapping,
     rootless: bool,
-) !u8 {
-    return runWithLimaEx(allocator, "", rootfs_path, command, env_vars, volumes, port_mappings, rootless, null);
+    detach: bool,
+    restart_policy: config_mod.Config.RestartPolicy,
+    stdout_path: ?[]const u8,
+    stderr_path: ?[]const u8,
+) !RunResult {
+    return runWithLimaEx(allocator, "", rootfs_path, command, env_vars, volumes, port_mappings, rootless, detach, restart_policy, null, null, stdout_path, stderr_path);
 }
 
-/// Extended Lima runner with resource limits support
+/// Extended Lima runner with resource limits and LSM support
 pub fn runWithLimaEx(
     allocator: std.mem.Allocator,
     _: []const u8, // kernel_path - Lima manages its own kernel
@@ -953,36 +486,44 @@ pub fn runWithLimaEx(
     volumes: []const VolumePair,
     port_mappings: []const PortMapping,
     rootless: bool,
+    detach: bool,
+    restart_policy: config_mod.Config.RestartPolicy,
     resource_limits: ?*const ResourceLimitsConfig,
-) !u8 {
-    // First, ensure Lima VM "isolazi" exists and is running
-    // Try to start it (will succeed if already running)
-    const start_result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &[_][]const u8{ "limactl", "start", "isolazi" },
-    }) catch |err| {
-        // If VM doesn't exist, we need to create it first
-        if (err == error.FileNotFound) {
-            return VirtualizationError.VMCreationFailed;
-        }
-        // VM might not exist, try to create it
-        _ = try createLimaInstance(allocator);
-        // After creating, try to start again
-        return runWithLimaEx(allocator, "", rootfs_path, command, env_vars, volumes, port_mappings, rootless, resource_limits);
-    };
+    lsm_config: ?*const LSMConfig,
+    stdout_path: ?[]const u8,
+    stderr_path: ?[]const u8,
+) !RunResult {
+    // Check Lima status
+    const status = checkLimaStatus(allocator);
+    switch (status) {
+        .Running => {}, // Proceed
+        .NotExists => {
+            // Create and start the VM (shows progress to user)
+            std.debug.print("Creating Lima VM (this may take a few minutes)...\n", .{});
+            _ = try createLimaInstance(allocator);
+            return runWithLimaEx(allocator, "", rootfs_path, command, env_vars, volumes, port_mappings, rootless, detach, restart_policy, resource_limits, lsm_config, stdout_path, stderr_path);
+        },
 
-    if (start_result.term.Exited != 0) {
-        // VM might not exist, try to create it
-        _ = try createLimaInstance(allocator);
+        .Stopped, .Unknown => {
+            // VM exists but stopped (or unknown), start it with visible progress
+            std.debug.print("Starting Lima VM...\n", .{});
+            try startLimaWithProgress(allocator);
+        },
     }
-
-    allocator.free(start_result.stdout);
-    allocator.free(start_result.stderr);
 
     // Build the lima shell command
     // Lima automatically mounts the home directory, so we can access rootfs directly
     var lima_args: std.ArrayList([]const u8) = .empty;
     defer lima_args.deinit(allocator);
+
+    // Keep track of all allocations to free after spawn
+    var dynamic_allocs: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (dynamic_allocs.items) |alloc| {
+            allocator.free(alloc);
+        }
+        dynamic_allocs.deinit(allocator);
+    }
 
     try lima_args.append(allocator, "limactl");
     try lima_args.append(allocator, "shell");
@@ -1000,203 +541,292 @@ pub fn runWithLimaEx(
     try lima_args.append(allocator, "TERM=xterm");
     try lima_args.append(allocator, "LANG=C.UTF-8");
 
+    // Tag the process for easy stopping/lookup
+    const container_id_dir = std.fs.path.dirname(rootfs_path) orelse rootfs_path;
+    const parent_dir = std.fs.path.basename(container_id_dir);
+
     // Add user environment variables (these override defaults)
-    var env_allocs: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (env_allocs.items) |alloc| {
-            allocator.free(alloc);
-        }
-        env_allocs.deinit(allocator);
-    }
     for (env_vars) |env| {
         const env_str = try std.fmt.allocPrint(allocator, "{s}={s}", .{ env.key, env.value });
-        try env_allocs.append(allocator, env_str);
+        try dynamic_allocs.append(allocator, env_str);
         try lima_args.append(allocator, env_str);
     }
 
-    // Build a shell script to handle bind mounts for volumes
-    if (volumes.len > 0) {
-        try lima_args.append(allocator, "sh");
-        try lima_args.append(allocator, "-c");
+    // Build a shell script that handles all setup and runs the container command
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(allocator);
 
-        // Build script that creates bind mounts then runs chroot
-        var script: std.ArrayList(u8) = .empty;
-        defer script.deinit(allocator);
+    // Put the tag at the very beginning to be visible in ps output
+    try script.appendSlice(allocator, "# ISOLAZI_ID=");
+    try appendCommentText(&script, allocator, parent_dir);
+    try script.appendSlice(allocator, "\n");
 
-        // Create bind mounts for each volume
-        for (volumes) |vol| {
-            try script.appendSlice(allocator, "mkdir -p ");
-            try script.appendSlice(allocator, rootfs_path);
-            try script.appendSlice(allocator, vol.container_path);
-            try script.appendSlice(allocator, " && mount --bind ");
-            try script.appendSlice(allocator, vol.host_path);
-            try script.append(allocator, ' ');
-            try script.appendSlice(allocator, rootfs_path);
-            try script.appendSlice(allocator, vol.container_path);
-            try script.appendSlice(allocator, " && ");
-        }
+    // Mount essential filesystems
+    try script.appendSlice(allocator, "mkdir -p ");
+    try appendShellQuotedConcat(&script, allocator, rootfs_path, "/proc");
+    try script.append(allocator, ' ');
+    try appendShellQuotedConcat(&script, allocator, rootfs_path, "/sys");
+    try script.append(allocator, ' ');
+    try appendShellQuotedConcat(&script, allocator, rootfs_path, "/dev");
+    try script.appendSlice(allocator, " && ");
 
-        // Set up port forwarding using iptables DNAT
-        for (port_mappings) |port| {
-            try script.appendSlice(allocator, "iptables -t nat -A PREROUTING -p ");
-            if (port.protocol == .udp) {
-                try script.appendSlice(allocator, "udp");
-            } else {
-                try script.appendSlice(allocator, "tcp");
-            }
-            try script.appendSlice(allocator, " --dport ");
-            var host_port_buf: [8]u8 = undefined;
-            const host_port_str = std.fmt.bufPrint(&host_port_buf, "{d}", .{port.host_port}) catch "0";
-            try script.appendSlice(allocator, host_port_str);
-            try script.appendSlice(allocator, " -j REDIRECT --to-port ");
-            var cont_port_buf: [8]u8 = undefined;
-            const cont_port_str = std.fmt.bufPrint(&cont_port_buf, "{d}", .{port.container_port}) catch "0";
-            try script.appendSlice(allocator, cont_port_str);
-            try script.appendSlice(allocator, " 2>/dev/null; ");
-        }
+    // Create runtime directories
+    try script.appendSlice(allocator, "mkdir -p ");
+    try appendShellQuotedConcat(&script, allocator, rootfs_path, "/run");
+    try script.append(allocator, ' ');
+    try appendShellQuotedConcat(&script, allocator, rootfs_path, "/tmp");
+    try script.appendSlice(allocator, " && ");
 
-        // Add the unshare and chroot command with clean environment inside container
-        try script.appendSlice(allocator, "unshare --mount --uts --ipc --pid --fork --mount-proc");
-        if (rootless) {
-            try script.appendSlice(allocator, " --user --map-root-user");
-        }
-        try script.appendSlice(allocator, " chroot ");
-        try script.appendSlice(allocator, rootfs_path);
-        try script.appendSlice(allocator, " /usr/bin/env -i ");
+    // Create volume directories on host
+    for (volumes) |vol| {
+        try script.appendSlice(allocator, "mkdir -p ");
+        try appendShellQuotedConcat(&script, allocator, rootfs_path, vol.container_path);
+        try script.appendSlice(allocator, " && ");
+    }
 
-        // Set minimal required environment inside container
-        try script.appendSlice(allocator, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ");
-        try script.appendSlice(allocator, "HOME=/root ");
-        try script.appendSlice(allocator, "TERM=xterm ");
-        try script.appendSlice(allocator, "LANG=C.UTF-8 ");
+    // Set up port forwarding using iptables DNAT (for when host_port != container_port)
+    for (port_mappings) |port| {
+        if (port.host_port == port.container_port) continue;
+        const proto_str = if (port.protocol == .udp) "udp" else "tcp";
+        var host_port_buf: [8]u8 = undefined;
+        const host_port_str = std.fmt.bufPrint(&host_port_buf, "{d}", .{port.host_port}) catch "0";
+        var cont_port_buf: [8]u8 = undefined;
+        const cont_port_str = std.fmt.bufPrint(&cont_port_buf, "{d}", .{port.container_port}) catch "0";
 
-        // Add user env vars inside container
-        for (env_vars) |env| {
-            try script.appendSlice(allocator, env.key);
-            try script.append(allocator, '=');
-            try script.appendSlice(allocator, env.value);
-            try script.append(allocator, ' ');
-        }
+        // PREROUTING rule for incoming traffic
+        try script.appendSlice(allocator, "iptables -t nat -A PREROUTING -p ");
+        try script.appendSlice(allocator, proto_str);
+        try script.appendSlice(allocator, " --dport ");
+        try script.appendSlice(allocator, host_port_str);
+        try script.appendSlice(allocator, " -j REDIRECT --to-port ");
+        try script.appendSlice(allocator, cont_port_str);
+        try script.appendSlice(allocator, " 2>/dev/null; ");
 
-        // Add the command
-        for (command) |arg| {
-            try script.appendSlice(allocator, arg);
-            try script.append(allocator, ' ');
-        }
+        // OUTPUT rule for localhost traffic
+        try script.appendSlice(allocator, "iptables -t nat -A OUTPUT -p ");
+        try script.appendSlice(allocator, proto_str);
+        try script.appendSlice(allocator, " --dport ");
+        try script.appendSlice(allocator, host_port_str);
+        try script.appendSlice(allocator, " -j REDIRECT --to-port ");
+        try script.appendSlice(allocator, cont_port_str);
+        try script.appendSlice(allocator, " 2>/dev/null; ");
+    }
 
-        const script_str = try allocator.dupe(u8, script.items);
-        defer allocator.free(script_str);
-        try lima_args.append(allocator, script_str);
-    } else if (port_mappings.len > 0) {
-        // Use script approach for port forwarding even without volumes
-        try lima_args.append(allocator, "sh");
-        try lima_args.append(allocator, "-c");
+    // Write setup script for inside the namespace
+    const setup_script_path = try std.fmt.allocPrint(allocator, "{s}/setup.sh", .{container_id_dir});
+    try dynamic_allocs.append(allocator, setup_script_path);
 
-        var script: std.ArrayList(u8) = .empty;
-        defer script.deinit(allocator);
+    var setup_script: std.ArrayList(u8) = .empty;
+    defer setup_script.deinit(allocator);
 
-        // Set up port forwarding using iptables DNAT
-        for (port_mappings) |port| {
-            try script.appendSlice(allocator, "iptables -t nat -A PREROUTING -p ");
-            if (port.protocol == .udp) {
-                try script.appendSlice(allocator, "udp");
-            } else {
-                try script.appendSlice(allocator, "tcp");
-            }
-            try script.appendSlice(allocator, " --dport ");
-            var host_port_buf: [8]u8 = undefined;
-            const host_port_str = std.fmt.bufPrint(&host_port_buf, "{d}", .{port.host_port}) catch "0";
-            try script.appendSlice(allocator, host_port_str);
-            try script.appendSlice(allocator, " -j REDIRECT --to-port ");
-            var cont_port_buf: [8]u8 = undefined;
-            const cont_port_str = std.fmt.bufPrint(&cont_port_buf, "{d}", .{port.container_port}) catch "0";
-            try script.appendSlice(allocator, cont_port_str);
-            try script.appendSlice(allocator, " 2>/dev/null; ");
-        }
+    try setup_script.appendSlice(allocator, "#!/bin/sh\n");
 
-        // Add the unshare and chroot command with clean environment inside container
-        try script.appendSlice(allocator, "unshare --mount --uts --ipc --pid --fork --mount-proc");
-        if (rootless) {
-            try script.appendSlice(allocator, " --user --map-root-user");
-        }
-        try script.appendSlice(allocator, " chroot ");
-        try script.appendSlice(allocator, rootfs_path);
-        try script.appendSlice(allocator, " /usr/bin/env -i ");
+    // Safety: prevent propagation back to host
+    try setup_script.appendSlice(allocator, "mount --make-rprivate /\n");
 
-        // Set minimal required environment inside container
-        try script.appendSlice(allocator, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ");
-        try script.appendSlice(allocator, "HOME=/root ");
-        try script.appendSlice(allocator, "TERM=xterm ");
-        try script.appendSlice(allocator, "LANG=C.UTF-8 ");
+    // Mount proc (which unshare --mount-proc mounted to /proc in new ns) to destination
+    try setup_script.appendSlice(allocator, "mount --bind /proc ");
+    try appendShellQuotedConcat(&setup_script, allocator, rootfs_path, "/proc");
+    try setup_script.append(allocator, '\n');
 
-        // Add user env vars inside container
-        for (env_vars) |env| {
-            try script.appendSlice(allocator, env.key);
-            try script.append(allocator, '=');
-            try script.appendSlice(allocator, env.value);
-            try script.append(allocator, ' ');
-        }
+    // Mount sysfs
+    try setup_script.appendSlice(allocator, "mount -t sysfs sysfs ");
+    try appendShellQuotedConcat(&setup_script, allocator, rootfs_path, "/sys");
+    try setup_script.append(allocator, '\n');
 
-        // Add the command
-        for (command) |arg| {
-            try script.appendSlice(allocator, arg);
-            try script.append(allocator, ' ');
-        }
+    // Mount dev
+    try setup_script.appendSlice(allocator, "mount --bind /dev ");
+    try appendShellQuotedConcat(&setup_script, allocator, rootfs_path, "/dev");
+    try setup_script.append(allocator, '\n');
 
-        const script_str = try allocator.dupe(u8, script.items);
-        defer allocator.free(script_str);
-        try lima_args.append(allocator, script_str);
+    // Mount tmpfs run
+    try setup_script.appendSlice(allocator, "mount -t tmpfs tmpfs ");
+    try appendShellQuotedConcat(&setup_script, allocator, rootfs_path, "/run");
+    try setup_script.append(allocator, '\n');
+
+    // Mount tmpfs tmp
+    try setup_script.appendSlice(allocator, "mount -t tmpfs tmpfs ");
+    try appendShellQuotedConcat(&setup_script, allocator, rootfs_path, "/tmp");
+    try setup_script.append(allocator, '\n');
+
+    // Handle volume mounts
+    for (volumes) |vol| {
+        try setup_script.appendSlice(allocator, "mount --bind ");
+        try appendShellQuoted(&setup_script, allocator, vol.host_path);
+        try setup_script.append(allocator, ' ');
+        try appendShellQuotedConcat(&setup_script, allocator, rootfs_path, vol.container_path);
+        try setup_script.append(allocator, '\n');
+    }
+
+    // Add LSM configuration setup
+    if (lsm_config) |lsm| {
+        try lsm.toShellScript(&setup_script, allocator);
     } else {
-        try lima_args.append(allocator, "unshare");
-        try lima_args.append(allocator, "--mount");
-        try lima_args.append(allocator, "--uts");
-        try lima_args.append(allocator, "--ipc");
-        try lima_args.append(allocator, "--pid");
-        try lima_args.append(allocator, "--fork");
-        try lima_args.append(allocator, "--mount-proc");
-        // Add user namespace for rootless containers
-        if (rootless) {
-            try lima_args.append(allocator, "--user");
-            try lima_args.append(allocator, "--map-root-user");
-        }
-        try lima_args.append(allocator, "chroot");
-        try lima_args.append(allocator, rootfs_path);
-        try lima_args.append(allocator, "/usr/bin/env");
-        try lima_args.append(allocator, "-i");
+        try setup_script.appendSlice(allocator, "AA_EXEC_PREFIX=\"\"; RUNCON_PREFIX=\"\";\n");
+    }
 
-        // Set minimal required environment inside container
-        try lima_args.append(allocator, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
-        try lima_args.append(allocator, "HOME=/root");
-        try lima_args.append(allocator, "TERM=xterm");
-        try lima_args.append(allocator, "LANG=C.UTF-8");
+    // Exec chroot with LSM wrappers
+    try setup_script.appendSlice(allocator, "exec $AA_EXEC_PREFIX $RUNCON_PREFIX chroot ");
+    try appendShellQuoted(&setup_script, allocator, rootfs_path);
+    try setup_script.appendSlice(allocator, " /usr/bin/env ");
+    try appendShellQuoted(&setup_script, allocator, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/lib/postgresql/17/bin:/usr/lib/postgresql/16/bin:/usr/lib/postgresql/15/bin:/opt/rabbitmq/sbin:/usr/lib/rabbitmq/bin:/opt/erlang/bin");
+    try setup_script.append(allocator, ' ');
 
-        // Add user env vars
-        for (env_vars) |env| {
-            const env_str = try std.fmt.allocPrint(allocator, "{s}={s}", .{ env.key, env.value });
-            try env_allocs.append(allocator, env_str);
-            try lima_args.append(allocator, env_str);
+    // Add env vars
+    for (env_vars) |env| {
+        try appendShellQuotedEnv(&setup_script, allocator, env.key, env.value);
+        try setup_script.append(allocator, ' ');
+    }
+
+    // Add the command
+    for (command) |arg| {
+        try appendShellQuoted(&setup_script, allocator, arg);
+        try setup_script.append(allocator, ' ');
+    }
+
+    const setup_file = try std.fs.cwd().createFile(setup_script_path, .{ .mode = 0o755 });
+    defer setup_file.close();
+    try setup_file.writeAll(setup_script.items);
+
+    // Finalize main run script
+    try script.appendSlice(allocator, "unshare --mount --uts --ipc --pid --fork --mount-proc -- /bin/sh ");
+    try appendShellQuoted(&script, allocator, setup_script_path);
+
+    // Write script to file
+    const run_script_path = try std.fmt.allocPrint(allocator, "{s}/run.sh", .{container_id_dir});
+    try dynamic_allocs.append(allocator, run_script_path);
+    const run_file = try std.fs.cwd().createFile(run_script_path, .{ .mode = 0o755 });
+    defer run_file.close();
+    try run_file.writeAll(script.items);
+
+    // Now construct the execution command based on restart policy
+    if (restart_policy == .no) {
+        try lima_args.append(allocator, "sh");
+        try lima_args.append(allocator, run_script_path);
+    } else {
+        // Use systemd-run
+        try lima_args.append(allocator, "systemd-run");
+
+        // Unit name: isolazi-<id>
+        const unit_name = try std.fmt.allocPrint(allocator, "isolazi-{s}", .{parent_dir});
+        try dynamic_allocs.append(allocator, unit_name);
+        try lima_args.append(allocator, try std.fmt.allocPrint(allocator, "--unit={s}", .{unit_name}));
+        try dynamic_allocs.append(allocator, lima_args.items[lima_args.items.len - 1]);
+
+        try lima_args.append(allocator, "--service-type=simple");
+
+        // Restart policy
+        // systemd-run uses --property=Restart=... for transient units
+        // Mapping:
+        // no -> no
+        // always -> always
+        // on-failure -> on-failure
+        // unless-stopped -> always (systemd doesn't have unless-stopped, but strict always behaves similarly for units)
+        const policy_str = switch (restart_policy) {
+            .no => "no",
+            .always => "always",
+            .on_failure => "on-failure",
+            .unless_stopped => "always",
+        };
+        try lima_args.append(allocator, try std.fmt.allocPrint(allocator, "--property=Restart={s}", .{policy_str}));
+        try dynamic_allocs.append(allocator, lima_args.items[lima_args.items.len - 1]);
+
+        // Default TasksMax might be too low for some containers/distros
+        try lima_args.append(allocator, "--property=TasksMax=infinity");
+        try lima_args.append(allocator, "--property=Delegate=yes");
+        try lima_args.append(allocator, "--property=LimitNOFILE=infinity");
+        try lima_args.append(allocator, "--property=LimitNPROC=infinity");
+
+        // Working directory (rootfs? or container dir?)
+        // Let's use container dir so we can find things if needed
+        try lima_args.append(allocator, try std.fmt.allocPrint(allocator, "--working-directory={s}", .{container_id_dir}));
+        try dynamic_allocs.append(allocator, lima_args.items[lima_args.items.len - 1]);
+
+        // Logs: Use strict file path for output logging.
+        // systemd-run doesn't support -p StandardOutput=file:... easily with appending,
+        // but StandardOutput=append:/path works in recent systemd.
+        // Lima usually runs recent Ubuntu (24.04), so it should work.
+        // We need to ensure the path is correct. stdout_path passed here is relative or absolute on host.
+        // Lima mounts home, so if log path is in home, it works.
+        // However, stdout_path is optional.
+
+        if (stdout_path) |path| {
+            try lima_args.append(allocator, try std.fmt.allocPrint(allocator, "--property=StandardOutput=append:{s}", .{path}));
+            try dynamic_allocs.append(allocator, lima_args.items[lima_args.items.len - 1]);
         }
 
-        // Add the command
-        for (command) |arg| {
-            try lima_args.append(allocator, arg);
+        if (stderr_path) |path| {
+            try lima_args.append(allocator, try std.fmt.allocPrint(allocator, "--property=StandardError=append:{s}", .{path}));
+            try dynamic_allocs.append(allocator, lima_args.items[lima_args.items.len - 1]);
         }
+
+        // Collect logs/status
+        // Note: With StandardOutput=file, --collect might not be strict requirement for logs,
+        // but it helps keep the unit loaded for status check.
+        try lima_args.append(allocator, "--collect");
+
+        // The command to run
+        try lima_args.append(allocator, "--");
+        try lima_args.append(allocator, "sh");
+        try lima_args.append(allocator, run_script_path);
     }
 
     // Execute via Lima
     var child = std.process.Child.init(lima_args.items, allocator);
-    child.stdin_behavior = .Inherit;
+
+    child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Inherit;
     child.stderr_behavior = .Inherit;
 
-    try child.spawn();
-    const term = try child.wait();
+    if (!detach) {
+        child.stdin_behavior = .Inherit;
+    }
 
-    return switch (term) {
-        .Exited => |code| code,
-        .Signal => |sig| @truncate(128 +% sig),
-        else => 1,
-    };
+    // Save current stdout/stderr to restore later
+    const saved_stdout = try std.posix.dup(std.posix.STDOUT_FILENO);
+    defer std.posix.close(saved_stdout);
+    const saved_stderr = try std.posix.dup(std.posix.STDERR_FILENO);
+    defer std.posix.close(saved_stderr);
+
+    // Redirect stdout
+    if (stdout_path) |path| {
+        const f = try std.fs.cwd().createFile(path, .{ .truncate = false });
+        defer f.close();
+        try std.posix.dup2(f.handle, std.posix.STDOUT_FILENO);
+    } else if (detach) {
+        const null_fd = try std.posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0);
+        defer std.posix.close(null_fd);
+        try std.posix.dup2(null_fd, std.posix.STDOUT_FILENO);
+    }
+
+    // Redirect stderr
+    if (stderr_path) |path| {
+        const f = try std.fs.cwd().createFile(path, .{ .truncate = false });
+        defer f.close();
+        try std.posix.dup2(f.handle, std.posix.STDERR_FILENO);
+    } else if (detach) {
+        const null_fd = try std.posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0);
+        defer std.posix.close(null_fd);
+        try std.posix.dup2(null_fd, std.posix.STDERR_FILENO);
+    }
+
+    try child.spawn();
+
+    // Restore original stdout/stderr for parent
+    try std.posix.dup2(saved_stdout, std.posix.STDOUT_FILENO);
+    try std.posix.dup2(saved_stderr, std.posix.STDERR_FILENO);
+
+    if (detach) {
+        return RunResult{ .exit_code = 0, .pid = child.id };
+    } else {
+        const term = try child.wait();
+        const exit_code: u8 = switch (term) {
+            .Exited => |code| code,
+            .Signal => |sig| @truncate(128 +% sig),
+            else => 1,
+        };
+        return RunResult{ .exit_code = exit_code, .pid = child.id };
+    }
 }
 
 /// Create a Lima instance configured for isolazi
@@ -1209,17 +839,25 @@ fn createLimaInstance(allocator: std.mem.Allocator) !void {
         \\    arch: "x86_64"
         \\  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
         \\    arch: "aarch64"
-        \\cpus: 2
-        \\memory: "2GiB"
-        \\disk: "10GiB"
+        \\cpus: 4
+        \\memory: "4GiB"
+        \\disk: "20GiB"
         \\mounts:
         \\  - location: "~"
         \\    writable: true
-        \\  - location: "/tmp/lima"
+        \\  - location: "/tmp/isolazi"
         \\    writable: true
+        \\provision:
+        \\  - mode: system
+        \\    script: |
+        \\      apt-get update && apt-get install -y iptables uidmap procps
         \\containerd:
         \\  system: false
         \\  user: false
+        \\portForwards:
+        \\  - guestIP: "0.0.0.0"
+        \\    guestPortRange: [1, 65535]
+        \\    hostIP: "127.0.0.1"
     ;
 
     // Write config to temporary file
@@ -1241,31 +879,119 @@ fn createLimaInstance(allocator: std.mem.Allocator) !void {
     defer file.close();
     try file.writeAll(lima_config);
 
-    // Create Lima instance
+    // Create Lima instance with visible output so user sees progress
+    {
+        var child = std.process.Child.init(
+            &[_][]const u8{ "limactl", "create", "--name=isolazi", "--tty=false", config_path },
+            allocator,
+        );
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Inherit;
+        child.stderr_behavior = .Inherit;
+        try child.spawn();
+        const term = try child.wait();
+        if (term.Exited != 0) {
+            return VirtualizationError.VMCreationFailed;
+        }
+    }
+
+    // Start the instance with visible output
+    try startLimaWithProgress(allocator);
+}
+
+/// Start Lima VM with stdout/stderr inherited so user sees boot progress.
+///
+/// We fork+setsid before exec so the spawned `limactl start` (and the
+/// `limactl hostagent` grandchild it leaves behind to supervise the VM)
+/// run in a new session with no controlling TTY. Without this, the
+/// hostagent inherits isolazi's controlling TTY and dies along with our
+/// process group when isolazi exits - leaving the VM stopped within
+/// seconds of `start` returning, which makes containers immediately
+/// report as "stopped" in `ps -a`.
+fn startLimaWithProgress(allocator: std.mem.Allocator) VirtualizationError!void {
+    const wait_exit_signal_mask = 0x7f;
+    const wait_exit_status_shift = 8;
+    const wait_exit_status_mask = 0xff;
+
+    // Build a null-terminated envp from std.os.environ.
+    const envp_buf = allocator.allocSentinel(?[*:0]const u8, std.os.environ.len, null) catch
+        return VirtualizationError.VMStartFailed;
+    defer allocator.free(envp_buf);
+    for (std.os.environ, 0..) |e, i| envp_buf[i] = e;
+
+    const pid = std.posix.fork() catch return VirtualizationError.VMStartFailed;
+    if (pid == 0) {
+        // Child: detach into a new session, then exec limactl. setsid()
+        // fails if we're already a process-group leader; ignore that.
+        _ = std.posix.setsid() catch {};
+        const argv = [_:null]?[*:0]const u8{ "limactl", "start", "isolazi" };
+        const exec_err = std.posix.execvpeZ("limactl", &argv, envp_buf.ptr);
+        std.debug.print("Error: failed to exec limactl: {s}\n", .{@errorName(exec_err)});
+        std.posix.exit(127);
+    }
+
+    // Parent: wait for `limactl start` to finish booting the VM.
+    const result = std.posix.waitpid(pid, 0);
+    const status = result.status;
+    // POSIX WIFEXITED + WEXITSTATUS (works on macOS and Linux).
+    const exited_normally = (status & wait_exit_signal_mask) == 0;
+    const exit_code = (status >> wait_exit_status_shift) & wait_exit_status_mask;
+    if (!exited_normally or exit_code != 0) {
+        return VirtualizationError.VMStartFailed;
+    }
+}
+
+pub fn stopInLima(allocator: std.mem.Allocator, container_id: []const u8) !void {
+    // 1. Try to stop systemd service first (if it exists)
+    // The unit name is isolazi-<id>
+    const systemctl_cmd = try std.fmt.allocPrint(allocator, "sudo systemctl stop isolazi-{s}", .{container_id});
+    defer allocator.free(systemctl_cmd);
+
+    const sc_res = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &[_][]const u8{ "limactl", "shell", "isolazi", "sh", "-c", systemctl_cmd },
+    });
+    if (sc_res) |res| {
+        allocator.free(res.stdout);
+        allocator.free(res.stderr);
+    } else |_| {}
+
+    // 2. Fallback: Find PIDs via /proc/*/environ using grep
+    // Use grep -a -l to find files containing the ID, then extract PID
+    const find_cmd = try std.fmt.allocPrint(allocator, "sudo grep -l -a 'ISOLAZI_ID={s}' /proc/[0-9]*/environ 2>/dev/null | cut -d/ -f3", .{container_id});
+    defer allocator.free(find_cmd);
+
     const result = std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &[_][]const u8{ "limactl", "create", "--name=isolazi", config_path },
-    }) catch return VirtualizationError.VMCreationFailed;
-
+        .argv = &[_][]const u8{ "limactl", "shell", "isolazi", "sh", "-c", find_cmd },
+    }) catch return;
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    if (result.term.Exited != 0) {
-        return VirtualizationError.VMCreationFailed;
+    var it = std.mem.tokenizeAny(u8, result.stdout, " \t\r\n");
+    while (it.next()) |pid_str| {
+        const kill_res = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &[_][]const u8{ "limactl", "shell", "isolazi", "sudo", "kill", "-TERM", pid_str },
+        }) catch continue;
+        allocator.free(kill_res.stdout);
+        allocator.free(kill_res.stderr);
     }
+}
 
-    // Start the instance
-    const start_result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &[_][]const u8{ "limactl", "start", "isolazi" },
-    }) catch return VirtualizationError.VMStartFailed;
-
-    defer allocator.free(start_result.stdout);
-    defer allocator.free(start_result.stderr);
-
-    if (start_result.term.Exited != 0) {
-        return VirtualizationError.VMStartFailed;
-    }
+/// Refresh Lima port forwarding by signaling the host agent to re-scan ports.
+/// This is called after stopping a container to ensure port bindings are released.
+pub fn refreshLimaPortForwarding(allocator: std.mem.Allocator) void {
+    _ = allocator;
+    // No-op on current Lima (VZ driver): the hostagent does NOT treat SIGHUP
+    // as a "rescan" signal - it terminates on SIGHUP, which tears down the
+    // whole VM and silently stops every container. The Lima guest agent
+    // already pushes port-mapping changes to the hostagent over its gRPC
+    // socket, so an explicit refresh is unnecessary here.
+    //
+    // Previously this sent `pkill -HUP -f 'limactl.*hostagent.*isolazi'`,
+    // which made `start` appear to succeed (state.json updated to "running")
+    // but `ps -a` immediately reported "stopped" because the VM was dead.
 }
 
 /// Stop the Lima instance
@@ -1281,18 +1007,198 @@ pub fn stopLimaInstance(allocator: std.mem.Allocator) !void {
 
 /// Check if Lima instance exists and is running
 pub fn isLimaRunning(allocator: std.mem.Allocator) bool {
+    return checkLimaStatus(allocator) == .Running;
+}
+
+/// Ensure the Lima VM is created and running
+pub fn ensureVMRunning(allocator: std.mem.Allocator) !void {
+    const status = checkLimaStatus(allocator);
+    switch (status) {
+        .Running => return,
+        .NotExists => {
+            // Create and start the VM (shows progress to user)
+            std.debug.print("Creating Lima VM (this may take a few minutes)...\n", .{});
+            try createLimaInstance(allocator);
+        },
+        .Stopped, .Unknown => {
+            // VM exists but stopped (or unknown), start with visible progress
+            std.debug.print("Starting Lima VM...\n", .{});
+            try startLimaWithProgress(allocator);
+        },
+    }
+}
+
+pub const LimaStatus = enum {
+    Running,
+    Stopped,
+    NotExists,
+    Unknown,
+};
+
+pub fn checkLimaStatus(allocator: std.mem.Allocator) LimaStatus {
     const result = std.process.Child.run(.{
         .allocator = allocator,
         .argv = &[_][]const u8{ "limactl", "list", "--format={{.Status}}", "isolazi" },
-    }) catch return false;
-
+    }) catch return .Unknown;
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
     if (result.term.Exited != 0) {
-        return false;
+        return .NotExists;
     }
 
     const status = std.mem.trim(u8, result.stdout, " \t\r\n");
-    return std.mem.eql(u8, status, "Running");
+    if (std.mem.eql(u8, status, "Running")) return .Running;
+    if (std.mem.eql(u8, status, "Stopped")) return .Stopped;
+    return .Unknown; // e.g. "Starting"
+}
+
+/// Start a stopped container by re-executing its run.sh script within Lima
+pub fn startContainer(
+    allocator: std.mem.Allocator,
+    container_id: []const u8,
+    info: *const @import("../container/state.zig").ContainerInfo,
+) !void {
+    // Ensure VM is running
+    try ensureVMRunning(allocator);
+
+    // Get home directory for constructing paths
+    const home = std.process.getEnvVarOwned(allocator, "HOME") catch {
+        return VirtualizationError.ConfigurationInvalid;
+    };
+    defer allocator.free(home);
+
+    // Construct the run script path
+    const run_script_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/.isolazi/containers/{s}/run.sh",
+        .{ home, container_id },
+    );
+    defer allocator.free(run_script_path);
+
+    // Verify script exists (via Lima test -f)
+    const check_cmd = try std.fmt.allocPrint(allocator, "test -f \"{s}\"", .{run_script_path});
+    defer allocator.free(check_cmd);
+
+    const check_result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &[_][]const u8{ "limactl", "shell", "isolazi", "sh", "-c", check_cmd },
+    }) catch return VirtualizationError.CommandFailed;
+    defer allocator.free(check_result.stdout);
+    defer allocator.free(check_result.stderr);
+
+    if (check_result.term.Exited != 0) {
+        return VirtualizationError.ConfigurationInvalid; // run.sh doesn't exist
+    }
+
+    // Execute the run script based on restart policy
+    var lima_args: std.ArrayList([]const u8) = .empty;
+    defer lima_args.deinit(allocator);
+
+    // Track dynamic allocations that need cleanup after run()
+    var dynamic_allocs: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (dynamic_allocs.items) |ptr| allocator.free(ptr);
+        dynamic_allocs.deinit(allocator);
+    }
+
+    // Build log path for output capture
+    const log_path = try std.fmt.allocPrint(allocator, "{s}/.isolazi/containers/{s}/stdout.log", .{ home, container_id });
+    try dynamic_allocs.append(allocator, log_path);
+
+    if (info.restart_policy == .no) {
+        // Simple execution - run in background via sh -c
+        const bg_cmd = try std.fmt.allocPrint(allocator, "ISOLAZI_ID={s} sh \"{s}\" >> \"{s}\" 2>&1 &", .{ container_id, run_script_path, log_path });
+        try dynamic_allocs.append(allocator, bg_cmd);
+
+        try lima_args.append(allocator, "limactl");
+        try lima_args.append(allocator, "shell");
+        try lima_args.append(allocator, "isolazi");
+        try lima_args.append(allocator, "--");
+        try lima_args.append(allocator, "sudo");
+        try lima_args.append(allocator, "sh");
+        try lima_args.append(allocator, "-c");
+        try lima_args.append(allocator, bg_cmd);
+    } else {
+        // Use systemd-run for restart policies
+        try lima_args.append(allocator, "limactl");
+        try lima_args.append(allocator, "shell");
+        try lima_args.append(allocator, "isolazi");
+        try lima_args.append(allocator, "--");
+        try lima_args.append(allocator, "sudo");
+        try lima_args.append(allocator, "systemd-run");
+
+        const unit_name = try std.fmt.allocPrint(allocator, "--unit=isolazi-{s}", .{container_id});
+        try dynamic_allocs.append(allocator, unit_name);
+        try lima_args.append(allocator, unit_name);
+
+        try lima_args.append(allocator, "--service-type=simple");
+
+        const policy_str = switch (info.restart_policy) {
+            .no => "no",
+            .always => "always",
+            .on_failure => "on-failure",
+            .unless_stopped => "always",
+        };
+        const restart_prop = try std.fmt.allocPrint(allocator, "--property=Restart={s}", .{policy_str});
+        try dynamic_allocs.append(allocator, restart_prop);
+        try lima_args.append(allocator, restart_prop);
+
+        try lima_args.append(allocator, "--property=TasksMax=infinity");
+        try lima_args.append(allocator, "--property=Delegate=yes");
+        try lima_args.append(allocator, "--property=LimitNOFILE=infinity");
+        try lima_args.append(allocator, "--property=LimitNPROC=infinity");
+
+        // Pass ISOLAZI_ID to the service process for liveness detection
+        const setenv_arg = try std.fmt.allocPrint(allocator, "--setenv=ISOLAZI_ID={s}", .{container_id});
+        try dynamic_allocs.append(allocator, setenv_arg);
+        try lima_args.append(allocator, setenv_arg);
+
+        // Direct service output to log file
+        const stdout_prop = try std.fmt.allocPrint(allocator, "--property=StandardOutput=append:{s}", .{log_path});
+        try dynamic_allocs.append(allocator, stdout_prop);
+        try lima_args.append(allocator, stdout_prop);
+
+        const stderr_prop = try std.fmt.allocPrint(allocator, "--property=StandardError=append:{s}", .{log_path});
+        try dynamic_allocs.append(allocator, stderr_prop);
+        try lima_args.append(allocator, stderr_prop);
+
+        // Keep unit around after exit for status inspection
+        try lima_args.append(allocator, "--collect");
+
+        // Separator between systemd-run options and the command
+        try lima_args.append(allocator, "--");
+        try lima_args.append(allocator, "sh");
+        try lima_args.append(allocator, run_script_path);
+    }
+
+    // Execute
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = lima_args.items,
+    }) catch return VirtualizationError.CommandFailed;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    // Check if the command actually succeeded
+    if (result.term.Exited != 0) {
+        std.debug.print("Error: container start failed (exit {d})\n", .{result.term.Exited});
+        if (result.stderr.len > 0) {
+            std.debug.print("{s}\n", .{result.stderr});
+        }
+        return VirtualizationError.CommandFailed;
+    }
+
+    // Update container state via ContainerManager
+    var manager = @import("../container/state.zig").ContainerManager.init(allocator) catch {
+        return VirtualizationError.ConfigurationInvalid;
+    };
+    defer manager.deinit();
+
+    manager.updateState(container_id, .running, null, null) catch {};
+
+    // Refresh port forwarding to re-establish bindings
+    if (info.ports.len > 0) {
+        refreshLimaPortForwarding(allocator);
+    }
 }

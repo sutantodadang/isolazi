@@ -20,7 +20,7 @@ const runtime_mod = @import("../runtime/mod.zig");
 const Config = config_mod.Config;
 
 /// CLI version string
-pub const VERSION = "0.1.0";
+pub const VERSION = "0.2.12";
 
 /// CLI error types
 pub const CliError = error{
@@ -90,15 +90,43 @@ pub const Command = union(enum) {
     pull: PullCommand,
     exec: ExecCommand,
     logs: LogsCommand,
+    prune: PruneCommand,
+    ps: PsCommand,
+    start: StartCommand,
+    stop: StopCommand,
+    rm: RmCommand,
+    inspect: InspectCommand,
+    create: CreateCommand,
+    build: BuildCommand,
     images: void,
     version: void,
     help: void,
+    compose: ComposeCommand,
+};
+
+/// Arguments for the 'compose' command
+pub const ComposeCommand = struct {
+    op: Operation,
+    file: []const u8 = "docker-compose.yml",
+    detach: bool = false,
+    follow: bool = false,
+    tail: usize = 0,
+    pub const Operation = enum {
+        up,
+        down,
+        ps,
+        logs,
+        stop,
+        restart,
+        pull,
+        config,
+    };
 };
 
 /// Arguments for the 'run' command
 pub const RunCommand = struct {
     rootfs: []const u8,
-    command: []const u8,
+    command: ?[]const u8 = null, // Optional - uses image default CMD if not specified
     args: []const []const u8,
     hostname: ?[]const u8 = null,
     cwd: ?[]const u8 = null,
@@ -108,9 +136,22 @@ pub const RunCommand = struct {
     volumes: []const VolumeMount = &[_]VolumeMount{},
     ports: []const PortMap = &[_]PortMap{},
     detach: bool = false, // Run container in background
+    restart_policy: config_mod.Config.RestartPolicy = .no, // Restart policy
+    name: ?[]const u8 = null, // Custom container name
     rootless: bool = false, // Enable rootless mode (user namespace)
     uid_maps: []const IdMap = &[_]IdMap{}, // Custom UID mappings
     gid_maps: []const IdMap = &[_]IdMap{}, // Custom GID mappings
+
+    parsed_env_vars: [MAX_ENV_VARS]EnvVar = undefined,
+    parsed_env_vars_count: usize = 0,
+    parsed_volumes: [MAX_VOLUMES]VolumeMount = undefined,
+    parsed_volumes_count: usize = 0,
+    parsed_ports: [MAX_PORTS]PortMap = undefined,
+    parsed_ports_count: usize = 0,
+    parsed_uid_maps: [MAX_ID_MAPPINGS]IdMap = undefined,
+    parsed_uid_maps_count: usize = 0,
+    parsed_gid_maps: [MAX_ID_MAPPINGS]IdMap = undefined,
+    parsed_gid_maps_count: usize = 0,
 
     // Resource limits
     memory_limit: ?[]const u8 = null, // e.g., "512m", "1g"
@@ -127,12 +168,57 @@ pub const RunCommand = struct {
     seccomp_enabled: bool = true, // Enable seccomp filtering (default: true)
     seccomp_profile: SeccompProfile = .default_container, // Seccomp profile
 
+    // AppArmor Linux Security Module options
+    apparmor_enabled: bool = false, // Enable AppArmor profile
+    apparmor_profile: ?[]const u8 = null, // AppArmor profile name (null = default "isolazi-default")
+    apparmor_mode: AppArmorMode = .enforce, // AppArmor enforcement mode
+
+    // SELinux Linux Security Module options
+    selinux_enabled: bool = false, // Enable SELinux context
+    selinux_context: ?[]const u8 = null, // Custom SELinux context string
+    selinux_type: SELinuxType = .container_t, // SELinux type for container process
+    selinux_mcs_category1: ?u16 = null, // MCS category 1 for container isolation
+    selinux_mcs_category2: ?u16 = null, // MCS category 2 for container isolation
+
     pub const SeccompProfile = enum {
         disabled, // No seccomp filtering
         default_container, // Default container profile - blocks dangerous syscalls
         minimal, // Minimal profile - only blocks most critical syscalls
         strict, // Strict allowlist profile - blocks everything except explicitly allowed
     };
+
+    pub const AppArmorMode = enum {
+        unconfined, // No AppArmor restrictions
+        complain, // Log violations but don't block
+        enforce, // Block violations (default)
+    };
+
+    pub const SELinuxType = enum {
+        container_t, // Standard container (restricted)
+        spc_t, // Super-privileged container
+        unconfined_t, // Unconfined (no SELinux restrictions)
+        custom, // Custom context string provided
+    };
+
+    pub fn getEnvVars(self: *const RunCommand) []const EnvVar {
+        return if (self.env_vars.len > 0) self.env_vars else self.parsed_env_vars[0..self.parsed_env_vars_count];
+    }
+
+    pub fn getVolumes(self: *const RunCommand) []const VolumeMount {
+        return if (self.volumes.len > 0) self.volumes else self.parsed_volumes[0..self.parsed_volumes_count];
+    }
+
+    pub fn getPorts(self: *const RunCommand) []const PortMap {
+        return if (self.ports.len > 0) self.ports else self.parsed_ports[0..self.parsed_ports_count];
+    }
+
+    pub fn getUidMaps(self: *const RunCommand) []const IdMap {
+        return if (self.uid_maps.len > 0) self.uid_maps else self.parsed_uid_maps[0..self.parsed_uid_maps_count];
+    }
+
+    pub fn getGidMaps(self: *const RunCommand) []const IdMap {
+        return if (self.gid_maps.len > 0) self.gid_maps else self.parsed_gid_maps[0..self.parsed_gid_maps_count];
+    }
 };
 
 /// Arguments for the 'pull' command
@@ -163,6 +249,61 @@ pub const LogsCommand = struct {
     tail: usize = 0, // --tail N: show last N lines (0 = all)
     stdout_only: bool = false, // --stdout: show only stdout
     stderr_only: bool = false, // --stderr: show only stderr
+};
+
+/// Arguments for the 'prune' command
+/// Remove unused resources (containers/images)
+pub const PruneCommand = struct {
+    force: bool = false, // -f, --force: remove all containers (including running)
+};
+
+/// Arguments for the 'ps' command
+pub const PsCommand = struct {
+    all: bool = false, // -a, --all: show all containers
+};
+
+/// Arguments for the 'start' command
+pub const StartCommand = struct {
+    container_id: []const u8,
+};
+
+/// Arguments for the 'stop' command
+pub const StopCommand = struct {
+    container_id: []const u8,
+};
+
+/// Arguments for the 'rm' command
+pub const RmCommand = struct {
+    container_id: []const u8,
+    force: bool = false, // -f, --force: force removal
+};
+
+/// Arguments for the 'inspect' command
+pub const InspectCommand = struct {
+    container_id: []const u8,
+};
+
+/// Arguments for the 'create' command (placeholder for now)
+pub const CreateCommand = struct {
+    image: []const u8,
+    command: []const u8,
+    args: []const []const u8,
+    // Add other fields from RunCommand as needed
+};
+
+/// Arguments for the 'build' command
+pub const BuildCommand = struct {
+    context_path: []const u8,
+    file: ?[]const u8 = null,
+    tag: ?[]const u8 = null,
+    build_args: []const BuildArg = &[_]BuildArg{},
+    no_cache: bool = false,
+    quiet: bool = false,
+
+    pub const BuildArg = struct {
+        name: []const u8,
+        value: []const u8,
+    };
 };
 
 /// Parse command-line arguments.
@@ -214,6 +355,42 @@ pub fn parse(args: []const []const u8) CliError!Command {
         return parseLogsCommand(args[2..]);
     }
 
+    if (std.mem.eql(u8, cmd, "prune")) {
+        return parsePruneCommand(args[2..]);
+    }
+
+    if (std.mem.eql(u8, cmd, "ps")) {
+        return parsePsCommand(args[2..]);
+    }
+
+    if (std.mem.eql(u8, cmd, "start")) {
+        return parseStartCommand(args[2..]);
+    }
+
+    if (std.mem.eql(u8, cmd, "stop")) {
+        return parseStopCommand(args[2..]);
+    }
+
+    if (std.mem.eql(u8, cmd, "rm")) {
+        return parseRmCommand(args[2..]);
+    }
+
+    if (std.mem.eql(u8, cmd, "inspect")) {
+        return parseInspectCommand(args[2..]);
+    }
+
+    if (std.mem.eql(u8, cmd, "create")) {
+        return parseCreateCommand(args[2..]);
+    }
+
+    if (std.mem.eql(u8, cmd, "build")) {
+        return parseBuildCommand(args[2..]);
+    }
+
+    if (std.mem.eql(u8, cmd, "compose")) {
+        return parseComposeCommand(args[2..]);
+    }
+
     return CliError.UnknownCommand;
 }
 
@@ -221,25 +398,12 @@ pub fn parse(args: []const []const u8) CliError!Command {
 fn parseRunCommand(args: []const []const u8) CliError!Command {
     var run_cmd = RunCommand{
         .rootfs = undefined,
-        .command = undefined,
         .args = &[_][]const u8{},
     };
 
-    // Static arrays to store env vars, volumes, ports, and id maps (avoids allocation)
-    var env_vars_buf: [MAX_ENV_VARS]EnvVar = undefined;
-    var env_vars_count: usize = 0;
-    var volumes_buf: [MAX_VOLUMES]VolumeMount = undefined;
-    var volumes_count: usize = 0;
-    var ports_buf: [MAX_PORTS]PortMap = undefined;
-    var ports_count: usize = 0;
-    var uid_maps_buf: [MAX_ID_MAPPINGS]IdMap = undefined;
-    var uid_maps_count: usize = 0;
-    var gid_maps_buf: [MAX_ID_MAPPINGS]IdMap = undefined;
-    var gid_maps_count: usize = 0;
-
     var i: usize = 0;
     var positional_count: usize = 0;
-    var command_args_start: usize = 0;
+    var command_args_start: ?usize = null;
 
     // Parse options and positional arguments
     while (i < args.len) : (i += 1) {
@@ -263,32 +427,36 @@ fn parseRunCommand(args: []const []const u8) CliError!Command {
                 // Environment variable: -e KEY=VALUE
                 i += 1;
                 if (i >= args.len) return CliError.InvalidArgument;
-                if (env_vars_count >= MAX_ENV_VARS) return CliError.TooManyEnvVars;
+                if (run_cmd.parsed_env_vars_count >= MAX_ENV_VARS) return CliError.TooManyEnvVars;
 
                 const env_str = args[i];
                 const env_var = parseEnvVar(env_str) orelse return CliError.InvalidEnvVar;
-                env_vars_buf[env_vars_count] = env_var;
-                env_vars_count += 1;
+                run_cmd.parsed_env_vars[run_cmd.parsed_env_vars_count] = env_var;
+                run_cmd.parsed_env_vars_count += 1;
             } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--volume")) {
                 // Volume mount: -v /host/path:/container/path[:ro]
                 i += 1;
                 if (i >= args.len) return CliError.InvalidArgument;
-                if (volumes_count >= MAX_VOLUMES) return CliError.TooManyMounts;
+                if (run_cmd.parsed_volumes_count >= MAX_VOLUMES) return CliError.TooManyMounts;
 
                 const vol_str = args[i];
                 const volume = parseVolumeMount(vol_str) orelse return CliError.InvalidVolumeMount;
-                volumes_buf[volumes_count] = volume;
-                volumes_count += 1;
+                run_cmd.parsed_volumes[run_cmd.parsed_volumes_count] = volume;
+                run_cmd.parsed_volumes_count += 1;
             } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--port") or std.mem.eql(u8, arg, "--publish")) {
                 // Port mapping: -p host_port:container_port[/protocol]
                 i += 1;
                 if (i >= args.len) return CliError.InvalidArgument;
-                if (ports_count >= MAX_PORTS) return CliError.TooManyPorts;
+                if (run_cmd.parsed_ports_count >= MAX_PORTS) return CliError.TooManyPorts;
 
                 const port_str = args[i];
                 const port_map = parsePortMapping(port_str) orelse return CliError.InvalidPortMapping;
-                ports_buf[ports_count] = port_map;
-                ports_count += 1;
+                run_cmd.parsed_ports[run_cmd.parsed_ports_count] = port_map;
+                run_cmd.parsed_ports_count += 1;
+            } else if (std.mem.eql(u8, arg, "--name")) {
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                run_cmd.name = args[i];
             } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--detach")) {
                 // Detach mode
                 run_cmd.detach = true;
@@ -299,22 +467,22 @@ fn parseRunCommand(args: []const []const u8) CliError!Command {
                 // UID mapping: --uid-map container:host:count
                 i += 1;
                 if (i >= args.len) return CliError.InvalidArgument;
-                if (uid_maps_count >= MAX_ID_MAPPINGS) return CliError.InvalidArgument;
+                if (run_cmd.parsed_uid_maps_count >= MAX_ID_MAPPINGS) return CliError.InvalidArgument;
 
                 const map_str = args[i];
                 const uid_map = parseIdMap(map_str) orelse return CliError.InvalidArgument;
-                uid_maps_buf[uid_maps_count] = uid_map;
-                uid_maps_count += 1;
+                run_cmd.parsed_uid_maps[run_cmd.parsed_uid_maps_count] = uid_map;
+                run_cmd.parsed_uid_maps_count += 1;
             } else if (std.mem.eql(u8, arg, "--gid-map") or std.mem.eql(u8, arg, "--gidmap")) {
                 // GID mapping: --gid-map container:host:count
                 i += 1;
                 if (i >= args.len) return CliError.InvalidArgument;
-                if (gid_maps_count >= MAX_ID_MAPPINGS) return CliError.InvalidArgument;
+                if (run_cmd.parsed_gid_maps_count >= MAX_ID_MAPPINGS) return CliError.InvalidArgument;
 
                 const map_str = args[i];
                 const gid_map = parseIdMap(map_str) orelse return CliError.InvalidArgument;
-                gid_maps_buf[gid_maps_count] = gid_map;
-                gid_maps_count += 1;
+                run_cmd.parsed_gid_maps[run_cmd.parsed_gid_maps_count] = gid_map;
+                run_cmd.parsed_gid_maps_count += 1;
             } else if (std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--memory")) {
                 // Memory limit: --memory 512m
                 i += 1;
@@ -381,6 +549,146 @@ fn parseRunCommand(args: []const []const u8) CliError!Command {
                 } else {
                     return CliError.InvalidArgument;
                 }
+            } else if (std.mem.startsWith(u8, arg, "--apparmor=")) {
+                // AppArmor profile: --apparmor=<profile-name>
+                const profile_str = arg["--apparmor=".len..];
+                if (profile_str.len == 0) return CliError.InvalidArgument;
+                if (std.mem.eql(u8, profile_str, "unconfined") or std.mem.eql(u8, profile_str, "disabled") or std.mem.eql(u8, profile_str, "none")) {
+                    run_cmd.apparmor_enabled = false;
+                    run_cmd.apparmor_mode = .unconfined;
+                } else {
+                    run_cmd.apparmor_enabled = true;
+                    run_cmd.apparmor_profile = profile_str;
+                    run_cmd.apparmor_mode = .enforce;
+                }
+            } else if (std.mem.eql(u8, arg, "--apparmor")) {
+                // Enable AppArmor with the default profile.
+                // Use --apparmor=<profile> or --security-opt apparmor=<profile>
+                // to set a custom profile.
+                run_cmd.apparmor_enabled = true;
+                run_cmd.apparmor_mode = .enforce;
+            } else if (std.mem.eql(u8, arg, "--apparmor-mode")) {
+                // AppArmor mode: --apparmor-mode <enforce|complain|unconfined>
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                const mode_str = args[i];
+                if (std.mem.eql(u8, mode_str, "enforce") or std.mem.eql(u8, mode_str, "enforcing")) {
+                    run_cmd.apparmor_mode = .enforce;
+                } else if (std.mem.eql(u8, mode_str, "complain") or std.mem.eql(u8, mode_str, "permissive")) {
+                    run_cmd.apparmor_mode = .complain;
+                } else if (std.mem.eql(u8, mode_str, "unconfined") or std.mem.eql(u8, mode_str, "disabled")) {
+                    run_cmd.apparmor_enabled = false;
+                    run_cmd.apparmor_mode = .unconfined;
+                } else {
+                    return CliError.InvalidArgument;
+                }
+            } else if (std.mem.eql(u8, arg, "--no-apparmor") or std.mem.eql(u8, arg, "--disable-apparmor")) {
+                // Disable AppArmor
+                run_cmd.apparmor_enabled = false;
+                run_cmd.apparmor_mode = .unconfined;
+            } else if (std.mem.eql(u8, arg, "--security-opt")) {
+                // Docker-compatible security option: --security-opt <option>
+                // Supports: apparmor=<profile>, label=type:<type>, label=disable
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                const opt_str = args[i];
+                if (std.mem.startsWith(u8, opt_str, "apparmor=")) {
+                    const profile = opt_str[9..];
+                    if (std.mem.eql(u8, profile, "unconfined")) {
+                        run_cmd.apparmor_enabled = false;
+                        run_cmd.apparmor_mode = .unconfined;
+                    } else {
+                        run_cmd.apparmor_enabled = true;
+                        run_cmd.apparmor_profile = profile;
+                    }
+                } else if (std.mem.startsWith(u8, opt_str, "label=type:")) {
+                    // SELinux type: label=type:<type>
+                    const type_str = opt_str[11..];
+                    run_cmd.selinux_enabled = true;
+                    if (std.mem.eql(u8, type_str, "container_t")) {
+                        run_cmd.selinux_type = .container_t;
+                    } else if (std.mem.eql(u8, type_str, "spc_t")) {
+                        run_cmd.selinux_type = .spc_t;
+                    } else if (std.mem.eql(u8, type_str, "unconfined_t")) {
+                        run_cmd.selinux_type = .unconfined_t;
+                    } else {
+                        // Custom context
+                        run_cmd.selinux_type = .custom;
+                        run_cmd.selinux_context = type_str;
+                    }
+                } else if (std.mem.eql(u8, opt_str, "label=disable") or std.mem.eql(u8, opt_str, "label:disable")) {
+                    // Disable SELinux
+                    run_cmd.selinux_enabled = false;
+                    run_cmd.selinux_type = .unconfined_t;
+                } else if (std.mem.startsWith(u8, opt_str, "label=")) {
+                    // Generic label - treat as SELinux context
+                    run_cmd.selinux_enabled = true;
+                    run_cmd.selinux_context = opt_str[6..];
+                    run_cmd.selinux_type = .custom;
+                }
+            } else if (std.mem.eql(u8, arg, "--selinux") or std.mem.eql(u8, arg, "--selinux-context")) {
+                // SELinux context: --selinux <context>
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                const context_str = args[i];
+                if (std.mem.eql(u8, context_str, "unconfined") or std.mem.eql(u8, context_str, "disabled") or std.mem.eql(u8, context_str, "none")) {
+                    run_cmd.selinux_enabled = false;
+                    run_cmd.selinux_type = .unconfined_t;
+                } else {
+                    run_cmd.selinux_enabled = true;
+                    run_cmd.selinux_context = context_str;
+                    run_cmd.selinux_type = .custom;
+                }
+            } else if (std.mem.eql(u8, arg, "--selinux-type")) {
+                // SELinux type: --selinux-type <container_t|spc_t|unconfined_t>
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                const type_str = args[i];
+                run_cmd.selinux_enabled = true;
+                if (std.mem.eql(u8, type_str, "container_t") or std.mem.eql(u8, type_str, "container")) {
+                    run_cmd.selinux_type = .container_t;
+                } else if (std.mem.eql(u8, type_str, "spc_t") or std.mem.eql(u8, type_str, "super-privileged")) {
+                    run_cmd.selinux_type = .spc_t;
+                } else if (std.mem.eql(u8, type_str, "unconfined_t") or std.mem.eql(u8, type_str, "unconfined")) {
+                    run_cmd.selinux_enabled = false;
+                    run_cmd.selinux_type = .unconfined_t;
+                } else {
+                    return CliError.InvalidArgument;
+                }
+            } else if (std.mem.eql(u8, arg, "--selinux-mcs")) {
+                // SELinux MCS categories: --selinux-mcs <c1>,<c2>
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                const mcs_str = args[i];
+                // Parse "c1,c2" format
+                var iter = std.mem.splitScalar(u8, mcs_str, ',');
+                const cat1_str = iter.next() orelse return CliError.InvalidArgument;
+                const cat2_str = iter.next() orelse cat1_str;
+                run_cmd.selinux_enabled = true;
+                run_cmd.selinux_mcs_category1 = std.fmt.parseInt(u16, cat1_str, 10) catch return CliError.InvalidArgument;
+                run_cmd.selinux_mcs_category2 = std.fmt.parseInt(u16, cat2_str, 10) catch return CliError.InvalidArgument;
+            } else if (std.mem.eql(u8, arg, "--no-selinux") or std.mem.eql(u8, arg, "--disable-selinux")) {
+                // Disable SELinux
+                run_cmd.selinux_enabled = false;
+                run_cmd.selinux_type = .unconfined_t;
+            } else if (std.mem.eql(u8, arg, "--privileged")) {
+                // Privileged container: disable all security features
+                run_cmd.seccomp_enabled = false;
+                run_cmd.seccomp_profile = .disabled;
+                run_cmd.apparmor_enabled = false;
+                run_cmd.apparmor_mode = .unconfined;
+                run_cmd.selinux_enabled = false;
+                run_cmd.selinux_type = .unconfined_t;
+            } else if (std.mem.eql(u8, arg, "--restart")) {
+                // Restart policy: --restart <policy>
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                const policy_str = args[i];
+                if (config_mod.Config.RestartPolicy.fromString(policy_str)) |policy| {
+                    run_cmd.restart_policy = policy;
+                } else {
+                    return CliError.InvalidArgument;
+                }
             } else {
                 return CliError.InvalidArgument;
             }
@@ -392,39 +700,20 @@ fn parseRunCommand(args: []const []const u8) CliError!Command {
                 run_cmd.is_image = isImageReference(arg);
             } else if (positional_count == 1) {
                 run_cmd.command = arg;
-                command_args_start = i;
+                command_args_start = i + 1;
             }
             positional_count += 1;
         }
     }
 
-    // Store env vars, volumes, and ports in the command
-    if (env_vars_count > 0) {
-        run_cmd.env_vars = env_vars_buf[0..env_vars_count];
-    }
-    if (volumes_count > 0) {
-        run_cmd.volumes = volumes_buf[0..volumes_count];
-    }
-    if (ports_count > 0) {
-        run_cmd.ports = ports_buf[0..ports_count];
-    }
-    if (uid_maps_count > 0) {
-        run_cmd.uid_maps = uid_maps_buf[0..uid_maps_count];
-    }
-    if (gid_maps_count > 0) {
-        run_cmd.gid_maps = gid_maps_buf[0..gid_maps_count];
-    }
-
     if (positional_count < 1) {
         return CliError.MissingRootfs;
     }
-    if (positional_count < 2) {
-        return CliError.MissingCommand;
-    }
+    // Command is now optional - images with default CMD/ENTRYPOINT don't need one
 
-    // Set command args (including the command itself as argv[0])
-    if (command_args_start < args.len) {
-        run_cmd.args = args[command_args_start..];
+    // Set command args after the command token.
+    if (command_args_start) |start| {
+        run_cmd.args = args[start..];
     }
 
     return Command{ .run = run_cmd };
@@ -475,6 +764,80 @@ fn parseIdMap(s: []const u8) ?IdMap {
         .host_id = host_id,
         .count = count,
     };
+}
+
+/// Parse the 'compose' subcommand arguments
+fn parseComposeCommand(args: []const []const u8) CliError!Command {
+    // Parse global flags before subcommand (e.g., -f/--file)
+    var file: []const u8 = "docker-compose.yml";
+    var subcmd_idx: usize = 0;
+
+    // Scan for global flags before the subcommand
+    while (subcmd_idx < args.len) : (subcmd_idx += 1) {
+        const arg = args[subcmd_idx];
+        if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--file")) {
+            subcmd_idx += 1;
+            if (subcmd_idx >= args.len) return CliError.InvalidArgument;
+            file = args[subcmd_idx];
+        } else {
+            break; // First non-flag arg is the subcommand
+        }
+    }
+
+    if (subcmd_idx >= args.len) return CliError.NoCommand;
+
+    const subcmd = args[subcmd_idx];
+    var op: ComposeCommand.Operation = undefined;
+    if (std.mem.eql(u8, subcmd, "up")) {
+        op = .up;
+    } else if (std.mem.eql(u8, subcmd, "down")) {
+        op = .down;
+    } else if (std.mem.eql(u8, subcmd, "ps")) {
+        op = .ps;
+    } else if (std.mem.eql(u8, subcmd, "logs")) {
+        op = .logs;
+    } else if (std.mem.eql(u8, subcmd, "stop")) {
+        op = .stop;
+    } else if (std.mem.eql(u8, subcmd, "restart")) {
+        op = .restart;
+    } else if (std.mem.eql(u8, subcmd, "pull")) {
+        op = .pull;
+    } else if (std.mem.eql(u8, subcmd, "config")) {
+        op = .config;
+    } else {
+        return CliError.UnknownCommand;
+    }
+    var cmd = ComposeCommand{
+        .op = op,
+        .file = file,
+    };
+
+    // Parse subcommand-specific flags
+    var i: usize = subcmd_idx + 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--follow")) {
+            if (op == .logs) {
+                cmd.follow = true;
+            }
+        } else if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--file")) {
+            // -f after subcommand: --follow for logs, --file for everything else
+            if (op == .logs) {
+                cmd.follow = true;
+            } else {
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                cmd.file = args[i];
+            }
+        } else if (std.mem.eql(u8, arg, "-n") or std.mem.eql(u8, arg, "--tail")) {
+            i += 1;
+            if (i >= args.len) return CliError.InvalidArgument;
+            cmd.tail = std.fmt.parseInt(usize, args[i], 10) catch return CliError.InvalidArgument;
+        } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--detach")) {
+            cmd.detach = true;
+        }
+    }
+    return Command{ .compose = cmd };
 }
 
 /// Parse the 'exec' subcommand arguments.
@@ -613,6 +976,75 @@ fn parseLogsCommand(args: []const []const u8) CliError!Command {
     return Command{ .logs = logs_cmd };
 }
 
+/// Parse the 'prune' subcommand arguments.
+fn parsePruneCommand(args: []const []const u8) CliError!Command {
+    var prune_cmd = PruneCommand{};
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--force")) {
+            prune_cmd.force = true;
+        } else {
+            return CliError.InvalidArgument;
+        }
+    }
+
+    return Command{ .prune = prune_cmd };
+}
+
+fn parsePsCommand(args: []const []const u8) CliError!Command {
+    var cmd = PsCommand{};
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "-a") or std.mem.eql(u8, arg, "--all")) {
+            cmd.all = true;
+        }
+    }
+    return Command{ .ps = cmd };
+}
+
+fn parseStartCommand(args: []const []const u8) CliError!Command {
+    if (args.len < 1) return CliError.MissingContainerId;
+    return Command{ .start = .{ .container_id = args[0] } };
+}
+
+fn parseStopCommand(args: []const []const u8) CliError!Command {
+    if (args.len < 1) return CliError.MissingContainerId;
+    return Command{ .stop = .{ .container_id = args[0] } };
+}
+
+fn parseRmCommand(args: []const []const u8) CliError!Command {
+    if (args.len < 1) return CliError.MissingContainerId;
+    var cmd = RmCommand{ .container_id = undefined };
+    var found_id = false;
+
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--force")) {
+            cmd.force = true;
+        } else if (!found_id) {
+            cmd.container_id = arg;
+            found_id = true;
+        }
+    }
+    if (!found_id) return CliError.MissingContainerId;
+    return Command{ .rm = cmd };
+}
+
+fn parseInspectCommand(args: []const []const u8) CliError!Command {
+    if (args.len < 1) return CliError.MissingContainerId;
+    return Command{ .inspect = .{ .container_id = args[0] } };
+}
+
+fn parseCreateCommand(args: []const []const u8) CliError!Command {
+    // Basic implementation for now
+    if (args.len < 2) return CliError.MissingImage;
+    return Command{ .create = .{
+        .image = args[0],
+        .command = args[1],
+        .args = if (args.len > 2) args[2..] else &[_][]const u8{},
+    } };
+}
+
 /// Parse an environment variable string "KEY=VALUE"
 fn parseEnvVar(s: []const u8) ?EnvVar {
     const eq_pos = std.mem.indexOf(u8, s, "=") orelse return null;
@@ -715,9 +1147,15 @@ pub fn buildConfig(run_cmd: *const RunCommand) !Config {
     var cfg = try Config.init(run_cmd.rootfs);
 
     // Set command
-    try cfg.setCommand(run_cmd.command);
+    if (run_cmd.command) |cmd| {
+        try cfg.setCommand(cmd);
+        try cfg.addArg(cmd);
+    } else {
+        try cfg.setCommand("/bin/sh");
+        try cfg.addArg("/bin/sh");
+    }
 
-    // Set argv (including argv[0])
+    // Add remaining argv values (excluding argv[0], already set above).
     for (run_cmd.args) |arg| {
         try cfg.addArg(arg);
     }
@@ -732,19 +1170,24 @@ pub fn buildConfig(run_cmd: *const RunCommand) !Config {
     }
 
     // Copy environment variables
-    for (run_cmd.env_vars) |env| {
+    for (run_cmd.getEnvVars()) |env| {
         var buf: [4096]u8 = undefined;
         const env_str = std.fmt.bufPrint(&buf, "{s}={s}", .{ env.key, env.value }) catch continue;
         try cfg.addEnv(env_str);
     }
 
     // Copy volume mounts
-    for (run_cmd.volumes) |vol| {
+    for (run_cmd.getVolumes()) |vol| {
+        // Ensure host path exists (create directory if missing)
+        if (std.fs.cwd().access(vol.host_path, .{})) |_| {} else |err| switch (err) {
+            error.FileNotFound => std.fs.cwd().makePath(vol.host_path) catch return err,
+            else => return err,
+        }
         try cfg.addMount(vol.host_path, vol.container_path, vol.read_only);
     }
 
     // Copy port mappings
-    for (run_cmd.ports) |port| {
+    for (run_cmd.getPorts()) |port| {
         const protocol: config_mod.PortMapping.Protocol = if (port.protocol == .tcp) .tcp else .udp;
         try cfg.addPort(port.host_port, port.container_port, protocol);
     }
@@ -755,17 +1198,17 @@ pub fn buildConfig(run_cmd: *const RunCommand) !Config {
     }
 
     // Copy UID mappings
-    for (run_cmd.uid_maps) |uid_map| {
+    for (run_cmd.getUidMaps()) |uid_map| {
         try cfg.addUidMapping(uid_map.host_id, uid_map.container_id, uid_map.count);
     }
 
     // Copy GID mappings
-    for (run_cmd.gid_maps) |gid_map| {
+    for (run_cmd.getGidMaps()) |gid_map| {
         try cfg.addGidMapping(gid_map.host_id, gid_map.container_id, gid_map.count);
     }
 
     // If uid/gid maps provided but rootless not explicitly set, enable user namespace
-    if (run_cmd.uid_maps.len > 0 or run_cmd.gid_maps.len > 0) {
+    if (run_cmd.getUidMaps().len > 0 or run_cmd.getGidMaps().len > 0) {
         cfg.namespaces.user = true;
     }
 
@@ -821,7 +1264,7 @@ pub fn printHelp(writer: anytype) !void {
         \\    isolazi <COMMAND> [OPTIONS]
         \\
         \\COMMANDS:
-        \\    run [-d] <image> [command]       Run a command in a new container
+        \\    run [-d] [--name NAME] <image> [command]  Run a command in a new container
         \\    exec <container> <command>       Execute a command in a running container
         \\    logs [-f] <container>            Display container logs
         \\    create [--name NAME] <image>     Create a container without starting
@@ -832,12 +1275,15 @@ pub fn printHelp(writer: anytype) !void {
         \\    inspect <container>              Display container details
         \\    pull <image>                     Pull an image from a registry
         \\    images                           List cached images
-        \\    prune                            Remove all stopped containers and unused images
+        \\    prune [-f]                       Remove stopped containers and unused images
+        \\    compose <subcommand>              Manage multi-container applications
+        \\    update                           Update isolazi to the latest version
         \\    version                          Print version information
         \\    help                             Print this help message
         \\
         \\OPTIONS for 'run':
         \\    -d, --detach              Run container in background
+        \\    --name <name>             Assign a name to the container
         \\    -e, --env KEY=VALUE       Set environment variable (can use comma: KEY1=V1,KEY2=V2)
         \\    -v, --volume SRC:DST[:ro] Mount a volume (can be repeated)
         \\    -p, --port HOST:CONTAINER Publish port (can be repeated)
@@ -846,6 +1292,7 @@ pub fn printHelp(writer: anytype) !void {
         \\    --rootless                Enable rootless mode (user namespace)
         \\    --uid-map C:H[:N]         Map container UID C to host UID H (N count, default 1)
         \\    --gid-map C:H[:N]         Map container GID C to host GID H (N count, default 1)
+        \\    --restart <policy>        Restart policy (no|always|on-failure|unless-stopped)
         \\
         \\OPTIONS for 'exec':
         \\    -i, --interactive         Keep STDIN open
@@ -861,6 +1308,8 @@ pub fn printHelp(writer: anytype) !void {
         \\    -t, --timestamps          Show timestamps with each line
         \\    --stdout                  Show only stdout logs
         \\    --stderr                  Show only stderr logs
+        \\OPTIONS for 'prune':
+        \\    -f, --force               Remove all containers (including running)
         \\
         \\RESOURCE LIMITS:
         \\    -m, --memory <limit>      Memory limit (e.g., 512m, 1g, 2048k)
@@ -878,17 +1327,58 @@ pub fn printHelp(writer: anytype) !void {
         \\                              Profiles: default, minimal, strict, disabled
         \\    --no-seccomp              Disable seccomp filtering (same as --seccomp disabled)
         \\
+        \\    --apparmor                Enable AppArmor with default profile
+        \\    --apparmor=<profile>      AppArmor profile name
+        \\    --apparmor-mode <mode>    AppArmor mode: enforce, complain, unconfined
+        \\    --no-apparmor             Disable AppArmor enforcement
+        \\
+        \\    --selinux <context>       SELinux security context (full context string)
+        \\    --selinux-type <type>     SELinux type: container_t, spc_t, unconfined_t
+        \\    --selinux-mcs <c1>,<c2>   SELinux MCS categories for isolation (e.g., 100,200)
+        \\    --no-selinux              Disable SELinux enforcement
+        \\
+        \\    --security-opt <opt>      Docker-compatible security options:
+        \\                              apparmor=<profile>, label=type:<type>, label=disable
+        \\
+        \\    --privileged              Disable all security features (seccomp, AppArmor, SELinux)
+        \\
         \\    Seccomp Profiles:
         \\      default-container       Blocks dangerous syscalls (mount, ptrace, kexec, etc.)
         \\      minimal                 Only blocks critical syscalls (kexec, reboot, modules)
         \\      strict                  Allowlist mode - only basic syscalls permitted
         \\      disabled                No syscall filtering (less secure)
         \\
+        \\    AppArmor Modes:
+        \\      enforce                 Block and log policy violations (default)
+        \\      complain                Log violations but don't block (for debugging)
+        \\      unconfined              No AppArmor restrictions
+        \\
+        \\    SELinux Types:
+        \\      container_t             Standard container process (restricted, default)
+        \\      spc_t                   Super-privileged container (less restricted)
+        \\      unconfined_t            No SELinux restrictions
+        \\
         \\OPTIONS for 'ps':
         \\    -a, --all            Show all containers (default: only running)
         \\
         \\OPTIONS for 'rm':
         \\    -f, --force          Force remove running container
+        \\
+        \\COMPOSE SUBCOMMANDS:
+        \\    isolazi compose up [-d] [-f FILE]           Create and start services
+        \\    isolazi compose down [-f FILE]              Stop and remove services
+        \\    isolazi compose ps [-f FILE]                List running services
+        \\    isolazi compose logs [-f] [--tail N] [-f FILE]  View service logs
+        \\    isolazi compose stop [-f FILE]              Stop services
+        \\    isolazi compose restart [-f FILE]           Restart services
+        \\    isolazi compose pull [-f FILE]              Pull service images
+        \\    isolazi compose config [-f FILE]            Validate and print config
+        \\
+        \\OPTIONS for 'compose':
+        \\    -f, --file <path>         Compose file (default: docker-compose.yml)
+        \\    -d, --detach              Run services in background (up only)
+        \\    --follow                  Follow log output (logs only)
+        \\    --tail <N>                Number of log lines to show (logs only)
         \\
         \\IMAGE REFERENCES:
         \\    alpine                          Short name (defaults to docker.io)
@@ -908,11 +1398,17 @@ pub fn printHelp(writer: anytype) !void {
         \\    isolazi run -m 1g --cpu-weight 200 --io-weight 500 alpine /bin/sh
         \\    isolazi run --seccomp minimal alpine /bin/sh
         \\    isolazi run --no-seccomp alpine /bin/sh     # Less secure, for debugging
+        \\    isolazi run --apparmor alpine /bin/sh
+        \\    isolazi run --apparmor=myprofile --apparmor-mode complain alpine /bin/sh
+        \\    isolazi run --selinux-type container_t --selinux-mcs 100,200 alpine /bin/sh
+        \\    isolazi run --security-opt apparmor=isolazi-default alpine /bin/sh
+        \\    isolazi run --privileged alpine /bin/sh     # Disables all security features
         \\    isolazi create --name myapp alpine
         \\    isolazi start myapp
         \\    isolazi ps -a
         \\    isolazi stop myapp
         \\    isolazi prune
+        \\    isolazi prune -f
         \\    isolazi rm myapp
         \\    isolazi exec mycontainer /bin/sh
         \\    isolazi exec -it mycontainer /bin/bash
@@ -957,6 +1453,64 @@ pub fn printError(writer: anytype, err: CliError) !void {
     try writer.writeAll("Run 'isolazi help' for usage information.\n");
 }
 
+/// Maximum number of build arguments
+const MAX_BUILD_ARGS = 32;
+
+/// Parse the 'build' subcommand arguments.
+/// Usage: isolazi build [options] <context>
+fn parseBuildCommand(args: []const []const u8) CliError!Command {
+    var build_cmd = BuildCommand{
+        .context_path = ".",
+    };
+
+    var build_args_buf: [MAX_BUILD_ARGS]BuildCommand.BuildArg = undefined;
+    var build_args_count: usize = 0;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+
+        if (arg.len > 0 and arg[0] == '-') {
+            if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--file")) {
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                build_cmd.file = args[i];
+            } else if (std.mem.eql(u8, arg, "-t") or std.mem.eql(u8, arg, "--tag")) {
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                build_cmd.tag = args[i];
+            } else if (std.mem.eql(u8, arg, "--build-arg")) {
+                i += 1;
+                if (i >= args.len) return CliError.InvalidArgument;
+                if (build_args_count >= MAX_BUILD_ARGS) return CliError.InvalidArgument;
+                const arg_str = args[i];
+                if (std.mem.indexOf(u8, arg_str, "=")) |eq_pos| {
+                    build_args_buf[build_args_count] = .{
+                        .name = arg_str[0..eq_pos],
+                        .value = arg_str[eq_pos + 1 ..],
+                    };
+                    build_args_count += 1;
+                }
+            } else if (std.mem.eql(u8, arg, "--no-cache")) {
+                build_cmd.no_cache = true;
+            } else if (std.mem.eql(u8, arg, "-q") or std.mem.eql(u8, arg, "--quiet")) {
+                build_cmd.quiet = true;
+            } else {
+                return CliError.InvalidArgument;
+            }
+        } else {
+            // Positional argument = context path
+            build_cmd.context_path = arg;
+        }
+    }
+
+    if (build_args_count > 0) {
+        build_cmd.build_args = build_args_buf[0..build_args_count];
+    }
+
+    return Command{ .build = build_cmd };
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -996,6 +1550,135 @@ test "parse run command with options" {
             try std.testing.expectEqualStrings("/bin/sh", run_cmd.command);
             try std.testing.expectEqualStrings("test", run_cmd.hostname.?);
             try std.testing.expectEqualStrings("/app", run_cmd.cwd.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse run command preserves parsed option arrays" {
+    const args = [_][]const u8{
+        "isolazi",   "run",
+        "-e",        "FOO=bar",
+        "-v",        "/host:/container:ro",
+        "-p",        "8080:80/tcp",
+        "--uid-map", "0:1000:1",
+        "--gid-map", "0:1000:1",
+        "/rootfs",   "/bin/sh",
+    };
+    const cmd = try parse(&args);
+
+    switch (cmd) {
+        .run => |run_cmd| {
+            try std.testing.expectEqual(@as(usize, 1), run_cmd.getEnvVars().len);
+            try std.testing.expectEqualStrings("FOO", run_cmd.getEnvVars()[0].key);
+            try std.testing.expectEqualStrings("bar", run_cmd.getEnvVars()[0].value);
+            try std.testing.expectEqual(@as(usize, 1), run_cmd.getVolumes().len);
+            try std.testing.expectEqualStrings("/host", run_cmd.getVolumes()[0].host_path);
+            try std.testing.expectEqualStrings("/container", run_cmd.getVolumes()[0].container_path);
+            try std.testing.expect(run_cmd.getVolumes()[0].read_only);
+            try std.testing.expectEqual(@as(usize, 1), run_cmd.getPorts().len);
+            try std.testing.expectEqual(@as(u16, 8080), run_cmd.getPorts()[0].host_port);
+            try std.testing.expectEqual(@as(u16, 80), run_cmd.getPorts()[0].container_port);
+            try std.testing.expectEqual(@as(usize, 1), run_cmd.getUidMaps().len);
+            try std.testing.expectEqual(@as(u32, 0), run_cmd.getUidMaps()[0].container_id);
+            try std.testing.expectEqual(@as(u32, 1000), run_cmd.getUidMaps()[0].host_id);
+            try std.testing.expectEqual(@as(usize, 1), run_cmd.getGidMaps().len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse run command apparmor equals profile" {
+    const args = [_][]const u8{ "isolazi", "run", "--apparmor=custom-profile", "/rootfs", "/bin/sh" };
+    const cmd = try parse(&args);
+
+    switch (cmd) {
+        .run => |run_cmd| {
+            try std.testing.expect(run_cmd.apparmor_enabled);
+            try std.testing.expectEqualStrings("custom-profile", run_cmd.apparmor_profile.?);
+            try std.testing.expectEqual(RunCommand.AppArmorMode.enforce, run_cmd.apparmor_mode);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse run command apparmor default profile" {
+    const args = [_][]const u8{ "isolazi", "run", "--apparmor", "/rootfs", "/bin/sh" };
+    const cmd = try parse(&args);
+
+    switch (cmd) {
+        .run => |run_cmd| {
+            try std.testing.expect(run_cmd.apparmor_enabled);
+            try std.testing.expect(run_cmd.apparmor_profile == null);
+            try std.testing.expectEqual(RunCommand.AppArmorMode.enforce, run_cmd.apparmor_mode);
+            try std.testing.expectEqualStrings("/rootfs", run_cmd.rootfs);
+            try std.testing.expectEqualStrings("/bin/sh", run_cmd.command.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse run command apparmor equals unconfined" {
+    const args = [_][]const u8{ "isolazi", "run", "--apparmor=unconfined", "/rootfs", "/bin/sh" };
+    const cmd = try parse(&args);
+
+    switch (cmd) {
+        .run => |run_cmd| {
+            try std.testing.expect(!run_cmd.apparmor_enabled);
+            try std.testing.expectEqual(RunCommand.AppArmorMode.unconfined, run_cmd.apparmor_mode);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse run command rejects empty apparmor equals value" {
+    const args = [_][]const u8{ "isolazi", "run", "--apparmor=", "/rootfs", "/bin/sh" };
+    try std.testing.expectError(CliError.InvalidArgument, parse(&args));
+}
+
+test "parse run command stores args after command token" {
+    const args = [_][]const u8{ "isolazi", "run", "ubuntu:latest", "echo", "hello", "world" };
+    const cmd = try parse(&args);
+
+    switch (cmd) {
+        .run => |run_cmd| {
+            try std.testing.expectEqualStrings("ubuntu:latest", run_cmd.rootfs);
+            try std.testing.expectEqualStrings("echo", run_cmd.command.?);
+            try std.testing.expectEqual(@as(usize, 2), run_cmd.args.len);
+            try std.testing.expectEqualStrings("hello", run_cmd.args[0]);
+            try std.testing.expectEqualStrings("world", run_cmd.args[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "buildConfig defaults command when omitted" {
+    const args = [_][]const u8{ "isolazi", "run", "/rootfs" };
+    const cmd = try parse(&args);
+
+    switch (cmd) {
+        .run => |run_cmd| {
+            const cfg = try buildConfig(&run_cmd);
+            try std.testing.expectEqualStrings("/bin/sh", std.mem.sliceTo(cfg.getCommand(), 0));
+            try std.testing.expectEqual(@as(usize, 1), cfg.args_count);
+            try std.testing.expectEqualStrings("/bin/sh", std.mem.sliceTo(&cfg.args[0], 0));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "buildConfig preserves command argv layout" {
+    const args = [_][]const u8{ "isolazi", "run", "ubuntu:latest", "echo", "hello", "world" };
+    const cmd = try parse(&args);
+
+    switch (cmd) {
+        .run => |run_cmd| {
+            const cfg = try buildConfig(&run_cmd);
+            try std.testing.expectEqualStrings("echo", std.mem.sliceTo(cfg.getCommand(), 0));
+            try std.testing.expectEqual(@as(usize, 3), cfg.args_count);
+            try std.testing.expectEqualStrings("echo", std.mem.sliceTo(&cfg.args[0], 0));
+            try std.testing.expectEqualStrings("hello", std.mem.sliceTo(&cfg.args[1], 0));
+            try std.testing.expectEqualStrings("world", std.mem.sliceTo(&cfg.args[2], 0));
         },
         else => return error.TestUnexpectedResult,
     }

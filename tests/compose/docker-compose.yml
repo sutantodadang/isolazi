@@ -1,0 +1,67 @@
+version: '3.8'
+services:
+  web:
+    image: alpine:latest
+    container_name: myapp-web
+    command:
+      - sh
+      - -c
+      - "while true; do echo hello; sleep 5; done"
+    ports:
+      - "8080:80"
+      - "8443:443"
+    volumes:
+      - ./html:/usr/share/nginx/html:ro
+      - /tmp/logs:/var/log/nginx
+    environment:
+      - NODE_ENV=production
+      - LOG_LEVEL=info
+    working_dir: /app
+    hostname: web-server
+    restart: unless-stopped
+    depends_on:
+      - db
+      - redis
+
+  db:
+    image: postgres:16-alpine
+    container_name: myapp-db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: myapp
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: myapp_production
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "1.5"
+
+  redis:
+    image: redis:7-alpine
+    container_name: myapp-redis
+    ports:
+      - "6379:6379"
+    restart: on-failure
+    depends_on:
+      - db
+
+  worker:
+    image: alpine:latest
+    command: "sh -c 'echo worker started && sleep infinity'"
+    environment:
+      - QUEUE=default
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      db:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  pgdata:

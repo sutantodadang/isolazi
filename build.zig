@@ -40,6 +40,7 @@ pub fn build(b: *std.Build) void {
         // which requires us to specify a target.
         .target = target,
     });
+    mod.addImport("isolazi", mod);
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
@@ -153,4 +154,94 @@ pub fn build(b: *std.Build) void {
     //
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
+
+    // =========================================================================
+    // Benchmark Suite
+    // =========================================================================
+
+    // Add benchmark module
+    const bench_mod = b.addModule("bench", .{
+        .root_source_file = b.path("src/bench/mod.zig"),
+        .target = target,
+    });
+
+    // Add benchmark executable
+    const bench_exe = b.addExecutable(.{
+        .name = "isolazi-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/bench_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "isolazi", .module = mod },
+                .{ .name = "bench", .module = bench_mod },
+            },
+        }),
+    });
+
+    b.installArtifact(bench_exe);
+
+    // Add benchmark run step
+    const bench_step = b.step("bench", "Run benchmarks");
+    const run_bench = b.addRunArtifact(bench_exe);
+    run_bench.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_bench.addArgs(args);
+    }
+    bench_step.dependOn(&run_bench.step);
+
+    // Add benchmark tests
+    const bench_tests = b.addTest(.{
+        .root_module = bench_mod,
+    });
+    const run_bench_tests = b.addRunArtifact(bench_tests);
+    test_step.dependOn(&run_bench_tests.step);
+    // =========================================================================
+    // Cross-compilation helper
+    // =========================================================================
+
+    const targets: []const std.Target.Query = &.{
+        .{ .cpu_arch = .x86_64, .os_tag = .linux },
+        .{ .cpu_arch = .aarch64, .os_tag = .linux },
+        .{ .cpu_arch = .x86_64, .os_tag = .windows },
+        .{ .cpu_arch = .aarch64, .os_tag = .windows },
+        .{ .cpu_arch = .x86_64, .os_tag = .macos },
+        .{ .cpu_arch = .aarch64, .os_tag = .macos },
+    };
+
+    const build_all_step = b.step("all", "Build for all supported platforms");
+
+    for (targets) |t| {
+        const target_query = b.resolveTargetQuery(t);
+
+        // Create a module for this specific target
+        const target_mod = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target_query,
+            .optimize = optimize,
+        });
+
+        const cross_exe = b.addExecutable(.{
+            .name = "isolazi",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/main.zig"),
+                .target = target_query,
+                .optimize = optimize, // Use the same optimization level as main build
+                .imports = &.{
+                    .{ .name = "isolazi", .module = target_mod },
+                },
+            }),
+        });
+        target_mod.addImport("isolazi", target_mod);
+
+        const target_output = b.addInstallArtifact(cross_exe, .{
+            .dest_dir = .{
+                .override = .{
+                    .custom = t.zigTriple(b.allocator) catch @panic("OOM"),
+                },
+            },
+        });
+
+        build_all_step.dependOn(&target_output.step);
+    }
 }
