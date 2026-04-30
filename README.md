@@ -445,7 +445,8 @@ OPTIONS for 'run':
     Security Options:
     --seccomp <profile>       Seccomp profile: default, minimal, strict, disabled
     --no-seccomp              Disable seccomp filtering (less secure)
-    --apparmor [profile]      Enable AppArmor with optional profile (default: isolazi-default)
+    --apparmor                Enable AppArmor with default profile (isolazi-default)
+    --apparmor=<profile>      Enable AppArmor with custom profile
     --apparmor-mode <mode>    AppArmor mode: enforce, complain, unconfined
     --no-apparmor             Disable AppArmor restrictions
     --selinux [context]       Enable SELinux with optional context
@@ -613,7 +614,7 @@ AppArmor provides Mandatory Access Control (MAC) to restrict what a container ca
 isolazi run --apparmor alpine /bin/sh
 
 # Use a custom AppArmor profile
-isolazi run --apparmor my-profile alpine /bin/sh
+isolazi run --apparmor=my-profile alpine /bin/sh
 
 # AppArmor in complain mode (log only)
 isolazi run --apparmor --apparmor-mode complain alpine /bin/sh
@@ -688,7 +689,7 @@ isolazi run --seccomp strict \
 # Production-ready secure container
 isolazi run -d -p 8080:80 \
             --seccomp default \
-            --apparmor my-nginx-profile \
+            --apparmor=my-nginx-profile \
             --selinux --selinux-type container_net_t \
             --memory 256m --cpus 0.5 \
             nginx

@@ -32,6 +32,79 @@ pub const ContainerState = enum {
     }
 };
 
+test "container state JSON string escaping" {
+    var manager = ContainerManager{
+        .allocator = std.testing.allocator,
+        .base_path = "",
+    };
+
+    var json: std.ArrayList(u8) = .empty;
+    defer json.deinit(std.testing.allocator);
+
+    try manager.appendJsonString(&json, "quote \" slash \\ newline\n tab\t");
+    try std.testing.expectEqualStrings("\"quote \\\" slash \\\\ newline\\n tab\\t\"", json.items);
+
+    json.clearRetainingCapacity();
+    try manager.appendJsonString(&json, "");
+    try std.testing.expectEqualStrings("\"\"", json.items);
+
+    json.clearRetainingCapacity();
+    try manager.appendJsonString(&json, "\x00\x1f");
+    try std.testing.expectEqualStrings("\"\\u0000\\u001f\"", json.items);
+}
+
+test "container state preserves JSON-escaped fields on round trip" {
+    const base_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/state-test-{d}",
+        .{std.time.nanoTimestamp()},
+    );
+
+    var manager = ContainerManager{
+        .allocator = std.testing.allocator,
+        .base_path = base_path,
+    };
+    defer manager.deinit();
+    defer std.fs.cwd().deleteTree(base_path) catch {};
+
+    const container_id: [32]u8 = .{'a'} ** 32;
+    const volumes = [_]VolumeMount{.{
+        .host_path = "/tmp/host \"quoted\" path",
+        .container_path = "/data/with\\slash",
+    }};
+    const env_vars = [_]EnvVar{.{
+        .key = "SPECIAL",
+        .value = "quote \" slash \\ newline\n",
+    }};
+
+    try manager.createContainerWithId(
+        &container_id,
+        "postgres:16-alpine",
+        "docker-entrypoint.sh \"postgres\"",
+        "db \"primary\"",
+        .always,
+        &[_]PortMapping{},
+        &volumes,
+        &env_vars,
+        "/work/with\\slash",
+    );
+    try manager.updateState(&container_id, .stopped, null, 0);
+
+    var info = try manager.getContainer(&container_id);
+    defer info.deinit();
+
+    try std.testing.expectEqualStrings("postgres:16-alpine", info.image);
+    try std.testing.expectEqualStrings("docker-entrypoint.sh \"postgres\"", info.command);
+    try std.testing.expectEqualStrings("db \"primary\"", info.name.?);
+    try std.testing.expectEqualStrings("/work/with\\slash", info.workdir);
+    try std.testing.expectEqual(@as(usize, 1), info.volumes.len);
+    try std.testing.expectEqualStrings("/tmp/host \"quoted\" path", info.volumes[0].host_path);
+    try std.testing.expectEqualStrings("/data/with\\slash", info.volumes[0].container_path);
+    try std.testing.expectEqual(@as(usize, 1), info.env_vars.len);
+    try std.testing.expectEqualStrings("SPECIAL", info.env_vars[0].key);
+    try std.testing.expectEqualStrings("quote \" slash \\ newline\n", info.env_vars[0].value);
+}
+
 /// Port mapping for container networking (persistent version for state.json)
 pub const PortMapping = struct {
     host_port: u16,
@@ -155,6 +228,31 @@ pub const ContainerManager = struct {
         self.allocator.free(self.base_path);
     }
 
+    fn appendJsonString(self: *Self, json: *std.ArrayList(u8), value: []const u8) !void {
+        const hex_chars = "0123456789abcdef";
+
+        try json.append(self.allocator, '"');
+        for (value) |ch| {
+            switch (ch) {
+                '"' => try json.appendSlice(self.allocator, "\\\""),
+                '\\' => try json.appendSlice(self.allocator, "\\\\"),
+                '\n' => try json.appendSlice(self.allocator, "\\n"),
+                '\r' => try json.appendSlice(self.allocator, "\\r"),
+                '\t' => try json.appendSlice(self.allocator, "\\t"),
+                else => {
+                    if (ch < 0x20) {
+                        try json.appendSlice(self.allocator, "\\u00");
+                        try json.append(self.allocator, hex_chars[ch >> 4]);
+                        try json.append(self.allocator, hex_chars[ch & 0x0f]);
+                    } else {
+                        try json.append(self.allocator, ch);
+                    }
+                },
+            }
+        }
+        try json.append(self.allocator, '"');
+    }
+
     /// Create a new container (does not start it)
     pub fn createContainer(
         self: *Self,
@@ -183,36 +281,33 @@ pub const ContainerManager = struct {
         const state_path = try std.fmt.allocPrint(self.allocator, "{s}/state.json", .{container_dir});
         defer self.allocator.free(state_path);
 
-        // Build name string
-        var name_buf: [256]u8 = undefined;
-        const name_str: []const u8 = if (name) |n|
-            std.fmt.bufPrint(&name_buf, "\"{s}\"", .{n}) catch "null"
-        else
-            "null";
+        var json: std.ArrayList(u8) = .empty;
+        defer json.deinit(self.allocator);
 
-        var json_buf: [4096]u8 = undefined;
-        const json = try std.fmt.bufPrint(&json_buf,
-            \\{{
-            \\  "id": "{s}",
-            \\  "image": "{s}",
-            \\  "command": "{s}",
-            \\  "state": "created",
-            \\  "created_at": {d},
-            \\  "name": {s},
-            \\  "restart_policy": "{s}"
-            \\}}
-        , .{
-            container_id,
-            image,
-            command,
-            std.time.timestamp(),
-            name_str,
-            restart_policy.toString(),
-        });
+        try json.appendSlice(self.allocator, "{\n  \"id\": ");
+        try self.appendJsonString(&json, &container_id);
+        try json.appendSlice(self.allocator, ",\n  \"image\": ");
+        try self.appendJsonString(&json, image);
+        try json.appendSlice(self.allocator, ",\n  \"command\": ");
+        try self.appendJsonString(&json, command);
+        try json.appendSlice(self.allocator, ",\n  \"state\": \"created\",\n  \"created_at\": ");
+
+        var time_buf: [32]u8 = undefined;
+        const time_str = try std.fmt.bufPrint(&time_buf, "{d}", .{std.time.timestamp()});
+        try json.appendSlice(self.allocator, time_str);
+        try json.appendSlice(self.allocator, ",\n  \"name\": ");
+        if (name) |n| {
+            try self.appendJsonString(&json, n);
+        } else {
+            try json.appendSlice(self.allocator, "null");
+        }
+        try json.appendSlice(self.allocator, ",\n  \"restart_policy\": ");
+        try self.appendJsonString(&json, restart_policy.toString());
+        try json.appendSlice(self.allocator, "\n}");
 
         const file = try std.fs.cwd().createFile(state_path, .{});
         defer file.close();
-        try file.writeAll(json);
+        try file.writeAll(json.items);
 
         return container_id;
     }
@@ -246,15 +341,15 @@ pub const ContainerManager = struct {
         defer json.deinit(self.allocator);
 
         try json.appendSlice(self.allocator, "{\n");
-        try json.appendSlice(self.allocator, "  \"id\": \"");
-        try json.appendSlice(self.allocator, container_id);
-        try json.appendSlice(self.allocator, "\",\n");
-        try json.appendSlice(self.allocator, "  \"image\": \"");
-        try json.appendSlice(self.allocator, image);
-        try json.appendSlice(self.allocator, "\",\n");
-        try json.appendSlice(self.allocator, "  \"command\": \"");
-        try json.appendSlice(self.allocator, command);
-        try json.appendSlice(self.allocator, "\",\n");
+        try json.appendSlice(self.allocator, "  \"id\": ");
+        try self.appendJsonString(&json, container_id);
+        try json.appendSlice(self.allocator, ",\n");
+        try json.appendSlice(self.allocator, "  \"image\": ");
+        try self.appendJsonString(&json, image);
+        try json.appendSlice(self.allocator, ",\n");
+        try json.appendSlice(self.allocator, "  \"command\": ");
+        try self.appendJsonString(&json, command);
+        try json.appendSlice(self.allocator, ",\n");
         try json.appendSlice(self.allocator, "  \"state\": \"created\",\n");
 
         // created_at
@@ -267,23 +362,21 @@ pub const ContainerManager = struct {
         // name
         try json.appendSlice(self.allocator, "  \"name\": ");
         if (name) |n| {
-            try json.append(self.allocator, '"');
-            try json.appendSlice(self.allocator, n);
-            try json.append(self.allocator, '"');
+            try self.appendJsonString(&json, n);
         } else {
             try json.appendSlice(self.allocator, "null");
         }
         try json.appendSlice(self.allocator, ",\n");
 
         // restart_policy
-        try json.appendSlice(self.allocator, "  \"restart_policy\": \"");
-        try json.appendSlice(self.allocator, restart_policy.toString());
-        try json.appendSlice(self.allocator, "\",\n");
+        try json.appendSlice(self.allocator, "  \"restart_policy\": ");
+        try self.appendJsonString(&json, restart_policy.toString());
+        try json.appendSlice(self.allocator, ",\n");
 
         // workdir
-        try json.appendSlice(self.allocator, "  \"workdir\": \"");
-        try json.appendSlice(self.allocator, workdir);
-        try json.appendSlice(self.allocator, "\",\n");
+        try json.appendSlice(self.allocator, "  \"workdir\": ");
+        try self.appendJsonString(&json, workdir);
+        try json.appendSlice(self.allocator, ",\n");
 
         // ports array
         try json.appendSlice(self.allocator, "  \"ports\": [");
@@ -299,11 +392,11 @@ pub const ContainerManager = struct {
         try json.appendSlice(self.allocator, "  \"volumes\": [");
         for (volumes, 0..) |v, i| {
             if (i > 0) try json.append(self.allocator, ',');
-            try json.appendSlice(self.allocator, "{\"host_path\":\"");
-            try json.appendSlice(self.allocator, v.host_path);
-            try json.appendSlice(self.allocator, "\",\"container_path\":\"");
-            try json.appendSlice(self.allocator, v.container_path);
-            try json.appendSlice(self.allocator, "\"}");
+            try json.appendSlice(self.allocator, "{\"host_path\":");
+            try self.appendJsonString(&json, v.host_path);
+            try json.appendSlice(self.allocator, ",\"container_path\":");
+            try self.appendJsonString(&json, v.container_path);
+            try json.append(self.allocator, '}');
         }
         try json.appendSlice(self.allocator, "],\n");
 
@@ -311,11 +404,11 @@ pub const ContainerManager = struct {
         try json.appendSlice(self.allocator, "  \"env_vars\": [");
         for (env_vars, 0..) |e, i| {
             if (i > 0) try json.append(self.allocator, ',');
-            try json.appendSlice(self.allocator, "{\"key\":\"");
-            try json.appendSlice(self.allocator, e.key);
-            try json.appendSlice(self.allocator, "\",\"value\":\"");
-            try json.appendSlice(self.allocator, e.value);
-            try json.appendSlice(self.allocator, "\"}");
+            try json.appendSlice(self.allocator, "{\"key\":");
+            try self.appendJsonString(&json, e.key);
+            try json.appendSlice(self.allocator, ",\"value\":");
+            try self.appendJsonString(&json, e.value);
+            try json.append(self.allocator, '}');
         }
         try json.appendSlice(self.allocator, "]\n");
 
@@ -372,18 +465,18 @@ pub const ContainerManager = struct {
         const workdir_str = if (root.get("workdir")) |wd| wd.string else "/";
 
         try json.appendSlice(self.allocator, "{\n");
-        try json.appendSlice(self.allocator, "  \"id\": \"");
-        try json.appendSlice(self.allocator, id_str);
-        try json.appendSlice(self.allocator, "\",\n");
-        try json.appendSlice(self.allocator, "  \"image\": \"");
-        try json.appendSlice(self.allocator, image_str);
-        try json.appendSlice(self.allocator, "\",\n");
-        try json.appendSlice(self.allocator, "  \"command\": \"");
-        try json.appendSlice(self.allocator, cmd_str);
-        try json.appendSlice(self.allocator, "\",\n");
-        try json.appendSlice(self.allocator, "  \"state\": \"");
-        try json.appendSlice(self.allocator, state.toString());
-        try json.appendSlice(self.allocator, "\",\n");
+        try json.appendSlice(self.allocator, "  \"id\": ");
+        try self.appendJsonString(&json, id_str);
+        try json.appendSlice(self.allocator, ",\n");
+        try json.appendSlice(self.allocator, "  \"image\": ");
+        try self.appendJsonString(&json, image_str);
+        try json.appendSlice(self.allocator, ",\n");
+        try json.appendSlice(self.allocator, "  \"command\": ");
+        try self.appendJsonString(&json, cmd_str);
+        try json.appendSlice(self.allocator, ",\n");
+        try json.appendSlice(self.allocator, "  \"state\": ");
+        try self.appendJsonString(&json, state.toString());
+        try json.appendSlice(self.allocator, ",\n");
 
         // created_at
         var time_buf: [32]u8 = undefined;
@@ -396,9 +489,7 @@ pub const ContainerManager = struct {
         try json.appendSlice(self.allocator, "  \"name\": ");
         if (root.get("name")) |n| {
             if (n == .string) {
-                try json.append(self.allocator, '"');
-                try json.appendSlice(self.allocator, n.string);
-                try json.append(self.allocator, '"');
+                try self.appendJsonString(&json, n.string);
             } else {
                 try json.appendSlice(self.allocator, "null");
             }
@@ -408,14 +499,13 @@ pub const ContainerManager = struct {
         try json.appendSlice(self.allocator, ",\n");
 
         // restart_policy
-        try json.appendSlice(self.allocator, "  \"restart_policy\": \"");
-        try json.appendSlice(self.allocator, restart_policy_str);
-        try json.appendSlice(self.allocator, "\",\n");
+        try json.appendSlice(self.allocator, "  \"restart_policy\": ");
+        try self.appendJsonString(&json, restart_policy_str);
+        try json.appendSlice(self.allocator, ",\n");
 
         // workdir
-        try json.appendSlice(self.allocator, "  \"workdir\": \"");
-        try json.appendSlice(self.allocator, workdir_str);
-        try json.appendSlice(self.allocator, "\"");
+        try json.appendSlice(self.allocator, "  \"workdir\": ");
+        try self.appendJsonString(&json, workdir_str);
 
         // Timestamp fields
         switch (state) {
@@ -490,11 +580,11 @@ pub const ContainerManager = struct {
                 for (vols_val.array.items, 0..) |item, i| {
                     if (i > 0) try json.append(self.allocator, ',');
                     const obj = item.object;
-                    try json.appendSlice(self.allocator, "{\"host_path\":\"");
-                    try json.appendSlice(self.allocator, obj.get("host_path").?.string);
-                    try json.appendSlice(self.allocator, "\",\"container_path\":\"");
-                    try json.appendSlice(self.allocator, obj.get("container_path").?.string);
-                    try json.appendSlice(self.allocator, "\"}");
+                    try json.appendSlice(self.allocator, "{\"host_path\":");
+                    try self.appendJsonString(&json, obj.get("host_path").?.string);
+                    try json.appendSlice(self.allocator, ",\"container_path\":");
+                    try self.appendJsonString(&json, obj.get("container_path").?.string);
+                    try json.append(self.allocator, '}');
                 }
                 try json.append(self.allocator, ']');
             }
@@ -507,11 +597,11 @@ pub const ContainerManager = struct {
                 for (envs_val.array.items, 0..) |item, i| {
                     if (i > 0) try json.append(self.allocator, ',');
                     const obj = item.object;
-                    try json.appendSlice(self.allocator, "{\"key\":\"");
-                    try json.appendSlice(self.allocator, obj.get("key").?.string);
-                    try json.appendSlice(self.allocator, "\",\"value\":\"");
-                    try json.appendSlice(self.allocator, obj.get("value").?.string);
-                    try json.appendSlice(self.allocator, "\"}");
+                    try json.appendSlice(self.allocator, "{\"key\":");
+                    try self.appendJsonString(&json, obj.get("key").?.string);
+                    try json.appendSlice(self.allocator, ",\"value\":");
+                    try self.appendJsonString(&json, obj.get("value").?.string);
+                    try json.append(self.allocator, '}');
                 }
                 try json.append(self.allocator, ']');
             }
@@ -582,9 +672,14 @@ pub const ContainerManager = struct {
                     // On Windows, check WSL by container tag
                     alive = self.isContainerAliveWSLByTag(id_str) catch false;
                 } else if (builtin.os.tag == .macos) {
-                    // On macOS, containers run in Lima VM. Check if still alive there.
+                    // On macOS, containers run inside the Lima VM without a host
+                    // PID.  The deep liveness check (limactl shell + systemd/grep)
+                    // is unreliable - SSH contention, VM load, and namespace
+                    // timing regularly produce false negatives.  Instead, just
+                    // verify the VM itself is running.  If it is, trust the
+                    // persisted state (only written by explicit start/stop/rm).
                     const macos = @import("../macos/virtualization.zig");
-                    alive = macos.isContainerAliveInLima(self.allocator, id_str) catch false;
+                    alive = macos.isLimaRunning(self.allocator);
                 }
             }
 
@@ -966,7 +1061,7 @@ pub const ContainerManager = struct {
 
     /// Kill ALL isolazi container processes and clean up overlay mounts.
     /// Uses pidfile-based process tree scanning to find all container processes.
-    /// No dependency on state.json — works even with stale/missing state.
+    /// No dependency on state.json - works even with stale/missing state.
     fn killAllWSLContainers(self: *Self) void {
         if (builtin.os.tag == .windows) {
             // Write kill script to a temp file in WSL to avoid Windows command-line quoting issues

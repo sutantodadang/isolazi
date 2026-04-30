@@ -20,7 +20,7 @@ const runtime_mod = @import("../runtime/mod.zig");
 const Config = config_mod.Config;
 
 /// CLI version string
-pub const VERSION = "0.2.11";
+pub const VERSION = "0.2.12";
 
 /// CLI error types
 pub const CliError = error{
@@ -549,11 +549,10 @@ fn parseRunCommand(args: []const []const u8) CliError!Command {
                 } else {
                     return CliError.InvalidArgument;
                 }
-            } else if (std.mem.eql(u8, arg, "--apparmor")) {
-                // AppArmor profile: --apparmor <profile-name>
-                i += 1;
-                if (i >= args.len) return CliError.InvalidArgument;
-                const profile_str = args[i];
+            } else if (std.mem.startsWith(u8, arg, "--apparmor=")) {
+                // AppArmor profile: --apparmor=<profile-name>
+                const profile_str = arg["--apparmor=".len..];
+                if (profile_str.len == 0) return CliError.InvalidArgument;
                 if (std.mem.eql(u8, profile_str, "unconfined") or std.mem.eql(u8, profile_str, "disabled") or std.mem.eql(u8, profile_str, "none")) {
                     run_cmd.apparmor_enabled = false;
                     run_cmd.apparmor_mode = .unconfined;
@@ -562,6 +561,12 @@ fn parseRunCommand(args: []const []const u8) CliError!Command {
                     run_cmd.apparmor_profile = profile_str;
                     run_cmd.apparmor_mode = .enforce;
                 }
+            } else if (std.mem.eql(u8, arg, "--apparmor")) {
+                // Enable AppArmor with the default profile.
+                // Use --apparmor=<profile> or --security-opt apparmor=<profile>
+                // to set a custom profile.
+                run_cmd.apparmor_enabled = true;
+                run_cmd.apparmor_mode = .enforce;
             } else if (std.mem.eql(u8, arg, "--apparmor-mode")) {
                 // AppArmor mode: --apparmor-mode <enforce|complain|unconfined>
                 i += 1;
@@ -695,7 +700,7 @@ fn parseRunCommand(args: []const []const u8) CliError!Command {
                 run_cmd.is_image = isImageReference(arg);
             } else if (positional_count == 1) {
                 run_cmd.command = arg;
-                command_args_start = i;
+                command_args_start = i + 1;
             }
             positional_count += 1;
         }
@@ -706,7 +711,7 @@ fn parseRunCommand(args: []const []const u8) CliError!Command {
     }
     // Command is now optional - images with default CMD/ENTRYPOINT don't need one
 
-    // Set command args (including the command itself as argv[0])
+    // Set command args after the command token.
     if (command_args_start) |start| {
         run_cmd.args = args[start..];
     }
@@ -1144,15 +1149,13 @@ pub fn buildConfig(run_cmd: *const RunCommand) !Config {
     // Set command
     if (run_cmd.command) |cmd| {
         try cfg.setCommand(cmd);
-        if (run_cmd.args.len == 0) {
-            try cfg.addArg(cmd);
-        }
+        try cfg.addArg(cmd);
     } else {
         try cfg.setCommand("/bin/sh");
         try cfg.addArg("/bin/sh");
     }
 
-    // Set argv (including argv[0])
+    // Add remaining argv values (excluding argv[0], already set above).
     for (run_cmd.args) |arg| {
         try cfg.addArg(arg);
     }
@@ -1324,7 +1327,8 @@ pub fn printHelp(writer: anytype) !void {
         \\                              Profiles: default, minimal, strict, disabled
         \\    --no-seccomp              Disable seccomp filtering (same as --seccomp disabled)
         \\
-        \\    --apparmor <profile>      AppArmor profile name (default: isolazi-default)
+        \\    --apparmor                Enable AppArmor with default profile
+        \\    --apparmor=<profile>      AppArmor profile name
         \\    --apparmor-mode <mode>    AppArmor mode: enforce, complain, unconfined
         \\    --no-apparmor             Disable AppArmor enforcement
         \\
@@ -1394,8 +1398,8 @@ pub fn printHelp(writer: anytype) !void {
         \\    isolazi run -m 1g --cpu-weight 200 --io-weight 500 alpine /bin/sh
         \\    isolazi run --seccomp minimal alpine /bin/sh
         \\    isolazi run --no-seccomp alpine /bin/sh     # Less secure, for debugging
-        \\    isolazi run --apparmor isolazi-default alpine /bin/sh
-        \\    isolazi run --apparmor myprofile --apparmor-mode complain alpine /bin/sh
+        \\    isolazi run --apparmor alpine /bin/sh
+        \\    isolazi run --apparmor=myprofile --apparmor-mode complain alpine /bin/sh
         \\    isolazi run --selinux-type container_t --selinux-mcs 100,200 alpine /bin/sh
         \\    isolazi run --security-opt apparmor=isolazi-default alpine /bin/sh
         \\    isolazi run --privileged alpine /bin/sh     # Disables all security features
@@ -1584,6 +1588,70 @@ test "parse run command preserves parsed option arrays" {
     }
 }
 
+test "parse run command apparmor equals profile" {
+    const args = [_][]const u8{ "isolazi", "run", "--apparmor=custom-profile", "/rootfs", "/bin/sh" };
+    const cmd = try parse(&args);
+
+    switch (cmd) {
+        .run => |run_cmd| {
+            try std.testing.expect(run_cmd.apparmor_enabled);
+            try std.testing.expectEqualStrings("custom-profile", run_cmd.apparmor_profile.?);
+            try std.testing.expectEqual(RunCommand.AppArmorMode.enforce, run_cmd.apparmor_mode);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse run command apparmor default profile" {
+    const args = [_][]const u8{ "isolazi", "run", "--apparmor", "/rootfs", "/bin/sh" };
+    const cmd = try parse(&args);
+
+    switch (cmd) {
+        .run => |run_cmd| {
+            try std.testing.expect(run_cmd.apparmor_enabled);
+            try std.testing.expect(run_cmd.apparmor_profile == null);
+            try std.testing.expectEqual(RunCommand.AppArmorMode.enforce, run_cmd.apparmor_mode);
+            try std.testing.expectEqualStrings("/rootfs", run_cmd.rootfs);
+            try std.testing.expectEqualStrings("/bin/sh", run_cmd.command.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse run command apparmor equals unconfined" {
+    const args = [_][]const u8{ "isolazi", "run", "--apparmor=unconfined", "/rootfs", "/bin/sh" };
+    const cmd = try parse(&args);
+
+    switch (cmd) {
+        .run => |run_cmd| {
+            try std.testing.expect(!run_cmd.apparmor_enabled);
+            try std.testing.expectEqual(RunCommand.AppArmorMode.unconfined, run_cmd.apparmor_mode);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse run command rejects empty apparmor equals value" {
+    const args = [_][]const u8{ "isolazi", "run", "--apparmor=", "/rootfs", "/bin/sh" };
+    try std.testing.expectError(CliError.InvalidArgument, parse(&args));
+}
+
+test "parse run command stores args after command token" {
+    const args = [_][]const u8{ "isolazi", "run", "ubuntu:latest", "echo", "hello", "world" };
+    const cmd = try parse(&args);
+
+    switch (cmd) {
+        .run => |run_cmd| {
+            try std.testing.expectEqualStrings("ubuntu:latest", run_cmd.rootfs);
+            try std.testing.expectEqualStrings("echo", run_cmd.command.?);
+            try std.testing.expectEqual(@as(usize, 2), run_cmd.args.len);
+            try std.testing.expectEqualStrings("hello", run_cmd.args[0]);
+            try std.testing.expectEqualStrings("world", run_cmd.args[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "buildConfig defaults command when omitted" {
     const args = [_][]const u8{ "isolazi", "run", "/rootfs" };
     const cmd = try parse(&args);
@@ -1594,6 +1662,23 @@ test "buildConfig defaults command when omitted" {
             try std.testing.expectEqualStrings("/bin/sh", std.mem.sliceTo(cfg.getCommand(), 0));
             try std.testing.expectEqual(@as(usize, 1), cfg.args_count);
             try std.testing.expectEqualStrings("/bin/sh", std.mem.sliceTo(&cfg.args[0], 0));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "buildConfig preserves command argv layout" {
+    const args = [_][]const u8{ "isolazi", "run", "ubuntu:latest", "echo", "hello", "world" };
+    const cmd = try parse(&args);
+
+    switch (cmd) {
+        .run => |run_cmd| {
+            const cfg = try buildConfig(&run_cmd);
+            try std.testing.expectEqualStrings("echo", std.mem.sliceTo(cfg.getCommand(), 0));
+            try std.testing.expectEqual(@as(usize, 3), cfg.args_count);
+            try std.testing.expectEqualStrings("echo", std.mem.sliceTo(&cfg.args[0], 0));
+            try std.testing.expectEqualStrings("hello", std.mem.sliceTo(&cfg.args[1], 0));
+            try std.testing.expectEqualStrings("world", std.mem.sliceTo(&cfg.args[2], 0));
         },
         else => return error.TestUnexpectedResult,
     }

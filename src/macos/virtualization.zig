@@ -900,17 +900,43 @@ fn createLimaInstance(allocator: std.mem.Allocator) !void {
 }
 
 /// Start Lima VM with stdout/stderr inherited so user sees boot progress.
+///
+/// We fork+setsid before exec so the spawned `limactl start` (and the
+/// `limactl hostagent` grandchild it leaves behind to supervise the VM)
+/// run in a new session with no controlling TTY. Without this, the
+/// hostagent inherits isolazi's controlling TTY and dies along with our
+/// process group when isolazi exits - leaving the VM stopped within
+/// seconds of `start` returning, which makes containers immediately
+/// report as "stopped" in `ps -a`.
 fn startLimaWithProgress(allocator: std.mem.Allocator) VirtualizationError!void {
-    var child = std.process.Child.init(
-        &[_][]const u8{ "limactl", "start", "isolazi" },
-        allocator,
-    );
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-    child.spawn() catch return VirtualizationError.VMStartFailed;
-    const term = child.wait() catch return VirtualizationError.VMStartFailed;
-    if (term.Exited != 0) {
+    const wait_exit_signal_mask = 0x7f;
+    const wait_exit_status_shift = 8;
+    const wait_exit_status_mask = 0xff;
+
+    // Build a null-terminated envp from std.os.environ.
+    const envp_buf = allocator.allocSentinel(?[*:0]const u8, std.os.environ.len, null) catch
+        return VirtualizationError.VMStartFailed;
+    defer allocator.free(envp_buf);
+    for (std.os.environ, 0..) |e, i| envp_buf[i] = e;
+
+    const pid = std.posix.fork() catch return VirtualizationError.VMStartFailed;
+    if (pid == 0) {
+        // Child: detach into a new session, then exec limactl. setsid()
+        // fails if we're already a process-group leader; ignore that.
+        _ = std.posix.setsid() catch {};
+        const argv = [_:null]?[*:0]const u8{ "limactl", "start", "isolazi" };
+        const exec_err = std.posix.execvpeZ("limactl", &argv, envp_buf.ptr);
+        std.debug.print("Error: failed to exec limactl: {s}\n", .{@errorName(exec_err)});
+        std.posix.exit(127);
+    }
+
+    // Parent: wait for `limactl start` to finish booting the VM.
+    const result = std.posix.waitpid(pid, 0);
+    const status = result.status;
+    // POSIX WIFEXITED + WEXITSTATUS (works on macOS and Linux).
+    const exited_normally = (status & wait_exit_signal_mask) == 0;
+    const exit_code = (status >> wait_exit_status_shift) & wait_exit_status_mask;
+    if (!exited_normally or exit_code != 0) {
         return VirtualizationError.VMStartFailed;
     }
 }
@@ -956,58 +982,16 @@ pub fn stopInLima(allocator: std.mem.Allocator, container_id: []const u8) !void 
 /// Refresh Lima port forwarding by signaling the host agent to re-scan ports.
 /// This is called after stopping a container to ensure port bindings are released.
 pub fn refreshLimaPortForwarding(allocator: std.mem.Allocator) void {
-    // Send SIGHUP to Lima's hostagent to trigger port forwarding refresh
-    if (std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &[_][]const u8{ "pkill", "-HUP", "-f", "limactl.*hostagent.*isolazi" },
-    })) |res| {
-        allocator.free(res.stdout);
-        allocator.free(res.stderr);
-    } else |_| {}
-
-    // Note: Do NOT signal SSH processes (ssh.*lima.*isolazi) here.
-    // That pattern matches ALL Lima SSH sessions including those backing
-    // other running containers' `limactl shell` processes. Sending SIGHUP
-    // to those SSH sessions kills unrelated containers.
-    // The hostagent SIGHUP above is sufficient to trigger port re-scanning.
-}
-
-pub fn isContainerAliveInLima(allocator: std.mem.Allocator, container_id: []const u8) !bool {
-    // First check if Lima is actually running
-    if (!isLimaRunning(allocator)) return false;
-
-    // 1. Check systemd status first
-    const systemctl_cmd = try std.fmt.allocPrint(allocator, "sudo systemctl is-active isolazi-{s}", .{container_id});
-    defer allocator.free(systemctl_cmd);
-
-    const sc_res = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &[_][]const u8{ "limactl", "shell", "isolazi", "sh", "-c", systemctl_cmd },
-    }) catch {
-        // Fallthrough on error
-        return false;
-    };
-    defer allocator.free(sc_res.stdout);
-    defer allocator.free(sc_res.stderr);
-
-    const status = std.mem.trim(u8, sc_res.stdout, " \t\r\n");
-    if (std.mem.eql(u8, status, "active") or std.mem.eql(u8, status, "activating")) {
-        return true;
-    }
-
-    // 2. Fallback: Search /proc/*/environ for the tag using grep
-    // Use grep -a -q to search in binary files directly and exit on first match
-    const grep_cmd = try std.fmt.allocPrint(allocator, "sudo grep -a -q 'ISOLAZI_ID={s}' /proc/[0-9]*/environ", .{container_id});
-    defer allocator.free(grep_cmd);
-
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &[_][]const u8{ "limactl", "shell", "isolazi", "sh", "-c", grep_cmd },
-    }) catch return false;
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-
-    return result.term.Exited == 0;
+    _ = allocator;
+    // No-op on current Lima (VZ driver): the hostagent does NOT treat SIGHUP
+    // as a "rescan" signal - it terminates on SIGHUP, which tears down the
+    // whole VM and silently stops every container. The Lima guest agent
+    // already pushes port-mapping changes to the hostagent over its gRPC
+    // socket, so an explicit refresh is unnecessary here.
+    //
+    // Previously this sent `pkill -HUP -f 'limactl.*hostagent.*isolazi'`,
+    // which made `start` appear to succeed (state.json updated to "running")
+    // but `ps -a` immediately reported "stopped" because the VM was dead.
 }
 
 /// Stop the Lima instance

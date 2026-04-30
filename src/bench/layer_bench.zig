@@ -263,16 +263,16 @@ pub fn extractLayerWithStats(
     const end = std.time.nanoTimestamp();
     stats.extraction_time_ns = @intCast(end - start);
 
+    // Count files if not returned by extractLayer
+    if (stats.file_count <= 1) {
+        stats.file_count = countFilesInDirectory(allocator, target_dir);
+    }
+
     // Get extracted size
     stats.extracted_size = getDirectorySize(allocator, target_dir) catch 0;
     if (stats.extracted_size == 0) {
         // Fallback estimate based on file count
         stats.extracted_size = stats.file_count * 4096; // Assume 4KB average
-    }
-
-    // Count files if not returned by extractLayer
-    if (stats.file_count <= 1) {
-        stats.file_count = countFilesInDirectory(allocator, target_dir);
     }
 
     // Calculate derived metrics
