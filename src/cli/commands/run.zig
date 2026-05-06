@@ -95,7 +95,12 @@ pub fn parseRunOptions(allocator: std.mem.Allocator, args: []const []const u8) !
     while (arg_idx < args.len) : (arg_idx += 1) {
         const arg = args[arg_idx];
 
-        if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--detach")) {
+        if (image_found) {
+            if (cmd_count < cmd_buf.len) {
+                cmd_buf[cmd_count] = arg;
+                cmd_count += 1;
+            }
+        } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--detach")) {
             opts.detach_mode = true;
         } else if (std.mem.eql(u8, arg, "--name")) {
             arg_idx += 1;
@@ -216,12 +221,6 @@ pub fn parseRunOptions(allocator: std.mem.Allocator, args: []const []const u8) !
         } else if (!image_found) {
             opts.image_name = arg;
             image_found = true;
-        } else {
-            // This is a command argument (after image, not a flag)
-            if (cmd_count < cmd_buf.len) {
-                cmd_buf[cmd_count] = arg;
-                cmd_count += 1;
-            }
         }
     }
 
@@ -375,6 +374,81 @@ pub fn quoteArg(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, arg: []const 
     try buf.append(alloc, ' ');
 }
 
+/// Command resolved from an OCI image config. All slices are owned by this value.
+pub const ResolvedImageCommand = struct {
+    args: []const []const u8,
+    workdir: []const u8,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: ResolvedImageCommand) void {
+        for (self.args) |arg| {
+            self.allocator.free(arg);
+        }
+        self.allocator.free(self.args);
+        self.allocator.free(self.workdir);
+    }
+};
+
+fn appendConfigStringArray(
+    allocator: std.mem.Allocator,
+    args: *std.ArrayList([]const u8),
+    value: std.json.Value,
+) !void {
+    if (value != .array) return;
+
+    for (value.array.items) |item| {
+        if (item == .string) {
+            const arg = try allocator.dupe(u8, item.string);
+            errdefer allocator.free(arg);
+            try args.append(allocator, arg);
+        }
+    }
+}
+
+/// Resolve Docker-compatible Entrypoint + Cmd + WorkingDir from an OCI config blob.
+pub fn resolveImageConfigCommand(
+    allocator: std.mem.Allocator,
+    config_data: []const u8,
+) !ResolvedImageCommand {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, config_data, .{});
+    defer parsed.deinit();
+
+    const cfg = parsed.value.object.get("config") orelse return error.InvalidImageConfig;
+
+    var args: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (args.items) |arg| allocator.free(arg);
+        args.deinit(allocator);
+    }
+
+    var workdir = try allocator.dupe(u8, "/");
+    errdefer allocator.free(workdir);
+
+    if (cfg.object.get("WorkingDir")) |wd| {
+        if (wd == .string and wd.string.len > 0) {
+            allocator.free(workdir);
+            workdir = try allocator.dupe(u8, wd.string);
+        }
+    }
+
+    if (cfg.object.get("Entrypoint")) |entrypoint| {
+        try appendConfigStringArray(allocator, &args, entrypoint);
+    }
+    if (cfg.object.get("Cmd")) |cmd| {
+        try appendConfigStringArray(allocator, &args, cmd);
+    }
+
+    if (args.items.len == 0) {
+        try args.append(allocator, try allocator.dupe(u8, "/bin/sh"));
+    }
+
+    return .{
+        .args = try args.toOwnedSlice(allocator),
+        .workdir = workdir,
+        .allocator = allocator,
+    };
+}
+
 /// Print usage information for run command
 pub fn printUsage(stderr: anytype) void {
     stderr.writeAll("Error: Missing image name\n") catch {};
@@ -389,4 +463,51 @@ pub fn printUsage(stderr: anytype) void {
     stderr.writeAll("  --seccomp <profile>       Seccomp profile (disabled|default|minimal|strict)\n") catch {};
     stderr.writeAll("  --restart <policy>        Restart policy (no|always|on-failure|unless-stopped)\n") catch {};
     stderr.flush() catch {};
+}
+
+test "resolve image config command combines entrypoint cmd and workdir" {
+    const config_data =
+        \\{"config":{"Entrypoint":["docker-entrypoint.sh"],"Cmd":["redis-server"],"WorkingDir":"/data"}}
+    ;
+
+    const resolved = try resolveImageConfigCommand(std.testing.allocator, config_data);
+    defer resolved.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), resolved.args.len);
+    try std.testing.expectEqualStrings("docker-entrypoint.sh", resolved.args[0]);
+    try std.testing.expectEqualStrings("redis-server", resolved.args[1]);
+    try std.testing.expectEqualStrings("/data", resolved.workdir);
+}
+
+test "resolve image config command falls back to shell" {
+    const config_data =
+        \\{"config":{"Entrypoint":null,"Cmd":null,"WorkingDir":""}}
+    ;
+
+    const resolved = try resolveImageConfigCommand(std.testing.allocator, config_data);
+    defer resolved.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), resolved.args.len);
+    try std.testing.expectEqualStrings("/bin/sh", resolved.args[0]);
+    try std.testing.expectEqualStrings("/", resolved.workdir);
+}
+
+test "parse run options treats flags after image as command args" {
+    const args = [_][]const u8{ "isolazi", "run", "-p", "6380:6380", "redis:8.6-alpine", "redis-server", "--port", "6380", "--save", "", "--appendonly", "no" };
+
+    const opts = try parseRunOptions(std.testing.allocator, &args);
+    defer opts.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), opts.ports.len);
+    try std.testing.expectEqual(@as(u16, 6380), opts.ports[0].host_port);
+    try std.testing.expectEqual(@as(u16, 6380), opts.ports[0].container_port);
+    try std.testing.expectEqualStrings("redis:8.6-alpine", opts.image_name);
+    try std.testing.expectEqual(@as(usize, 7), opts.command_args.len);
+    try std.testing.expectEqualStrings("redis-server", opts.command_args[0]);
+    try std.testing.expectEqualStrings("--port", opts.command_args[1]);
+    try std.testing.expectEqualStrings("6380", opts.command_args[2]);
+    try std.testing.expectEqualStrings("--save", opts.command_args[3]);
+    try std.testing.expectEqualStrings("", opts.command_args[4]);
+    try std.testing.expectEqualStrings("--appendonly", opts.command_args[5]);
+    try std.testing.expectEqualStrings("no", opts.command_args[6]);
 }
