@@ -17,7 +17,7 @@ const macos = if (builtin.os.tag == .macos) isolazi.macos else struct {
         pub const VolumePair = struct { host_path: []const u8, container_path: []const u8 };
         pub const PortMapping = struct { host_port: u16, container_port: u16, protocol: enum { tcp, udp } };
         pub const RunResult = struct { exit_code: u8, pid: ?i32 = null };
-        pub fn runWithLima(_: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype) !RunResult {
+        pub fn runWithLima(_: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype) !RunResult {
             return RunResult{ .exit_code = 1 };
         }
     };
@@ -201,46 +201,49 @@ pub fn runContainer(
     };
     defer manager.deinit();
 
-    // Build command string for state tracking
-    var cmd_display: [256]u8 = undefined;
-    var cmd_display_len: usize = 0;
-
-    // Get command to run (default: /bin/sh, or entrypoint for known images)
-    var cmd_args: std.ArrayList([]const u8) = .empty;
-    defer cmd_args.deinit(allocator);
-
     const is_postgres = std.mem.indexOf(u8, opts.image_name, "postgres") != null;
-    const is_rabbitmq = std.mem.indexOf(u8, opts.image_name, "rabbitmq") != null;
+    var cmd_storage: std.ArrayList([]const u8) = .empty;
+    defer cmd_storage.deinit(allocator);
+    var resolved_cmd: ?runmod.ResolvedImageCommand = null;
+    defer if (resolved_cmd) |cmd| cmd.deinit();
 
+    var cmd_args: []const []const u8 = undefined;
+    var workdir: []const u8 = "/";
     if (opts.command_args.len > 0) {
         for (opts.command_args) |arg| {
-            try cmd_args.append(allocator, arg);
-            // Build display string
-            if (cmd_display_len > 0 and cmd_display_len < 255) {
-                cmd_display[cmd_display_len] = ' ';
-                cmd_display_len += 1;
-            }
-            const copy_len = @min(arg.len, 255 - cmd_display_len);
-            @memcpy(cmd_display[cmd_display_len..][0..copy_len], arg[0..copy_len]);
-            cmd_display_len += copy_len;
+            try cmd_storage.append(allocator, arg);
         }
-    } else if (is_postgres) {
-        try cmd_args.append(allocator, "docker-entrypoint.sh");
-        try cmd_args.append(allocator, "postgres");
-        const entry = "docker-entrypoint.sh postgres";
-        @memcpy(cmd_display[0..entry.len], entry);
-        cmd_display_len = entry.len;
-    } else if (is_rabbitmq) {
-        try cmd_args.append(allocator, "docker-entrypoint.sh");
-        try cmd_args.append(allocator, "rabbitmq-server");
-        const entry = "docker-entrypoint.sh rabbitmq-server";
-        @memcpy(cmd_display[0..entry.len], entry);
-        cmd_display_len = entry.len;
+        cmd_args = cmd_storage.items;
     } else {
-        try cmd_args.append(allocator, "/bin/sh");
-        const sh = "/bin/sh";
-        @memcpy(cmd_display[0..sh.len], sh);
-        cmd_display_len = sh.len;
+        read_config: {
+            const config_ref = root.object.get("config") orelse break :read_config;
+            const config_digest = (config_ref.object.get("digest") orelse break :read_config).string;
+            const config_data = cache.readBlob(config_digest) catch break :read_config;
+            defer allocator.free(config_data);
+            resolved_cmd = runmod.resolveImageConfigCommand(allocator, config_data) catch break :read_config;
+            cmd_args = resolved_cmd.?.args;
+            workdir = resolved_cmd.?.workdir;
+            break :read_config;
+        }
+
+        if (resolved_cmd == null) {
+            try cmd_storage.append(allocator, "/bin/sh");
+            cmd_args = cmd_storage.items;
+        }
+    }
+
+    var cmd_display: [256]u8 = undefined;
+    var cmd_display_len: usize = 0;
+    for (cmd_args, 0..) |arg, i| {
+        if (i > 0 and cmd_display_len < cmd_display.len) {
+            cmd_display[cmd_display_len] = ' ';
+            cmd_display_len += 1;
+        }
+        const available = cmd_display.len - cmd_display_len;
+        if (available == 0) break;
+        const copy_len = @min(arg.len, available);
+        @memcpy(cmd_display[cmd_display_len..][0..copy_len], arg[0..copy_len]);
+        cmd_display_len += copy_len;
     }
 
     if (opts.detach_mode) {
@@ -395,7 +398,7 @@ pub fn runContainer(
             persist_ports.items,
             persist_vols.items,
             persist_envs.items,
-            "/",
+            workdir,
         ) catch {};
     }
 
@@ -422,13 +425,14 @@ pub fn runContainer(
         allocator,
         "", // Lima manages its own kernel
         rootfs_path,
-        cmd_args.items,
+        cmd_args,
         env_pairs.items,
         vol_pairs.items,
         port_pairs.items,
         opts.rootless,
         opts.detach_mode,
         opts.restart_policy,
+        workdir,
         stdout_path,
         stderr_path,
     ) catch |err| {
@@ -441,7 +445,7 @@ pub fn runContainer(
     if (run_res.exit_code == 0) {
         if (opts.detach_mode) {
             // For detach mode, we consider it "running" if launch started successfully
-            manager.updateState(&container_id, .running, null, null) catch {};
+            manager.updateState(&container_id, .running, run_res.pid, null) catch {};
             exit_code = 0;
         } else {
             // Interactive mode finished successfully

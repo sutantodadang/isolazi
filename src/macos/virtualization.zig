@@ -470,10 +470,11 @@ pub fn runWithLima(
     rootless: bool,
     detach: bool,
     restart_policy: config_mod.Config.RestartPolicy,
+    workdir: []const u8,
     stdout_path: ?[]const u8,
     stderr_path: ?[]const u8,
 ) !RunResult {
-    return runWithLimaEx(allocator, "", rootfs_path, command, env_vars, volumes, port_mappings, rootless, detach, restart_policy, null, null, stdout_path, stderr_path);
+    return runWithLimaEx(allocator, "", rootfs_path, command, env_vars, volumes, port_mappings, rootless, detach, restart_policy, workdir, null, null, stdout_path, stderr_path);
 }
 
 /// Extended Lima runner with resource limits and LSM support
@@ -488,6 +489,7 @@ pub fn runWithLimaEx(
     rootless: bool,
     detach: bool,
     restart_policy: config_mod.Config.RestartPolicy,
+    workdir: []const u8,
     resource_limits: ?*const ResourceLimitsConfig,
     lsm_config: ?*const LSMConfig,
     stdout_path: ?[]const u8,
@@ -501,7 +503,7 @@ pub fn runWithLimaEx(
             // Create and start the VM (shows progress to user)
             std.debug.print("Creating Lima VM (this may take a few minutes)...\n", .{});
             _ = try createLimaInstance(allocator);
-            return runWithLimaEx(allocator, "", rootfs_path, command, env_vars, volumes, port_mappings, rootless, detach, restart_policy, resource_limits, lsm_config, stdout_path, stderr_path);
+            return runWithLimaEx(allocator, "", rootfs_path, command, env_vars, volumes, port_mappings, rootless, detach, restart_policy, workdir, resource_limits, lsm_config, stdout_path, stderr_path);
         },
 
         .Stopped, .Unknown => {
@@ -560,6 +562,10 @@ pub fn runWithLimaEx(
     try script.appendSlice(allocator, "# ISOLAZI_ID=");
     try appendCommentText(&script, allocator, parent_dir);
     try script.appendSlice(allocator, "\n");
+
+    try script.appendSlice(allocator, "echo $$ > ");
+    try appendShellQuotedConcat(&script, allocator, container_id_dir, "/pid");
+    try script.appendSlice(allocator, " && ");
 
     // Mount essential filesystems
     try script.appendSlice(allocator, "mkdir -p ");
@@ -675,6 +681,19 @@ pub fn runWithLimaEx(
     // Add env vars
     for (env_vars) |env| {
         try appendShellQuotedEnv(&setup_script, allocator, env.key, env.value);
+        try setup_script.append(allocator, ' ');
+    }
+
+    if (!std.mem.eql(u8, workdir, "/")) {
+        try appendShellQuoted(&setup_script, allocator, "/bin/sh");
+        try setup_script.append(allocator, ' ');
+        try appendShellQuoted(&setup_script, allocator, "-c");
+        try setup_script.append(allocator, ' ');
+        try appendShellQuoted(&setup_script, allocator, "cd \"$1\" && shift && exec \"$@\"");
+        try setup_script.append(allocator, ' ');
+        try appendShellQuoted(&setup_script, allocator, "isolazi-entrypoint");
+        try setup_script.append(allocator, ' ');
+        try appendShellQuoted(&setup_script, allocator, workdir);
         try setup_script.append(allocator, ' ');
     }
 
@@ -955,6 +974,49 @@ pub fn stopInLima(allocator: std.mem.Allocator, container_id: []const u8) !void 
         allocator.free(res.stdout);
         allocator.free(res.stderr);
     } else |_| {}
+
+    var container_dir: ?[]const u8 = null;
+    if (std.process.getEnvVarOwned(allocator, "HOME")) |home| {
+        defer allocator.free(home);
+        container_dir = try std.fmt.allocPrint(allocator, "{s}/.isolazi/containers/{s}", .{ home, container_id });
+    } else |_| {}
+    defer if (container_dir) |dir| allocator.free(dir);
+
+    if (container_dir) |dir| {
+        var stop_script: std.ArrayList(u8) = .empty;
+        defer stop_script.deinit(allocator);
+
+        try stop_script.appendSlice(allocator, "ALL_PIDS=''\nPID=$(cat ");
+        try appendShellQuotedConcat(&stop_script, allocator, dir, "/pid");
+        try stop_script.appendSlice(allocator, " 2>/dev/null || true)\n");
+        try stop_script.appendSlice(allocator, "[ -n \"$PID\" ] && ALL_PIDS=\"$ALL_PIDS $PID\"\nROOTFS=");
+        try appendShellQuotedConcat(&stop_script, allocator, dir, "/rootfs");
+        try stop_script.appendSlice(
+            allocator,
+            "\nfor proc in /proc/[0-9]*; do\n" ++
+                "  PID=${proc##*/}\n" ++
+                "  ROOT=$(readlink \"$proc/root\" 2>/dev/null || true)\n" ++
+                "  case \"$ROOT\" in \"$ROOTFS\"|\"$ROOTFS (deleted)\") ALL_PIDS=\"$ALL_PIDS $PID\" ;; esac\n" ++
+                "done\n" ++
+                "for PID in $ALL_PIDS; do\n" ++
+                "  for c1 in $(pgrep -P $PID 2>/dev/null); do ALL_PIDS=\"$ALL_PIDS $c1\";\n" ++
+                "    for c2 in $(pgrep -P $c1 2>/dev/null); do ALL_PIDS=\"$ALL_PIDS $c2\";\n" ++
+                "      for c3 in $(pgrep -P $c2 2>/dev/null); do ALL_PIDS=\"$ALL_PIDS $c3\"; done\n" ++
+                "    done\n" ++
+                "  done\n" ++
+                "done\n" ++
+                "[ -n \"$ALL_PIDS\" ] && sudo kill -TERM $ALL_PIDS 2>/dev/null\n",
+        );
+
+        const stop_res = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &[_][]const u8{ "limactl", "shell", "isolazi", "sh", "-c", stop_script.items },
+        });
+        if (stop_res) |res| {
+            allocator.free(res.stdout);
+            allocator.free(res.stderr);
+        } else |_| {}
+    }
 
     // 2. Fallback: Find PIDs via /proc/*/environ using grep
     // Use grep -a -l to find files containing the ID, then extract PID

@@ -105,7 +105,7 @@ fn extractLayerWindows(allocator: std.mem.Allocator, layer_path: []const u8, tar
 fn extractLayerLinux(allocator: std.mem.Allocator, layer_path: []const u8, target_dir: []const u8) !u64 {
     const list_result = std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &[_][]const u8{ "tar", "-tzf", "--", layer_path },
+        .argv = &[_][]const u8{ "tar", "-tzf", layer_path },
     }) catch return ExtractionError.InvalidArchive;
     defer allocator.free(list_result.stdout);
     defer allocator.free(list_result.stderr);
@@ -122,7 +122,6 @@ fn extractLayerLinux(allocator: std.mem.Allocator, layer_path: []const u8, targe
         .argv = &[_][]const u8{
             "tar",
             "-xzf",
-            "--",
             layer_path,
             "-C",
             target_dir,
